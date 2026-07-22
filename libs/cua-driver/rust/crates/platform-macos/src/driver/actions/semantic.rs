@@ -5,7 +5,7 @@ use core_foundation::base::{CFRelease, CFTypeRef};
 use cua_driver_core::api::{
     contracts::{MouseButton, Route, ScrollDirection, SelectionType, VerificationLevel},
     errors::{ErrorCode, ErrorPhase, NativeError},
-    interaction::{InteractionScope, LeaseDecision, NativeEvidence},
+    interaction::{InteractionScope, LeaseDecision, NativeEvidence, NativeSideEffectBoundary},
     observation::ResolvedElement,
     platform::{ClickSpec, ElementScrollSpec, NativeDispatch, ResolvedAction, SelectionSpec},
     settlement::SettlementSignal,
@@ -38,7 +38,10 @@ pub struct MacSemanticActions {
 /// Retained, side-effect-free semantic recipe produced before core consumes
 /// the observation. Its internals stay platform-owned and cannot be rebuilt
 /// from loose metadata at the dispatch boundary.
-pub struct MacPreparedSemanticAction(PreparedKind);
+pub struct MacPreparedSemanticAction {
+    kind: PreparedKind,
+    signal_epoch: u64,
+}
 
 enum PreparedKind {
     AxAction {
@@ -65,6 +68,25 @@ enum PreparedKind {
 impl MacSemanticActions {
     pub fn new(windows: MacWindowRegistry) -> Self {
         Self { windows }
+    }
+
+    async fn element_click_candidate(
+        &self,
+        target: &mut MacTargetState,
+        element: &ResolvedElement,
+        spec: &ClickSpec,
+    ) -> Result<bool, NativeError> {
+        let live = self.refetch_exact(target, element).await?;
+        let Ok(action) = click_action(&live.snapshot.role, live.snapshot.subrole.as_deref(), spec)
+        else {
+            return Ok(false);
+        };
+        Ok(action == AX_PRESS
+            && live
+                .snapshot
+                .actions
+                .iter()
+                .any(|candidate| candidate == AX_PRESS))
     }
 
     async fn prepare(
@@ -184,7 +206,10 @@ impl MacSemanticActions {
                 ))
             }
         };
-        Ok(MacPreparedSemanticAction(prepared))
+        Ok(MacPreparedSemanticAction {
+            kind: prepared,
+            signal_epoch: target.signals.epoch(),
+        })
     }
 
     async fn prepare_scroll_route(
@@ -236,14 +261,18 @@ impl MacSemanticActions {
         &self,
         target: &mut MacTargetState,
         scope: &mut InteractionScope,
+        boundary: &mut NativeSideEffectBoundary<'_>,
         action: MacPreparedSemanticAction,
     ) -> Result<NativeDispatch, NativeError> {
-        match action.0 {
+        self.revalidate_prepared(target, scope.owner.clone(), scope.window.stamp(), &action)
+            .await?;
+        match action.kind {
             PreparedKind::AxAction {
                 element,
                 action,
                 primitive,
             } => {
+                boundary.begin()?;
                 perform_exact(element.as_ptr(), &action)?;
                 target.signals.record(SettlementSignal::AxAction);
                 Ok(dispatch(
@@ -285,6 +314,7 @@ impl MacSemanticActions {
                 );
                 let mut completed_pages = 0_u16;
                 for _ in 0..pages {
+                    boundary.begin()?;
                     let result = unsafe { bindings::perform_action(native, action) };
                     if result != kAXErrorSuccess {
                         return Err(NativeError::new(
@@ -315,6 +345,7 @@ impl MacSemanticActions {
                 ))
             }
             PreparedKind::SetValue { element, value } => {
+                boundary.begin()?;
                 let result =
                     unsafe { bindings::set_string_attr(element.as_ptr(), "AXValue", &value) };
                 if result != kAXErrorSuccess {
@@ -343,6 +374,7 @@ impl MacSemanticActions {
                 range,
                 expected_text,
             } => {
+                boundary.begin()?;
                 let result = unsafe {
                     bindings::set_cf_range_attr(element.as_ptr(), "AXSelectedTextRange", range)
                 };
@@ -380,6 +412,49 @@ impl MacSemanticActions {
                 ))
             }
         }
+    }
+
+    async fn revalidate_prepared(
+        &self,
+        target: &mut MacTargetState,
+        scope_owner: cua_driver_core::api::observation::ResolvedWindowStamp,
+        scope_window: cua_driver_core::api::observation::ResolvedWindowStamp,
+        action: &MacPreparedSemanticAction,
+    ) -> Result<(), NativeError> {
+        if target.invalidated() || scope_owner != target.window || scope_window != target.window {
+            return Err(NativeError::stale(
+                ErrorCode::WindowIdentityChanged,
+                "semantic target identity changed after native action preparation",
+            ));
+        }
+        let epoch = target.signals.epoch();
+        if epoch != action.signal_epoch {
+            return Err(NativeError::stale(
+                ErrorCode::ObservationRaced,
+                "semantic AX/content notification raced the final native validation",
+            ));
+        }
+        let snapshots: Vec<_> = match &action.kind {
+            PreparedKind::AxAction { element, .. }
+            | PreparedKind::SetValue { element, .. }
+            | PreparedKind::SelectText { element, .. } => vec![element.snapshot.clone()],
+            PreparedKind::PageScroll { route, .. } => match route {
+                PageRoute::Direct { element, .. }
+                | PageRoute::ScrollbarPageChild { element, .. } => {
+                    vec![element.snapshot.clone()]
+                }
+            },
+        };
+        for snapshot in snapshots {
+            self.refetch_registered_exact(target, snapshot).await?;
+        }
+        if target.signals.epoch() != epoch {
+            return Err(NativeError::stale(
+                ErrorCode::ObservationRaced,
+                "semantic AX/content notification raced the exact dispatch refetch",
+            ));
+        }
+        Ok(())
     }
 
     async fn refetch_exact(
@@ -938,6 +1013,15 @@ fn verification_error(message: impl Into<String>) -> NativeError {
 impl cua_driver_core::api::platform::SemanticActionProvider<MacTargetState> for MacSemanticActions {
     type PreparedAction = MacPreparedSemanticAction;
 
+    async fn element_click_candidate(
+        &self,
+        target: &mut MacTargetState,
+        element: &ResolvedElement,
+        spec: &ClickSpec,
+    ) -> Result<bool, NativeError> {
+        MacSemanticActions::element_click_candidate(self, target, element, spec).await
+    }
+
     async fn prepare(
         &self,
         target: &mut MacTargetState,
@@ -951,9 +1035,10 @@ impl cua_driver_core::api::platform::SemanticActionProvider<MacTargetState> for 
         &self,
         target: &mut MacTargetState,
         scope: &mut InteractionScope,
+        boundary: &mut NativeSideEffectBoundary<'_>,
         action: Self::PreparedAction,
     ) -> Result<NativeDispatch, NativeError> {
-        MacSemanticActions::dispatch(self, target, scope, action).await
+        MacSemanticActions::dispatch(self, target, scope, boundary, action).await
     }
 }
 

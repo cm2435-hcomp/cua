@@ -21,10 +21,9 @@ use super::{
         TypeTextCommand, VerificationLevel, WindowRef, WindowState,
     },
     errors::{ErrorCode, ErrorPhase, NativeError, PartialEvidence, PartialNativeDispatch},
-    interaction::{MutationDeadline, ScopePlan, ScopeRequirements},
+    interaction::{MutationDeadline, NativeSideEffectBoundary, ScopePlan, ScopeRequirements},
     observation::{
-        revision_accessibility, InvalidationReason, ObservationRecord, ResolvedDrag,
-        ResolvedScroll, ResolvedWindow,
+        revision_accessibility, ObservationRecord, ResolvedDrag, ResolvedScroll, ResolvedWindow,
     },
     platform::{
         ClickSpec, ElementScrollSpec, InteractionProvider, KeyboardActionProvider,
@@ -45,6 +44,12 @@ const DEFAULT_TARGET_IDLE_TTL: Duration = Duration::from_secs(300);
 const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_MUTATION_WORK_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MUTATION_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+enum PreparedDispatch<P: PlatformDriver> {
+    Semantic(<P::Semantic as SemanticActionProvider<P::TargetState>>::PreparedAction),
+    Pointer(<P::Pointer as PointerActionProvider<P::TargetState>>::PreparedAction),
+    Keyboard(<P::Keyboard as KeyboardActionProvider<P::TargetState>>::PreparedAction),
+}
 
 pub struct DriverController<P: PlatformDriver> {
     platform: Arc<P>,
@@ -151,13 +156,9 @@ impl<P: PlatformDriver> DriverController<P> {
             }
         };
         if !launch.posture.held {
-            let mut error = NativeError::new(
-                ErrorCode::PostureViolated,
-                ErrorPhase::Verify,
-                false,
-                "background launch changed the user's foreground posture",
-            )
-            .with_detail("action_id", action_id.to_string());
+            let mut error = NativeError::from_posture(&launch.posture)
+                .expect("a non-held launch posture must be unverifiable or violated")
+                .with_detail("action_id", action_id.to_string());
             error.partial_evidence = Some(Box::new(PartialEvidence::Launch {
                 action_id,
                 app: Some(launch.app),
@@ -211,6 +212,11 @@ impl<P: PlatformDriver> DriverController<P> {
             .targets
             .get_or_create(&self.platform, key, resolved.clone())
             .await?;
+        tracing::debug!(
+            target_instance_id = %target.instance_id,
+            operation = "get_window_state",
+            "v2 target controller acquired"
+        );
         let _process_guard = tokio::time::timeout(
             self.lock_timeout,
             Arc::clone(&target.mutation_lock).lock_owned(),
@@ -247,6 +253,7 @@ impl<P: PlatformDriver> DriverController<P> {
             .as_ref()
             .map(|accessibility| accessibility.normalized_tree.len())
             .unwrap_or(0);
+        let ax_base_revision = state.ax_revisions.last_revision().map(ToString::to_string);
         let revisioned = native
             .accessibility
             .map(|accessibility| {
@@ -258,6 +265,9 @@ impl<P: PlatformDriver> DriverController<P> {
                 )
             })
             .transpose()?;
+        let ax_result_revision = revisioned
+            .as_ref()
+            .map(|revisioned| revisioned.public.tree_update.revision().to_string());
 
         let mut surfaces = HashMap::new();
         for surface in native.surfaces {
@@ -313,6 +323,13 @@ impl<P: PlatformDriver> DriverController<P> {
         if let Some(revisioned) = revisioned {
             state.ax_revisions.commit(revisioned.prepared_revision);
         }
+        tracing::info!(
+            target_instance_id = %target.instance_id,
+            ax_base_revision = ax_base_revision.as_deref().unwrap_or("none"),
+            ax_result_revision = ax_result_revision.as_deref().unwrap_or("none"),
+            settlement_profile = %public.settlement.profile,
+            "v2 window observation committed"
+        );
         target.touch();
         Ok(public)
     }
@@ -397,13 +414,13 @@ impl<P: PlatformDriver> DriverController<P> {
                     &command.request.surface_id,
                     command.request.end,
                 )?;
-                Ok(ResolvedAction::Drag(ResolvedDrag {
+                Ok(ResolvedAction::Drag(Box::new(ResolvedDrag {
                     start,
                     end,
                     duration_ms: command.request.duration_ms,
                     button: command.request.button,
                     modifiers: command.request.modifiers,
-                }))
+                })))
             },
         )
         .await
@@ -664,24 +681,116 @@ impl<P: PlatformDriver> DriverController<P> {
         let prepared = prepare(&mut state, &resolved)?;
         validate_current_menu_target(&state, &prepared)?;
         let targeted_menu_id = resolved_action_menu_id(&prepared).cloned();
-        let capability_key = CapabilityKey {
-            platform: self.platform_name.clone(),
-            os_version: self.os_version.clone(),
-            action: action.clone(),
-            addressing,
-            framework: resolved.framework.clone(),
-            window_state: resolved.state.clone(),
-        };
-        let route = match self.capabilities.read().await.decision(&capability_key) {
-            RouteDecision::Supported { route } => route,
-            RouteDecision::Unsupported { reason } => {
-                return Err(NativeError::unsupported(reason)
-                    .with_detail("action", format!("{action:?}"))
-                    .with_detail("framework", format!("{:?}", resolved.framework)))
+        let (route, prepared) = if let ResolvedAction::ElementClick {
+            source,
+            element,
+            spec,
+        } = prepared
+        {
+            let semantic_usable = self
+                .platform
+                .semantic()
+                .element_click_candidate(&mut state.platform, &element, &spec)
+                .await?;
+            let semantic_key = capability_key(
+                &self.platform_name,
+                &self.os_version,
+                &action,
+                AddressingMode::Element,
+                &resolved,
+            );
+            let semantic_decision = self.capabilities.read().await.decision(&semantic_key);
+            match (semantic_usable, semantic_decision) {
+                (true, RouteDecision::Supported { route: Route::Semantic }) => (
+                    Route::Semantic,
+                    ResolvedAction::ElementClick {
+                        source,
+                        element,
+                        spec,
+                    },
+                ),
+                (true, RouteDecision::Supported { route }) => {
+                    return Err(NativeError::new(
+                        ErrorCode::Internal,
+                        ErrorPhase::Preflight,
+                        false,
+                        "element capability published a non-semantic route for an exact semantic click candidate",
+                    )
+                    .with_detail("published_route", format!("{route:?}")))
+                }
+                (semantic_usable, semantic_decision) => {
+                    let point = state.observations.resolve_element_point(&resolved, &source)?;
+                    let point_key = capability_key(
+                        &self.platform_name,
+                        &self.os_version,
+                        &action,
+                        AddressingMode::CapturedPoint,
+                        &resolved,
+                    );
+                    match self.capabilities.read().await.decision(&point_key) {
+                        RouteDecision::Supported {
+                            route: Route::TargetedPointer,
+                        } => (
+                            Route::TargetedPointer,
+                            ResolvedAction::PointClick { point, spec },
+                        ),
+                        RouteDecision::Supported { route } => {
+                            return Err(NativeError::new(
+                                ErrorCode::Internal,
+                                ErrorPhase::Preflight,
+                                false,
+                                "captured-point capability published a non-pointer route",
+                            )
+                            .with_detail("published_route", format!("{route:?}")))
+                        }
+                        RouteDecision::Unsupported { reason } => {
+                            let semantic_reason = match semantic_decision {
+                                RouteDecision::Unsupported { reason } => reason,
+                                RouteDecision::Supported { .. } if !semantic_usable => {
+                                    "element did not retain an exact usable semantic AXPress candidate"
+                                        .to_owned()
+                                }
+                                RouteDecision::Supported { .. } => unreachable!(),
+                            };
+                            return Err(NativeError::unsupported(
+                                "no exact background element-click route is currently usable",
+                            )
+                            .with_detail("semantic_reason", semantic_reason)
+                            .with_detail("captured_point_reason", reason)
+                            .with_detail("framework", format!("{:?}", resolved.framework)));
+                        }
+                    }
+                }
             }
+        } else {
+            let capability_key = capability_key(
+                &self.platform_name,
+                &self.os_version,
+                &action,
+                addressing,
+                &resolved,
+            );
+            let route = match self.capabilities.read().await.decision(&capability_key) {
+                RouteDecision::Supported { route } => route,
+                RouteDecision::Unsupported { reason } => {
+                    return Err(NativeError::unsupported(reason)
+                        .with_detail("action", format!("{action:?}"))
+                        .with_detail("framework", format!("{:?}", resolved.framework)))
+                }
+            };
+            (
+                route,
+                adapt_action_route(&mut state, &resolved, route, prepared)?,
+            )
         };
-        let prepared = adapt_action_route(&mut state, &resolved, route, prepared)?;
         let action_id = ActionId::new();
+        tracing::info!(
+            target_instance_id = %target.instance_id,
+            action_id = %action_id,
+            action_kind = ?action,
+            route = ?route,
+            "v2 mutation target and route acquired"
+        );
         let deadline =
             mutation_deadline(self.mutation_work_timeout, self.mutation_teardown_timeout)?;
         let mut requirements = ScopeRequirements::for_route(route);
@@ -717,6 +826,12 @@ impl<P: PlatformDriver> DriverController<P> {
         };
         ensure_scope_plan_matches(&scope_plan, &action_id, &resolved, route, deadline)?;
         let pending_menu_id = menu_opening.then(|| {
+            tracing::debug!(
+                target_instance_id = %target.instance_id,
+                action_id = %action_id,
+                menu_transition = "closed_to_opening",
+                "v2 menu lifecycle transition"
+            );
             state
                 .menu
                 .begin_open(action_id.clone(), resolved.public.clone(), resolved.stamp())
@@ -739,9 +854,29 @@ impl<P: PlatformDriver> DriverController<P> {
         };
         let mut scope = match scope_result {
             Ok(Ok(scope)) => scope,
-            Ok(Err(error)) => {
+            Ok(Err(mut error)) => {
                 if menu_opening {
                     state.menu.close();
+                }
+                if error.target_invalidated() {
+                    target.invalidate();
+                    drop(state);
+                    match tokio::time::timeout_at(
+                        deadline.teardown.into(),
+                        self.targets.remove_invalid_target(&self.platform, &key),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(removal_error)) => error = error.with_related(&removal_error),
+                        Err(_) => {
+                            error = error.with_related(&mutation_deadline_error(
+                                &action_id,
+                                ErrorPhase::Verify,
+                                "poisoned_target_teardown",
+                            ));
+                        }
+                    }
                 }
                 return Err(error);
             }
@@ -778,94 +913,88 @@ impl<P: PlatformDriver> DriverController<P> {
             }
         };
         scope.bind_target_validity(target.validity_handle());
-        let semantic_plan = if route == Route::Semantic {
-            let prepare_result = {
-                let platform = &mut state.platform;
-                tokio::time::timeout_at(
-                    deadline.work.into(),
-                    self.platform
-                        .semantic()
-                        .prepare(platform, &mut scope, &prepared),
-                )
-                .await
-            };
-            match prepare_result {
-                Ok(Ok(plan)) => Some(plan),
-                Ok(Err(error)) => {
-                    let teardown = scope.release();
-                    let teardown_failed = !teardown.failures.is_empty();
-                    if teardown_failed {
-                        target.invalidate();
-                    }
-                    let mut failures = vec![error];
-                    failures.extend(teardown.failures);
-                    if let Some(error) = NativeError::from_posture(&scope.posture) {
-                        failures.push(error);
-                    }
-                    let scope_evidence = serde_json::to_value(&scope.native_evidence)
-                        .expect("typed scope evidence must serialize");
-                    if teardown_failed {
-                        drop(state);
-                        match tokio::time::timeout_at(
-                            deadline.teardown.into(),
-                            self.targets.remove_invalid_target(&self.platform, &key),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(error)) => failures.push(error),
-                            Err(_) => failures.push(mutation_deadline_error(
-                                &action_id,
-                                ErrorPhase::Verify,
-                                "poisoned_target_teardown",
-                            )),
-                        }
-                    }
-                    let mut primary = NativeError::primary(failures)
-                        .expect("semantic prepare failure is nonempty");
-                    primary
-                        .details
-                        .insert("interaction_scope".to_owned(), scope_evidence);
-                    return Err(primary);
+        let dispatch_plan_result = {
+            let platform = &mut state.platform;
+            tokio::time::timeout_at(
+                deadline.work.into(),
+                self.prepare_dispatch(platform, &mut scope, &prepared),
+            )
+            .await
+        };
+        let dispatch_plan = match dispatch_plan_result {
+            Ok(Ok(plan)) => plan,
+            Ok(Err(error)) => {
+                let teardown = scope.release();
+                let teardown_failed = !teardown.failures.is_empty();
+                if teardown_failed {
+                    target.invalidate();
                 }
-                Err(_) => {
-                    let mut failures = vec![mutation_deadline_error(
-                        &action_id,
-                        ErrorPhase::Preflight,
-                        "semantic_prepare",
-                    )];
-                    let teardown = scope.release();
-                    let teardown_failed = !teardown.failures.is_empty();
-                    if teardown_failed {
-                        target.invalidate();
-                    }
-                    failures.extend(teardown.failures);
-                    if let Some(error) = NativeError::from_posture(&scope.posture) {
-                        failures.push(error);
-                    }
-                    if teardown_failed {
-                        drop(state);
-                        match tokio::time::timeout_at(
-                            deadline.teardown.into(),
-                            self.targets.remove_invalid_target(&self.platform, &key),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(error)) => failures.push(error),
-                            Err(_) => failures.push(mutation_deadline_error(
-                                &action_id,
-                                ErrorPhase::Verify,
-                                "poisoned_target_teardown",
-                            )),
-                        }
-                    }
-                    return Err(NativeError::primary(failures)
-                        .expect("semantic prepare timeout failure is nonempty"));
+                let mut failures = vec![error];
+                failures.extend(teardown.failures);
+                if let Some(error) = NativeError::from_posture(&scope.posture) {
+                    failures.push(error);
                 }
+                let scope_evidence = serde_json::to_value(&scope.native_evidence)
+                    .expect("typed scope evidence must serialize");
+                if teardown_failed {
+                    drop(state);
+                    match tokio::time::timeout_at(
+                        deadline.teardown.into(),
+                        self.targets.remove_invalid_target(&self.platform, &key),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => failures.push(error),
+                        Err(_) => failures.push(mutation_deadline_error(
+                            &action_id,
+                            ErrorPhase::Verify,
+                            "poisoned_target_teardown",
+                        )),
+                    }
+                }
+                let mut primary = NativeError::primary(failures)
+                    .expect("native action prepare failure is nonempty");
+                primary
+                    .details
+                    .insert("interaction_scope".to_owned(), scope_evidence);
+                return Err(primary);
             }
-        } else {
-            None
+            Err(_) => {
+                let mut failures = vec![mutation_deadline_error(
+                    &action_id,
+                    ErrorPhase::Preflight,
+                    "native_action_prepare",
+                )];
+                let teardown = scope.release();
+                let teardown_failed = !teardown.failures.is_empty();
+                if teardown_failed {
+                    target.invalidate();
+                }
+                failures.extend(teardown.failures);
+                if let Some(error) = NativeError::from_posture(&scope.posture) {
+                    failures.push(error);
+                }
+                if teardown_failed {
+                    drop(state);
+                    match tokio::time::timeout_at(
+                        deadline.teardown.into(),
+                        self.targets.remove_invalid_target(&self.platform, &key),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => failures.push(error),
+                        Err(_) => failures.push(mutation_deadline_error(
+                            &action_id,
+                            ErrorPhase::Verify,
+                            "poisoned_target_teardown",
+                        )),
+                    }
+                }
+                return Err(NativeError::primary(failures)
+                    .expect("native action prepare timeout failure is nonempty"));
+            }
         };
         if !menu_opening {
             if let Some(menu_id) = &targeted_menu_id {
@@ -905,28 +1034,101 @@ impl<P: PlatformDriver> DriverController<P> {
                         .insert("interaction_scope".to_owned(), scope_evidence);
                     return Err(primary);
                 }
+                tracing::debug!(
+                    target_instance_id = %target.instance_id,
+                    action_id = %action_id,
+                    menu_transition = "open_to_targeting",
+                    "v2 menu lifecycle transition"
+                );
             }
         }
 
-        // Core owns the dispatch boundary. Once provider code is entered the
-        // observation is consumed and target dirty even if the task is
-        // cancelled while awaiting native dispatch.
-        state
-            .observations
-            .consume(&observation_id, action_id.clone())?;
-        state
-            .observations
-            .invalidate_all(InvalidationReason::MutationDispatched);
-        let profile = settlement_profile(&action, menu_opening, requires_effect_verification);
-        state.settlement.mark_dirty(action_id.clone(), profile)?;
-        let dispatch_result = {
-            let platform = &mut state.platform;
-            tokio::time::timeout_at(
+        let profile =
+            settlement_profile(&action, route, menu_opening, requires_effect_verification);
+        // Refresh the store's current proof immediately before handing the
+        // provider its explicit first-native-side-effect boundary. The target
+        // lock prevents any concurrent core mutation of this record.
+        state.observations.current(&observation_id, &resolved)?;
+        let (dispatch_result, side_effect_started) = {
+            let TargetControllerState {
+                platform,
+                observations,
+                settlement,
+                ..
+            } = &mut *state;
+            let mut boundary = NativeSideEffectBoundary::new(
+                observations,
+                settlement,
+                observation_id.clone(),
+                action_id.clone(),
+                profile,
+            );
+            let result = tokio::time::timeout_at(
                 deadline.work.into(),
-                self.dispatch(platform, &mut scope, prepared, semantic_plan),
+                self.dispatch(platform, &mut scope, &mut boundary, prepared, dispatch_plan),
             )
-            .await
+            .await;
+            (result, boundary.started())
         };
+        if !side_effect_started {
+            if menu_opening || targeted_menu_id.is_some() {
+                state.menu.close();
+            }
+            let provider_failure = match dispatch_result {
+                Ok(Err(error)) => error,
+                Err(_) => mutation_deadline_error(
+                    &action_id,
+                    ErrorPhase::Preflight,
+                    "final_native_validation",
+                )
+                .with_detail("native_side_effect_started", false),
+                Ok(Ok(_)) => NativeError::new(
+                    ErrorCode::Internal,
+                    ErrorPhase::Dispatch,
+                    false,
+                    "native provider returned success without entering the first-side-effect boundary",
+                ),
+            };
+            let provider_invalidated = provider_failure.target_invalidated();
+            let teardown = scope.release();
+            let teardown_failed = !teardown.failures.is_empty();
+            if provider_invalidated || teardown_failed {
+                target.invalidate();
+            }
+            let mut failures = vec![provider_failure];
+            failures.extend(teardown.failures);
+            if let Some(error) = NativeError::from_posture(&scope.posture) {
+                failures.push(error);
+            }
+            let scope_evidence = serde_json::to_value(&scope.native_evidence)
+                .expect("typed scope evidence must serialize");
+            if provider_invalidated || teardown_failed {
+                drop(state);
+                match tokio::time::timeout_at(
+                    deadline.teardown.into(),
+                    self.targets.remove_invalid_target(&self.platform, &key),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => failures.push(error),
+                    Err(_) => failures.push(mutation_deadline_error(
+                        &action_id,
+                        ErrorPhase::Verify,
+                        "poisoned_target_teardown",
+                    )),
+                }
+            }
+            let mut primary =
+                NativeError::primary(failures).expect("pre-side-effect failure is nonempty");
+            primary
+                .details
+                .insert("interaction_scope".to_owned(), scope_evidence);
+            primary
+                .details
+                .insert("native_side_effect_started".to_owned(), false.into());
+            return Err(primary);
+        }
         let mut failures = Vec::new();
         let mut dispatch_timed_out = false;
         let dispatch = match dispatch_result {
@@ -939,6 +1141,9 @@ impl<P: PlatformDriver> DriverController<P> {
                 match result {
                     Ok(dispatch) => Some(dispatch),
                     Err(error) => {
+                        if error.target_invalidated() {
+                            target.invalidate();
+                        }
                         if menu_opening || targeted_menu_id.is_some() {
                             state.menu.close();
                         }
@@ -1002,6 +1207,7 @@ impl<P: PlatformDriver> DriverController<P> {
 
         let teardown = scope.release();
         let teardown_failed = !teardown.failures.is_empty();
+        let target_invalidated = target.ensure_valid().is_err();
         if teardown_failed {
             target.invalidate();
         }
@@ -1042,7 +1248,7 @@ impl<P: PlatformDriver> DriverController<P> {
             native_evidence: scope.native_evidence.clone(),
             pending_settlement,
         };
-        if teardown_failed {
+        if teardown_failed || target_invalidated {
             drop(state);
             match tokio::time::timeout_at(
                 deadline.teardown.into(),
@@ -1060,6 +1266,17 @@ impl<P: PlatformDriver> DriverController<P> {
             }
         }
         if let Some(mut error) = NativeError::primary(failures) {
+            tracing::warn!(
+                target_instance_id = %target.instance_id,
+                action_id = %action_id,
+                action_kind = ?action,
+                route = ?route,
+                verification = ?dispatch.as_ref().map(|dispatch| dispatch.verification),
+                posture_held = scope.posture.held,
+                settlement_outcome = settlement.as_ref().map_or("pending_or_failed", |_| "settled"),
+                error_code = ?error.code,
+                "v2 mutation completed with typed failure"
+            );
             error.partial_evidence = Some(Box::new(partial));
             return Err(error);
         }
@@ -1079,6 +1296,19 @@ impl<P: PlatformDriver> DriverController<P> {
             _ => None,
         };
         target.touch();
+        if let Some(receipt) = &receipt {
+            tracing::info!(
+                target_instance_id = %target.instance_id,
+                action_id = %receipt.action_id,
+                action_kind = ?action,
+                route = ?receipt.route,
+                verification = ?receipt.verification,
+                posture_held = receipt.posture.held,
+                settlement_profile = %receipt.settlement.profile,
+                settlement_outcome = "settled",
+                "v2 mutation completed"
+            );
+        }
         receipt.ok_or_else(|| {
             NativeError::new(
                 ErrorCode::Internal,
@@ -1155,63 +1385,85 @@ impl<P: PlatformDriver> DriverController<P> {
         }
     }
 
+    async fn prepare_dispatch(
+        &self,
+        target: &mut P::TargetState,
+        scope: &mut super::interaction::InteractionScope,
+        mutation: &ResolvedAction,
+    ) -> Result<PreparedDispatch<P>, NativeError> {
+        match mutation {
+            ResolvedAction::PressKey { .. } | ResolvedAction::TypeText { .. } => self
+                .platform
+                .keyboard()
+                .prepare(target, scope, mutation)
+                .await
+                .map(PreparedDispatch::Keyboard),
+            _ if scope.route == Route::Semantic => self
+                .platform
+                .semantic()
+                .prepare(target, scope, mutation)
+                .await
+                .map(PreparedDispatch::Semantic),
+            ResolvedAction::PointClick { .. }
+            | ResolvedAction::Drag(_)
+            | ResolvedAction::DeltaScroll(_)
+                if scope.route == Route::TargetedPointer =>
+            {
+                self.platform
+                    .pointer()
+                    .prepare(target, scope, mutation)
+                    .await
+                    .map(PreparedDispatch::Pointer)
+            }
+            _ => Err(NativeError::new(
+                ErrorCode::Internal,
+                ErrorPhase::Preflight,
+                false,
+                "resolved action and selected route have no native prepare provider",
+            )),
+        }
+    }
+
     async fn dispatch(
         &self,
         target: &mut P::TargetState,
         scope: &mut super::interaction::InteractionScope,
+        boundary: &mut NativeSideEffectBoundary<'_>,
         mutation: ResolvedAction,
-        semantic_plan: Option<
-            <P::Semantic as SemanticActionProvider<P::TargetState>>::PreparedAction,
-        >,
+        plan: PreparedDispatch<P>,
     ) -> Result<NativeDispatch, NativeError> {
-        if scope.route == Route::Semantic {
-            let plan = semantic_plan.ok_or_else(|| {
-                NativeError::new(
-                    ErrorCode::Internal,
-                    ErrorPhase::Dispatch,
-                    false,
-                    "semantic dispatch entered without its retained prepare plan",
-                )
-            })?;
-            return self.platform.semantic().dispatch(target, scope, plan).await;
-        }
-        if semantic_plan.is_some() {
-            return Err(NativeError::new(
+        match (mutation, plan) {
+            (
+                ResolvedAction::PressKey { .. } | ResolvedAction::TypeText { .. },
+                PreparedDispatch::Keyboard(plan),
+            ) if matches!(scope.route, Route::Semantic | Route::TargetedKeyboard) => {
+                self.platform
+                    .keyboard()
+                    .dispatch(target, scope, boundary, plan)
+                    .await
+            }
+            (
+                ResolvedAction::PointClick { .. }
+                | ResolvedAction::Drag(_)
+                | ResolvedAction::DeltaScroll(_),
+                PreparedDispatch::Pointer(plan),
+            ) if scope.route == Route::TargetedPointer => {
+                self.platform
+                    .pointer()
+                    .dispatch(target, scope, boundary, plan)
+                    .await
+            }
+            (_, PreparedDispatch::Semantic(plan)) if scope.route == Route::Semantic => {
+                self.platform
+                    .semantic()
+                    .dispatch(target, scope, boundary, plan)
+                    .await
+            }
+            _ => Err(NativeError::new(
                 ErrorCode::Internal,
                 ErrorPhase::Dispatch,
                 false,
-                "non-semantic dispatch received a semantic prepare plan",
-            ));
-        }
-        match mutation {
-            ResolvedAction::PointClick { point, spec } => {
-                self.platform.pointer().click(scope, point, spec).await
-            }
-            ResolvedAction::Drag(drag) => self.platform.pointer().drag(scope, drag).await,
-            ResolvedAction::DeltaScroll(scroll) => {
-                self.platform.pointer().scroll(scope, scroll).await
-            }
-            ResolvedAction::PressKey { focus, stroke } => {
-                self.platform
-                    .keyboard()
-                    .press_key(scope, &focus, stroke)
-                    .await
-            }
-            ResolvedAction::TypeText { focus, text } => {
-                self.platform
-                    .keyboard()
-                    .type_text(scope, &focus, &text)
-                    .await
-            }
-            ResolvedAction::ElementClick { .. }
-            | ResolvedAction::ElementScroll { .. }
-            | ResolvedAction::SetValue { .. }
-            | ResolvedAction::SelectText { .. }
-            | ResolvedAction::Secondary { .. } => Err(NativeError::new(
-                ErrorCode::Internal,
-                ErrorPhase::Dispatch,
-                false,
-                "element semantic action reached a non-semantic dispatch route",
+                "prepared native action did not match the resolved action provider and route",
             )),
         }
     }
@@ -1295,6 +1547,23 @@ fn resolved_action_menu_id(action: &ResolvedAction) -> Option<&super::contracts:
         | ResolvedAction::SelectText { element, .. }
         | ResolvedAction::Secondary { element, .. } => element.menu_id.as_ref(),
         _ => None,
+    }
+}
+
+fn capability_key(
+    platform: &PlatformName,
+    os_version: &str,
+    action: &ActionKind,
+    addressing: AddressingMode,
+    window: &ResolvedWindow,
+) -> CapabilityKey {
+    CapabilityKey {
+        platform: platform.clone(),
+        os_version: os_version.to_owned(),
+        action: action.clone(),
+        addressing,
+        framework: window.framework.clone(),
+        window_state: window.state.clone(),
     }
 }
 
@@ -1397,6 +1666,7 @@ fn mutation_deadline_error(
 
 fn settlement_profile(
     action: &ActionKind,
+    route: Route,
     menu_opening: bool,
     exact_readback: bool,
 ) -> SettlementProfile {
@@ -1425,6 +1695,7 @@ fn settlement_profile(
     }
     let relevant = match action {
         ActionKind::Click => vec![
+            SettlementSignal::PointerSequenceComplete,
             SettlementSignal::AxAction,
             SettlementSignal::AxValueChanged,
             SettlementSignal::FocusChanged,
@@ -1433,11 +1704,13 @@ fn settlement_profile(
             SettlementSignal::MenuDismissed,
         ],
         ActionKind::Drag => vec![
+            SettlementSignal::PointerSequenceComplete,
             SettlementSignal::AxAction,
             SettlementSignal::AxValueChanged,
             SettlementSignal::WindowGeometryChanged,
         ],
         ActionKind::Scroll => vec![
+            SettlementSignal::PointerSequenceComplete,
             SettlementSignal::ScrollChanged,
             SettlementSignal::AxValueChanged,
         ],
@@ -1456,8 +1729,13 @@ fn settlement_profile(
             SettlementSignal::WindowListChanged,
         ],
     };
-    SettlementProfile::dispatch_only(format!("{action:?}").to_lowercase())
-        .with_relevant_signals(relevant)
+    let name = format!("{action:?}").to_lowercase();
+    if route == Route::TargetedPointer {
+        SettlementProfile::requiring(name, [SettlementSignal::PointerSequenceComplete])
+            .with_relevant_signals(relevant)
+    } else {
+        SettlementProfile::dispatch_only(name).with_relevant_signals(relevant)
+    }
 }
 
 fn target_busy(window: &ResolvedWindow) -> NativeError {

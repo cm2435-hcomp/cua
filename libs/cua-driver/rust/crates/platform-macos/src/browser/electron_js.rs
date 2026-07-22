@@ -125,4 +125,3 @@ fn find_bundle_path_for_app(name: &str) -> Option<String> {
     }
     None
 }
-

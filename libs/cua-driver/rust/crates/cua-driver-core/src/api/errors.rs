@@ -65,6 +65,12 @@ pub struct NativeError {
     pub pending_settlement: Option<Box<PendingSettlementEvidence>>,
     #[serde(default)]
     pub related_failures: Vec<NativeErrorSummary>,
+    /// Internal platform-to-core containment signal. This is deliberately not
+    /// serialized: callers need the durable failure evidence above, while the
+    /// in-process controller needs a typed instruction never to reuse native
+    /// state whose cleanup could not be proved.
+    #[serde(skip)]
+    target_invalidated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -133,6 +139,7 @@ impl NativeError {
             partial_evidence: None,
             pending_settlement: None,
             related_failures: Vec::new(),
+            target_invalidated: false,
         }
     }
 
@@ -196,6 +203,15 @@ impl NativeError {
         self
     }
 
+    pub fn with_target_invalidated(mut self) -> Self {
+        self.target_invalidated = true;
+        self
+    }
+
+    pub fn target_invalidated(&self) -> bool {
+        self.target_invalidated
+    }
+
     pub fn precedence(&self) -> u8 {
         match self.code {
             ErrorCode::PostureViolated => 5,
@@ -217,6 +233,7 @@ impl NativeError {
             .max_by_key(|(_, error)| error.precedence())
             .map(|(index, _)| index)?;
         let mut primary = failures.remove(primary_index);
+        primary.target_invalidated |= failures.iter().any(Self::target_invalidated);
         primary
             .related_failures
             .extend(failures.iter().map(|failure| NativeErrorSummary {

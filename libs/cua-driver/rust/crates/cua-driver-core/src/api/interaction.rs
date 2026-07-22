@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    contracts::{ActionId, MenuId, Point, Route},
+    contracts::{ActionId, MenuId, ObservationId, Point, Route},
     errors::NativeError,
-    observation::{ResolvedWindow, ResolvedWindowStamp},
+    observation::{InvalidationReason, ObservationStore, ResolvedWindow, ResolvedWindowStamp},
+    settlement::{SettlementProfile, SettlementState},
     target::TargetValidityHandle,
 };
 
@@ -117,6 +118,65 @@ pub struct ScopeRequirements {
 pub struct MutationDeadline {
     pub work: Instant,
     pub teardown: Instant,
+}
+
+/// The single controller-owned transition into possibly mutating native UI.
+///
+/// Platform providers keep every fallible no-side-effect validation and native
+/// event construction before `begin`, then call it immediately before the
+/// first AX write/action or targeted event post. The transition is idempotent
+/// so cleanup posts can safely pass through the same boundary. While the
+/// target lock is held, no other core path can change these stores between
+/// action resolution and this transition.
+pub struct NativeSideEffectBoundary<'a> {
+    observations: &'a mut ObservationStore,
+    settlement: &'a mut SettlementState,
+    observation_id: ObservationId,
+    action_id: ActionId,
+    profile: SettlementProfile,
+    started: bool,
+}
+
+impl<'a> NativeSideEffectBoundary<'a> {
+    pub fn new(
+        observations: &'a mut ObservationStore,
+        settlement: &'a mut SettlementState,
+        observation_id: ObservationId,
+        action_id: ActionId,
+        profile: SettlementProfile,
+    ) -> Self {
+        debug_assert!(settlement.settled_evidence().is_some());
+        Self {
+            observations,
+            settlement,
+            observation_id,
+            action_id,
+            profile,
+            started: false,
+        }
+    }
+
+    /// Consume perception and mark the target dirty exactly once.
+    ///
+    /// A provider must call this only after its last no-side-effect check and
+    /// immediately before its first native mutation primitive.
+    pub fn begin(&mut self) -> Result<(), NativeError> {
+        if self.started {
+            return Ok(());
+        }
+        self.observations
+            .consume(&self.observation_id, self.action_id.clone())?;
+        self.observations
+            .invalidate_all(InvalidationReason::MutationDispatched);
+        self.settlement
+            .mark_dirty(self.action_id.clone(), self.profile.clone())?;
+        self.started = true;
+        Ok(())
+    }
+
+    pub fn started(&self) -> bool {
+        self.started
+    }
 }
 
 impl MutationDeadline {
@@ -310,6 +370,15 @@ impl InteractionScope {
 
     pub(crate) fn bind_target_validity(&mut self, target_validity: TargetValidityHandle) {
         self.target_validity = Some(target_validity);
+    }
+
+    /// Fail closed when a native provider cannot prove that partially posted
+    /// state was released. Core removes the poisoned controller after scope
+    /// teardown so the next observation constructs fresh native state.
+    pub fn invalidate_target(&self) {
+        if let Some(target_validity) = &self.target_validity {
+            target_validity.invalidate();
+        }
     }
 
     pub fn release(&mut self) -> ScopeTeardownOutcome {

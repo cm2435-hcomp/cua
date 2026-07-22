@@ -16,6 +16,11 @@ use super::target::{MacActiveBelief, MacFocusState};
 
 const PROVEN_OS_VERSION: &str = "26.5.1";
 const PROVEN_ARCHITECTURE: &str = "arm64";
+// The live F1b recipe posted KeyFocusReturned followed by NewFront. Route B's
+// recovered SLPS record has no subtype field, so those two grants are the same
+// make-key byte shape but must still be posted twice, in order.
+const PROVEN_CHROMIUM_GRANT_RECORDS: [SlpsMakeKeyState; 2] =
+    [SlpsMakeKeyState::MakeKey, SlpsMakeKeyState::MakeKey];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRecipeContext {
@@ -75,7 +80,7 @@ impl MacScopeRecipe {
         match self.target_belief {
             TargetBeliefRecipe::NotApplicable => "semantic_no_target_belief",
             TargetBeliefRecipe::ChromiumPointClickSlpsMakeKeyHost26_5_1Arm64 => {
-                "chromium_point_click_slps_make_key_macos_26_5_1_arm64"
+                "chromium_point_click_two_slps_make_key_records_macos_26_5_1_arm64"
             }
         }
     }
@@ -255,12 +260,31 @@ impl TargetBeliefLease {
             });
         }
 
-        if let Err(error) = poster.post(pid, window_id, SlpsMakeKeyState::MakeKey) {
-            state
-                .lock()
-                .expect("macOS focus coordinator poisoned")
-                .active_belief = None;
-            return Err(error);
+        let mut grants_posted = 0usize;
+        for grant in PROVEN_CHROMIUM_GRANT_RECORDS {
+            if let Err(error) = poster.post(pid, window_id, grant) {
+                let mut error = error
+                    .with_detail("grant_records_posted", grants_posted)
+                    .with_detail(
+                        "grant_records_expected",
+                        PROVEN_CHROMIUM_GRANT_RECORDS.len(),
+                    );
+                let mut rollback_complete = true;
+                if grants_posted > 0 {
+                    if let Err(cleanup) = poster.post(pid, window_id, SlpsMakeKeyState::RemoveKey) {
+                        rollback_complete = false;
+                        error = error.with_related(&cleanup);
+                    }
+                }
+                if rollback_complete {
+                    state
+                        .lock()
+                        .expect("macOS focus coordinator poisoned")
+                        .active_belief = None;
+                }
+                return Err(error);
+            }
+            grants_posted += 1;
         }
 
         Ok(Self {
@@ -324,7 +348,7 @@ mod tests {
 
     struct FakePoster {
         signals: Mutex<Vec<SlpsMakeKeyState>>,
-        fail: Option<SlpsMakeKeyState>,
+        fail_at: Vec<usize>,
     }
 
     impl TargetBeliefPoster for FakePoster {
@@ -334,8 +358,10 @@ mod tests {
             _window_id: u32,
             signal: SlpsMakeKeyState,
         ) -> Result<(), NativeError> {
-            self.signals.lock().unwrap().push(signal);
-            if self.fail == Some(signal) {
+            let mut signals = self.signals.lock().unwrap();
+            let index = signals.len();
+            signals.push(signal);
+            if self.fail_at.contains(&index) {
                 Err(NativeError::new(
                     ErrorCode::Internal,
                     ErrorPhase::Preflight,
@@ -384,6 +410,9 @@ mod tests {
                 surface_id: SurfaceId::parse("surface").unwrap(),
                 surface_owner: SurfaceOwner::Target(window.stamp()),
                 capture_revision: CaptureRevision::parse("capture").unwrap(),
+                observation_epoch: Some(cua_driver_core::api::observation::NativeObservationEpoch(
+                    0,
+                )),
                 surface_point: Point { x: 1.0, y: 1.0 },
                 window_point: Point { x: 1.0, y: 1.0 },
                 screen_point: Point { x: 1.0, y: 1.0 },
@@ -463,7 +492,7 @@ mod tests {
         let state = Arc::new(Mutex::new(MacFocusState::default()));
         let poster = Arc::new(FakePoster {
             signals: Mutex::new(Vec::new()),
-            fail: None,
+            fail_at: Vec::new(),
         });
         let mut lease = TargetBeliefLease::acquire_with(
             ActionId::parse("action").unwrap(),
@@ -475,13 +504,17 @@ mod tests {
         .unwrap();
         assert_eq!(
             poster.signals.lock().unwrap().as_slice(),
-            [SlpsMakeKeyState::MakeKey]
+            [SlpsMakeKeyState::MakeKey, SlpsMakeKeyState::MakeKey]
         );
         assert!(state.lock().unwrap().active_belief.is_some());
         lease.release().unwrap();
         assert_eq!(
             poster.signals.lock().unwrap().as_slice(),
-            [SlpsMakeKeyState::MakeKey, SlpsMakeKeyState::RemoveKey]
+            [
+                SlpsMakeKeyState::MakeKey,
+                SlpsMakeKeyState::MakeKey,
+                SlpsMakeKeyState::RemoveKey
+            ]
         );
         assert!(state.lock().unwrap().active_belief.is_none());
     }
@@ -491,7 +524,7 @@ mod tests {
         let state = Arc::new(Mutex::new(MacFocusState::default()));
         let poster = Arc::new(FakePoster {
             signals: Mutex::new(Vec::new()),
-            fail: Some(SlpsMakeKeyState::MakeKey),
+            fail_at: vec![0],
         });
         let error = TargetBeliefLease::acquire_with(
             ActionId::parse("action").unwrap(),
@@ -508,5 +541,62 @@ mod tests {
             [SlpsMakeKeyState::MakeKey]
         );
         assert!(state.lock().unwrap().active_belief.is_none());
+    }
+
+    #[test]
+    fn second_grant_failure_posts_paired_revoke_and_clears_ownership() {
+        let state = Arc::new(Mutex::new(MacFocusState::default()));
+        let poster = Arc::new(FakePoster {
+            signals: Mutex::new(Vec::new()),
+            fail_at: vec![1],
+        });
+        let error = TargetBeliefLease::acquire_with(
+            ActionId::parse("action").unwrap(),
+            44,
+            99,
+            Arc::clone(&state),
+            poster.clone(),
+        )
+        .err()
+        .expect("second grant failure must refuse the lease");
+        assert_eq!(error.phase, ErrorPhase::Preflight);
+        assert_eq!(error.details["grant_records_posted"], 1);
+        assert_eq!(
+            poster.signals.lock().unwrap().as_slice(),
+            [
+                SlpsMakeKeyState::MakeKey,
+                SlpsMakeKeyState::MakeKey,
+                SlpsMakeKeyState::RemoveKey
+            ]
+        );
+        assert!(state.lock().unwrap().active_belief.is_none());
+    }
+
+    #[test]
+    fn failed_partial_grant_rollback_keeps_ownership_for_poison_and_shutdown_retry() {
+        let state = Arc::new(Mutex::new(MacFocusState::default()));
+        let poster = Arc::new(FakePoster {
+            signals: Mutex::new(Vec::new()),
+            fail_at: vec![1, 2],
+        });
+        let error = TargetBeliefLease::acquire_with(
+            ActionId::parse("action").unwrap(),
+            44,
+            99,
+            Arc::clone(&state),
+            poster.clone(),
+        )
+        .err()
+        .expect("grant and rollback failure must refuse the lease");
+        assert_eq!(error.related_failures.len(), 1);
+        assert_eq!(
+            poster.signals.lock().unwrap().as_slice(),
+            [
+                SlpsMakeKeyState::MakeKey,
+                SlpsMakeKeyState::MakeKey,
+                SlpsMakeKeyState::RemoveKey
+            ]
+        );
+        assert!(state.lock().unwrap().active_belief.is_some());
     }
 }

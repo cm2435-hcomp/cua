@@ -1,16 +1,10 @@
 //! Composition root for the background-only macOS v2 platform driver.
 
-use async_trait::async_trait;
 use cua_driver_core::api::{
     capabilities::CapabilityCell,
-    contracts::KeyStroke,
     errors::NativeError,
-    interaction::InteractionScope,
-    observation::{ResolvedDrag, ResolvedFocus, ResolvedPoint, ResolvedScroll, ResolvedWindow},
-    platform::{
-        ClickSpec, KeyboardActionProvider, NativeDispatch, PlatformDriver, PointerActionProvider,
-        TargetFocusCoordinator,
-    },
+    observation::ResolvedWindow,
+    platform::{PlatformDriver, TargetFocusCoordinator},
 };
 
 pub mod actions;
@@ -24,7 +18,10 @@ pub mod settlement;
 pub mod target;
 pub mod windows;
 
-use actions::{semantic_capability_cells, MacSemanticActions};
+use actions::{
+    keyboard_capability_cells, pointer_capability_cells, semantic_capability_cells,
+    MacKeyboardActions, MacPointerActions, MacSemanticActions,
+};
 use interaction::MacInteractionProvider;
 use lifecycle::MacLifecycle;
 use observation::MacObservationProvider;
@@ -43,7 +40,8 @@ pub struct MacDriver {
     observation: MacObservationProvider,
     interaction: MacInteractionProvider,
     semantic: MacSemanticActions,
-    unavailable: UnavailableProvider,
+    pointer: MacPointerActions,
+    keyboard: MacKeyboardActions,
     invalidations: MacInvalidationHub,
 }
 
@@ -55,13 +53,16 @@ impl MacDriver {
         let observation = MacObservationProvider::new(windows.clone());
         let interaction = MacInteractionProvider::new(windows.clone());
         let semantic = MacSemanticActions::new(windows.clone());
+        let pointer = MacPointerActions::new(windows.clone());
+        let keyboard = MacKeyboardActions::new(windows.clone());
         Self {
             lifecycle,
             windows,
             observation,
             interaction,
             semantic,
-            unavailable: UnavailableProvider,
+            pointer,
+            keyboard,
             invalidations,
         }
     }
@@ -73,65 +74,7 @@ impl Default for MacDriver {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UnavailableProvider;
-
-fn later_plan(capability: &str) -> NativeError {
-    NativeError::unsupported(format!(
-        "macOS v2 {capability} is not implemented by the lifecycle/window provider"
-    ))
-}
-
-#[async_trait]
-impl PointerActionProvider for UnavailableProvider {
-    async fn click(
-        &self,
-        _scope: &mut InteractionScope,
-        _point: ResolvedPoint,
-        _click: ClickSpec,
-    ) -> Result<NativeDispatch, NativeError> {
-        Err(later_plan("pointer click"))
-    }
-
-    async fn drag(
-        &self,
-        _scope: &mut InteractionScope,
-        _drag: ResolvedDrag,
-    ) -> Result<NativeDispatch, NativeError> {
-        Err(later_plan("pointer drag"))
-    }
-
-    async fn scroll(
-        &self,
-        _scope: &mut InteractionScope,
-        _scroll: ResolvedScroll,
-    ) -> Result<NativeDispatch, NativeError> {
-        Err(later_plan("pointer scroll"))
-    }
-}
-
-#[async_trait]
-impl KeyboardActionProvider for UnavailableProvider {
-    async fn press_key(
-        &self,
-        _scope: &mut InteractionScope,
-        _focus: &ResolvedFocus,
-        _stroke: KeyStroke,
-    ) -> Result<NativeDispatch, NativeError> {
-        Err(later_plan("keyboard input"))
-    }
-
-    async fn type_text(
-        &self,
-        _scope: &mut InteractionScope,
-        _focus: &ResolvedFocus,
-        _text: &str,
-    ) -> Result<NativeDispatch, NativeError> {
-        Err(later_plan("text input"))
-    }
-}
-
-#[async_trait]
+#[async_trait::async_trait]
 impl PlatformDriver for MacDriver {
     type TargetState = MacTargetState;
     type TargetFocusCoordinator = MacTargetFocusCoordinator;
@@ -139,8 +82,8 @@ impl PlatformDriver for MacDriver {
     type Windows = MacWindowRegistry;
     type Observation = MacObservationProvider;
     type Semantic = MacSemanticActions;
-    type Pointer = UnavailableProvider;
-    type Keyboard = UnavailableProvider;
+    type Pointer = MacPointerActions;
+    type Keyboard = MacKeyboardActions;
     type Interaction = MacInteractionProvider;
     type Invalidations = MacInvalidationSubscription;
 
@@ -186,11 +129,11 @@ impl PlatformDriver for MacDriver {
     }
 
     fn pointer(&self) -> &Self::Pointer {
-        &self.unavailable
+        &self.pointer
     }
 
     fn keyboard(&self) -> &Self::Keyboard {
-        &self.unavailable
+        &self.keyboard
     }
 
     fn interaction(&self) -> &Self::Interaction {
@@ -198,7 +141,10 @@ impl PlatformDriver for MacDriver {
     }
 
     fn capability_cells(&self, os_version: &str) -> Vec<CapabilityCell> {
-        semantic_capability_cells(os_version)
+        let mut cells = semantic_capability_cells(os_version);
+        cells.extend(pointer_capability_cells(os_version));
+        cells.extend(keyboard_capability_cells(os_version));
+        cells
     }
 
     fn subscribe_invalidations(&self) -> Self::Invalidations {

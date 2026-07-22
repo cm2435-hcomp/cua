@@ -12,8 +12,8 @@ use super::{
     },
     errors::NativeError,
     interaction::{
-        InteractionScope, MutationDeadline, NativeEvidence, PostureResult, ScopePlan,
-        ScopeRequirements, TargetCursorHandle,
+        InteractionScope, MutationDeadline, NativeEvidence, NativeSideEffectBoundary,
+        PostureResult, ScopePlan, ScopeRequirements, TargetCursorHandle,
     },
     menu::NativeMenuEvidence,
     observation::{
@@ -116,7 +116,7 @@ pub enum ResolvedAction {
         point: ResolvedPoint,
         spec: ClickSpec,
     },
-    Drag(ResolvedDrag),
+    Drag(Box<ResolvedDrag>),
     ElementScroll {
         element: ResolvedElement,
         spec: ElementScrollSpec,
@@ -242,6 +242,17 @@ pub trait ObservationProvider<TargetState>: Send + Sync {
 pub trait SemanticActionProvider<TargetState>: Send + Sync {
     type PreparedAction: Send;
 
+    /// Determines whether an element click has an exact, currently usable
+    /// semantic primitive. A false result lets core resolve the element's
+    /// current observation-owned point and query the captured-point route.
+    /// Stale identity failures must be returned, never converted to fallback.
+    async fn element_click_candidate(
+        &self,
+        target: &mut TargetState,
+        element: &ResolvedElement,
+        spec: &ClickSpec,
+    ) -> Result<bool, NativeError>;
+
     async fn prepare(
         &self,
         target: &mut TargetState,
@@ -253,52 +264,58 @@ pub trait SemanticActionProvider<TargetState>: Send + Sync {
         &self,
         target: &mut TargetState,
         scope: &mut InteractionScope,
+        boundary: &mut NativeSideEffectBoundary<'_>,
         action: Self::PreparedAction,
     ) -> Result<NativeDispatch, NativeError>;
 }
 
-/// Dispatch-only targeted pointer operations.
+/// Two-phase targeted pointer operations under the locked native target state.
 ///
-/// Method entry is the controller-owned dispatch boundary. Implementations do
-/// not perform a second preflight and must treat cancellation as a potentially
-/// partial dispatch.
+/// `prepare` is side-effect free and retains the exact surface/capture/native
+/// route proof before core consumes the observation. `dispatch` is the
+/// controller-owned dispatch boundary and may only execute that retained plan.
 #[async_trait]
-pub trait PointerActionProvider: Send + Sync {
-    async fn click(
+pub trait PointerActionProvider<TargetState>: Send + Sync {
+    type PreparedAction: Send;
+
+    async fn prepare(
         &self,
+        target: &mut TargetState,
         scope: &mut InteractionScope,
-        point: ResolvedPoint,
-        click: ClickSpec,
-    ) -> Result<NativeDispatch, NativeError>;
-    async fn drag(
+        action: &ResolvedAction,
+    ) -> Result<Self::PreparedAction, NativeError>;
+
+    async fn dispatch(
         &self,
+        target: &mut TargetState,
         scope: &mut InteractionScope,
-        drag: ResolvedDrag,
-    ) -> Result<NativeDispatch, NativeError>;
-    async fn scroll(
-        &self,
-        scope: &mut InteractionScope,
-        scroll: ResolvedScroll,
+        boundary: &mut NativeSideEffectBoundary<'_>,
+        action: Self::PreparedAction,
     ) -> Result<NativeDispatch, NativeError>;
 }
 
-/// Dispatch-only keyboard operations against a core-resolved focus token.
+/// Two-phase keyboard operations against a core-resolved focus token.
 ///
-/// Method entry occurs after observation consumption and dirty marking. Any
-/// fallible focus or route preparation belongs in `InteractionProvider`.
+/// Normalization and exact native focus/route proof complete in `prepare`
+/// before observation consumption. `dispatch` may only execute the retained
+/// plan and must release any partially posted modifier sequence on failure.
 #[async_trait]
-pub trait KeyboardActionProvider: Send + Sync {
-    async fn press_key(
+pub trait KeyboardActionProvider<TargetState>: Send + Sync {
+    type PreparedAction: Send;
+
+    async fn prepare(
         &self,
+        target: &mut TargetState,
         scope: &mut InteractionScope,
-        focus: &ResolvedFocus,
-        stroke: KeyStroke,
-    ) -> Result<NativeDispatch, NativeError>;
-    async fn type_text(
+        action: &ResolvedAction,
+    ) -> Result<Self::PreparedAction, NativeError>;
+
+    async fn dispatch(
         &self,
+        target: &mut TargetState,
         scope: &mut InteractionScope,
-        focus: &ResolvedFocus,
-        text: &str,
+        boundary: &mut NativeSideEffectBoundary<'_>,
+        action: Self::PreparedAction,
     ) -> Result<NativeDispatch, NativeError>;
 }
 
@@ -347,8 +364,8 @@ pub trait PlatformDriver: Send + Sync + 'static {
     type Windows: WindowProvider;
     type Observation: ObservationProvider<Self::TargetState>;
     type Semantic: SemanticActionProvider<Self::TargetState>;
-    type Pointer: PointerActionProvider;
-    type Keyboard: KeyboardActionProvider;
+    type Pointer: PointerActionProvider<Self::TargetState>;
+    type Keyboard: KeyboardActionProvider<Self::TargetState>;
     type Interaction: InteractionProvider<Self::TargetState, Self::TargetFocusCoordinator>;
     type Invalidations: InvalidationSubscription;
 

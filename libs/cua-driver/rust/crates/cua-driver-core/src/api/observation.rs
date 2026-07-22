@@ -125,6 +125,12 @@ pub enum CaptureFreshness {
     Unavailable,
 }
 
+/// Opaque monotonic epoch produced by the native observation journal. Core
+/// carries it with captured pixels so the platform can reject a point if a
+/// native content/focus/AX signal races before the first post.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeObservationEpoch(pub u64);
+
 impl CaptureFreshness {
     pub fn action_safe(self) -> bool {
         matches!(self, Self::Fresh | Self::ReusedWithFreshCompletion)
@@ -143,6 +149,7 @@ pub struct SurfaceRecord {
     pub raster_size: Size,
     pub window_bounds: Option<Rect>,
     pub capture_revision: CaptureRevision,
+    pub observation_epoch: Option<NativeObservationEpoch>,
     pub transform: SurfaceToWindowTransform,
     pub freshness: CaptureFreshness,
     /// Exact native ownership for the pixels. Related transient surfaces are
@@ -357,6 +364,7 @@ pub struct ResolvedPoint {
     pub surface_id: SurfaceId,
     pub surface_owner: SurfaceOwner,
     pub capture_revision: CaptureRevision,
+    pub observation_epoch: Option<NativeObservationEpoch>,
     pub surface_point: Point,
     pub window_point: Point,
     pub screen_point: Point,
@@ -588,6 +596,7 @@ impl ObservationStore {
             surface_id: surface_id.clone(),
             surface_owner: surface.owner.clone(),
             capture_revision: surface.capture_revision.clone(),
+            observation_epoch: surface.observation_epoch,
             surface_point: point,
             window_point,
             screen_point,
@@ -1324,6 +1333,7 @@ mod store_tests {
                 },
                 window_bounds: None,
                 capture_revision: CaptureRevision::parse("related-capture").unwrap(),
+                observation_epoch: None,
                 transform: SurfaceToWindowTransform {
                     scale_x: 0.5,
                     scale_y: 0.5,

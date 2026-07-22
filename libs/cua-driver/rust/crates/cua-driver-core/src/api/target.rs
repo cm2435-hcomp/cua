@@ -10,6 +10,7 @@ use std::{
 };
 
 use tokio::sync::Mutex as AsyncMutex;
+use uuid::Uuid;
 
 use super::{
     contracts::{AppId, ClientId, WindowGeneration, WindowId},
@@ -90,6 +91,9 @@ pub struct TargetControllerState<P: PlatformDriver> {
 }
 
 pub struct TargetController<P: PlatformDriver> {
+    /// Opaque, process-local correlation id for content-free diagnostics.
+    /// It is not a stable public handle and never crosses the v2 wire.
+    pub instance_id: String,
     pub key: TargetKey,
     pub process: NativeProcessHandle,
     pub mutation_lock: SharedProcessMutationLock,
@@ -108,6 +112,7 @@ impl<P: PlatformDriver> TargetController<P> {
         mutation_lock: SharedProcessMutationLock,
     ) -> Self {
         Self {
+            instance_id: Uuid::new_v4().to_string(),
             key,
             process: window.process.clone(),
             mutation_lock,

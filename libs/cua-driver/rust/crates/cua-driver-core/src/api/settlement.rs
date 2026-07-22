@@ -11,6 +11,7 @@ use super::{contracts::ActionId, errors::NativeError};
 pub enum SettlementSignal {
     DispatchStarted,
     DispatchComplete,
+    PointerSequenceComplete,
     AxAction,
     AxValueChanged,
     FocusChanged,

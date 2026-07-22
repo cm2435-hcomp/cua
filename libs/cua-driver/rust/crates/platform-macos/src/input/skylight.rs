@@ -180,6 +180,13 @@ pub fn is_available() -> bool {
     post_to_pid_fn().is_some()
 }
 
+/// `true` only when the complete v2 targeted-pointer post and window-stamp
+/// route is present. The v2 driver refuses the capability instead of silently
+/// falling back to an unstamped or process-global event path.
+pub fn is_targeted_pointer_route_available() -> bool {
+    post_to_pid_fn().is_some() && set_window_loc_fn().is_some() && set_int_field_fn().is_some()
+}
+
 /// `true` when all three focus-without-raise SPIs resolved.
 pub fn is_focus_without_raise_available() -> bool {
     get_front_process_fn().is_some()

@@ -1,8 +1,13 @@
 //! Exact, background-safe macOS semantic action routes.
 
+mod keyboard;
+mod pointer;
 mod scroll;
 mod semantic;
 
+pub(crate) use keyboard::keyboard_capability_cells;
+pub use keyboard::MacKeyboardActions;
+pub use pointer::MacPointerActions;
 pub use semantic::MacSemanticActions;
 
 use cua_driver_core::api::{
@@ -75,6 +80,64 @@ pub(crate) fn semantic_capability_cells(os_version: &str) -> Vec<CapabilityCell>
     cells
 }
 
+pub(crate) fn pointer_capability_cells(os_version: &str) -> Vec<CapabilityCell> {
+    let frameworks = [
+        Framework::Unknown,
+        Framework::AppKit,
+        Framework::Chromium,
+        Framework::Electron,
+        Framework::WebKit,
+        Framework::Catalyst,
+    ];
+    let actions = [ActionKind::Click, ActionKind::Drag, ActionKind::Scroll];
+    let states = [
+        WindowStateKind::Visible,
+        WindowStateKind::Occluded,
+        WindowStateKind::Minimized,
+        WindowStateKind::OffSpace,
+        WindowStateKind::Unknown,
+    ];
+    let architecture = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        value => value,
+    };
+    let mut cells = Vec::with_capacity(frameworks.len() * actions.len() * states.len());
+    for framework in frameworks {
+        for action in &actions {
+            for state in &states {
+                let proven_click = os_version == "26.5.1"
+                    && architecture == "arm64"
+                    && framework == Framework::Chromium
+                    && *action == ActionKind::Click
+                    && *state == WindowStateKind::Visible;
+                let decision = if proven_click {
+                    RouteDecision::Supported {
+                        route: Route::TargetedPointer,
+                    }
+                } else {
+                    RouteDecision::Unsupported {
+                        reason: format!(
+                            "recipe_unproven: targeted pointer {action:?} is not manually proved for macOS {os_version} {architecture} {framework:?} {state:?}"
+                        ),
+                    }
+                };
+                cells.push(CapabilityCell {
+                    key: CapabilityKey {
+                        platform: PlatformName::Macos,
+                        os_version: os_version.to_owned(),
+                        action: action.clone(),
+                        addressing: AddressingMode::CapturedPoint,
+                        framework: framework.clone(),
+                        window_state: state.clone(),
+                    },
+                    decision,
+                });
+            }
+        }
+    }
+    cells
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +171,42 @@ mod tests {
             cell.key.framework,
             Framework::Electron | Framework::Catalyst
         )));
+    }
+
+    #[test]
+    fn targeted_pointer_cells_publish_only_the_proven_chromium_click_posture() {
+        let cells = pointer_capability_cells("26.5.1");
+        assert_eq!(cells.len(), 90);
+        let supported: Vec<_> = cells
+            .iter()
+            .filter(|cell| matches!(cell.decision, RouteDecision::Supported { .. }))
+            .collect();
+        if std::env::consts::ARCH == "aarch64" {
+            assert_eq!(supported.len(), 1);
+            assert!(supported.iter().all(|cell| {
+                cell.key.action == ActionKind::Click
+                    && cell.key.addressing == AddressingMode::CapturedPoint
+                    && cell.key.framework == Framework::Chromium
+                    && cell.key.window_state == WindowStateKind::Visible
+                    && matches!(
+                        cell.decision,
+                        RouteDecision::Supported {
+                            route: Route::TargetedPointer
+                        }
+                    )
+            }));
+            assert!(cells.iter().any(|cell| {
+                cell.key.action == ActionKind::Click
+                    && cell.key.framework == Framework::Chromium
+                    && cell.key.window_state == WindowStateKind::Occluded
+                    && matches!(cell.decision, RouteDecision::Unsupported { .. })
+            }));
+        } else {
+            assert!(supported.is_empty());
+        }
+        assert!(cells
+            .iter()
+            .filter(|cell| matches!(cell.key.action, ActionKind::Drag | ActionKind::Scroll))
+            .all(|cell| matches!(cell.decision, RouteDecision::Unsupported { .. })));
     }
 }

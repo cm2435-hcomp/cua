@@ -25,7 +25,7 @@ use crate::{
     apps::nsworkspace::WorkspaceEventHub,
     ax::enablement::AxEnablementLease,
     focus_steal::{SuppressionLease, SuppressionOutcome},
-    input::slps_make_key,
+    input::{keyboard::normalize_chord, slps_make_key},
 };
 
 use super::{
@@ -38,6 +38,9 @@ use super::{
     target::{MacFocusState, MacTargetFocusCoordinator, MacTargetState},
     windows::{MacWindowFacts, MacWindowRegistry},
 };
+
+#[cfg(test)]
+use super::target::MacActiveBelief;
 
 const CONTAINMENT_BARRIER_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -361,6 +364,11 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
         ensure_target_live(target, focus, window)?;
         let facts = self.windows.facts_for_stamp(&window.stamp()).await?;
         ensure_native_facts_match(&facts, target, window)?;
+        if let ResolvedAction::PressKey { stroke, .. } = action {
+            // Platform key vocabulary is validated before any posture,
+            // accessibility, containment, or target-belief lease is acquired.
+            normalize_chord(stroke)?;
+        }
         let recipe =
             select_scope_recipe(&self.host, &window.framework, route, action, &requirements)?;
         if recipe.target_belief != TargetBeliefRecipe::NotApplicable && !slps_make_key::available()
@@ -505,7 +513,9 @@ fn acquire_resources(
         failures.extend(outcome.failures);
         let mut combined = NativeError::primary(failures).expect("acquisition failure is nonempty");
         if belief_still_active {
-            combined = combined.with_detail("target_poisoned", true);
+            combined = combined
+                .with_detail("target_poisoned", true)
+                .with_target_invalidated();
         }
         return Err(combined);
     }
@@ -782,6 +792,7 @@ mod tests {
         log: Arc<Mutex<Vec<&'static str>>>,
         containment_deadlines: Arc<Mutex<Vec<Instant>>>,
         fail_at: Option<&'static str>,
+        poison_belief: bool,
     }
 
     impl LoggingHooks {
@@ -849,8 +860,24 @@ mod tests {
             _action_id: &ActionId,
             _pid: i32,
             _cg_window_id: u32,
-            _focus_state: Arc<Mutex<MacFocusState>>,
+            focus_state: Arc<Mutex<MacFocusState>>,
         ) -> Result<Option<Box<dyn LeaseResource>>, NativeError> {
+            if self.poison_belief {
+                focus_state
+                    .lock()
+                    .expect("macOS focus coordinator poisoned")
+                    .active_belief = Some(MacActiveBelief {
+                    action_id: ActionId::parse("partial-belief").unwrap(),
+                    pid: 44,
+                    cg_window_id: 99,
+                });
+                return Err(NativeError::new(
+                    ErrorCode::Internal,
+                    ErrorPhase::Preflight,
+                    false,
+                    "injected partial belief rollback failure",
+                ));
+            }
             self.acquire("belief+", "belief-")
         }
     }
@@ -934,6 +961,7 @@ mod tests {
             log: Arc::clone(&log),
             containment_deadlines: Arc::new(Mutex::new(Vec::new())),
             fail_at: None,
+            poison_belief: false,
         };
         let poison = Arc::new(AtomicBool::new(false));
         let plan = scope_plan();
@@ -1007,6 +1035,7 @@ mod tests {
                 log: Arc::clone(&log),
                 containment_deadlines: Arc::new(Mutex::new(Vec::new())),
                 fail_at: Some(fail_at),
+                poison_belief: false,
             };
             let error = acquire_resources(
                 &hooks,
@@ -1019,6 +1048,36 @@ mod tests {
             assert_eq!(error.phase, ErrorPhase::Preflight);
             assert_eq!(*log.lock().unwrap(), expected, "failure at {fail_at}");
         }
+    }
+
+    #[test]
+    fn partial_target_belief_rollback_emits_typed_core_invalidation_signal() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let hooks = LoggingHooks {
+            log,
+            containment_deadlines: Arc::new(Mutex::new(Vec::new())),
+            fail_at: None,
+            poison_belief: true,
+        };
+        let poison = Arc::new(AtomicBool::new(false));
+        let focus_state = Arc::new(Mutex::new(MacFocusState::default()));
+        let error = acquire_resources(
+            &hooks,
+            &scope_plan(),
+            Arc::clone(&poison),
+            Arc::clone(&focus_state),
+        )
+        .err()
+        .expect("partial belief rollback must refuse acquisition");
+
+        assert!(error.target_invalidated());
+        assert_eq!(error.details["target_poisoned"], true);
+        assert!(poison.load(Ordering::Acquire));
+        assert!(focus_state
+            .lock()
+            .expect("macOS focus coordinator poisoned")
+            .active_belief
+            .is_some());
     }
 
     #[test]

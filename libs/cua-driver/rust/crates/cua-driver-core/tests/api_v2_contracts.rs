@@ -393,7 +393,10 @@ struct FakePlatform {
     preflight_action_ids: Arc<Mutex<Vec<ActionId>>>,
     acquired_action_ids: Arc<Mutex<Vec<ActionId>>>,
     block_dispatch: std::sync::atomic::AtomicBool,
+    block_before_boundary: std::sync::atomic::AtomicBool,
     dispatch_fail: std::sync::atomic::AtomicBool,
+    dispatch_poison: std::sync::atomic::AtomicBool,
+    semantic_candidate_unusable: std::sync::atomic::AtomicBool,
     semantic_prepare_fail: std::sync::atomic::AtomicBool,
     semantic_verification_fail: std::sync::atomic::AtomicBool,
     observation_role: Mutex<Option<String>>,
@@ -401,6 +404,8 @@ struct FakePlatform {
     cleanup_posture_violated: std::sync::atomic::AtomicBool,
     settle_pending: std::sync::atomic::AtomicBool,
     launch_fail: std::sync::atomic::AtomicBool,
+    launch_posture_unverifiable: std::sync::atomic::AtomicBool,
+    launch_posture_violation: std::sync::atomic::AtomicBool,
     refresh_geometry_during_observe: std::sync::atomic::AtomicBool,
     dispatch_entered: Notify,
 }
@@ -484,7 +489,10 @@ impl LifecycleProvider for FakePlatform {
         })
     }
 
-    async fn list_apps(&self, _query: AppQuery) -> Result<Vec<AppRef>, NativeError> {
+    async fn list_apps(&self, query: AppQuery) -> Result<Vec<AppRef>, NativeError> {
+        if query.name_contains.as_deref() == Some("slow-protocol-read") {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         Ok(vec![app_ref()])
     }
 
@@ -495,7 +503,9 @@ impl LifecycleProvider for FakePlatform {
     ) -> Result<NativeLaunch, NativeError> {
         posture.begin_launch();
         posture.record_partial_result(app_ref(), vec![window_ref()]);
-        posture.posture.held = true;
+        posture.posture.held = !self.launch_posture_unverifiable.load(Ordering::SeqCst)
+            && !self.launch_posture_violation.load(Ordering::SeqCst);
+        posture.posture.frontmost_changed = self.launch_posture_violation.load(Ordering::SeqCst);
         posture.pending_settlement = Some(PendingSettlementEvidence {
             state: PendingSettlementState::Pending,
             trigger_action_id: posture
@@ -554,6 +564,37 @@ async fn post_dispatch_launch_failure_keeps_exact_partial_and_pending_evidence()
     assert_eq!(windows, &vec![window_ref()]);
     assert!(posture.held);
     assert_eq!(pending.trigger_action_id, *action_id);
+}
+
+#[tokio::test]
+async fn launch_posture_distinguishes_unverifiable_from_observed_violation() {
+    for (unverifiable, violation, expected) in [
+        (true, false, ErrorCode::PostureUnverifiable),
+        (false, true, ErrorCode::PostureViolated),
+    ] {
+        let platform = Arc::new(FakePlatform::default());
+        platform
+            .launch_posture_unverifiable
+            .store(unverifiable, Ordering::SeqCst);
+        platform
+            .launch_posture_violation
+            .store(violation, Ordering::SeqCst);
+        let controller = DriverController::new(platform, PlatformName::Macos, "test-os");
+        let error = controller
+            .launch_app(LaunchAppRequest {
+                app: AppSelector::BundleId {
+                    bundle_id: "com.example.fixture".to_owned(),
+                },
+            })
+            .await
+            .expect_err("non-held launch posture must fail");
+        assert_eq!(error.code, expected);
+        assert_eq!(error.phase, ErrorPhase::Verify);
+        assert!(matches!(
+            error.partial_evidence.as_deref(),
+            Some(PartialEvidence::Launch { posture, .. }) if !posture.held
+        ));
+    }
 }
 
 #[async_trait]
@@ -667,6 +708,7 @@ impl ObservationProvider<FakeTargetState> for FakePlatform {
                     &format!("capture-{observation_suffix}"),
                     CaptureRevision::parse,
                 ),
+                observation_epoch: None,
                 transform: SurfaceToWindowTransform {
                     scale_x: 1.0,
                     scale_y: 1.0,
@@ -719,6 +761,19 @@ impl ObservationProvider<FakeTargetState> for FakePlatform {
 impl SemanticActionProvider<FakeTargetState> for FakePlatform {
     type PreparedAction = FakePreparedSemantic;
 
+    async fn element_click_candidate(
+        &self,
+        _target: &mut FakeTargetState,
+        element: &ResolvedElement,
+        spec: &ClickSpec,
+    ) -> Result<bool, NativeError> {
+        Ok(!self.semantic_candidate_unusable.load(Ordering::SeqCst)
+            && spec.button == MouseButton::Left
+            && spec.click_count == 1
+            && spec.modifiers.is_empty()
+            && element.actions.iter().any(|action| action == "AXPress"))
+    }
+
     async fn prepare(
         &self,
         _target: &mut FakeTargetState,
@@ -761,8 +816,10 @@ impl SemanticActionProvider<FakeTargetState> for FakePlatform {
         &self,
         target: &mut FakeTargetState,
         _scope: &mut InteractionScope,
+        boundary: &mut NativeSideEffectBoundary<'_>,
         action: Self::PreparedAction,
     ) -> Result<NativeDispatch, NativeError> {
+        boundary.begin()?;
         target.semantic_dispatches += 1;
         self.dispatch_count.fetch_add(1, Ordering::SeqCst);
         self.record("dispatch");
@@ -787,13 +844,32 @@ impl SemanticActionProvider<FakeTargetState> for FakePlatform {
 }
 
 #[async_trait]
-impl PointerActionProvider for FakePlatform {
-    async fn click(
+impl PointerActionProvider<FakeTargetState> for FakePlatform {
+    type PreparedAction = ResolvedAction;
+
+    async fn prepare(
         &self,
+        _target: &mut FakeTargetState,
         _scope: &mut InteractionScope,
-        _point: ResolvedPoint,
-        _click: ClickSpec,
+        action: &ResolvedAction,
+    ) -> Result<Self::PreparedAction, NativeError> {
+        self.record("pointer_prepare");
+        Ok(action.clone())
+    }
+
+    async fn dispatch(
+        &self,
+        _target: &mut FakeTargetState,
+        _scope: &mut InteractionScope,
+        boundary: &mut NativeSideEffectBoundary<'_>,
+        _action: Self::PreparedAction,
     ) -> Result<NativeDispatch, NativeError> {
+        if self.block_before_boundary.load(Ordering::SeqCst) {
+            self.dispatch_entered.notify_waiters();
+            std::future::pending::<()>().await;
+        }
+        boundary.begin()?;
+        boundary.begin()?;
         self.dispatch_count.fetch_add(1, Ordering::SeqCst);
         self.record("dispatch");
         if self.block_dispatch.load(Ordering::SeqCst) {
@@ -808,42 +884,39 @@ impl PointerActionProvider for FakePlatform {
                 "fake dispatch failure",
             ));
         }
+        if self.dispatch_poison.load(Ordering::SeqCst) {
+            return Err(NativeError::new(
+                ErrorCode::DispatchFailed,
+                ErrorPhase::Dispatch,
+                false,
+                "fake native cleanup could not be proved",
+            )
+            .with_target_invalidated());
+        }
         Ok(NativeDispatch::dispatch_verified())
-    }
-
-    async fn drag(
-        &self,
-        _scope: &mut InteractionScope,
-        _drag: ResolvedDrag,
-    ) -> Result<NativeDispatch, NativeError> {
-        Err(NativeError::unsupported("not used by this fixture"))
-    }
-
-    async fn scroll(
-        &self,
-        _scope: &mut InteractionScope,
-        _scroll: ResolvedScroll,
-    ) -> Result<NativeDispatch, NativeError> {
-        Err(NativeError::unsupported("not used by this fixture"))
     }
 }
 
 #[async_trait]
-impl KeyboardActionProvider for FakePlatform {
-    async fn press_key(
+impl KeyboardActionProvider<FakeTargetState> for FakePlatform {
+    type PreparedAction = ResolvedAction;
+
+    async fn prepare(
         &self,
+        _target: &mut FakeTargetState,
         _scope: &mut InteractionScope,
-        _focus: &ResolvedFocus,
-        _stroke: KeyStroke,
-    ) -> Result<NativeDispatch, NativeError> {
-        Err(NativeError::unsupported("not used by this fixture"))
+        action: &ResolvedAction,
+    ) -> Result<Self::PreparedAction, NativeError> {
+        self.record("keyboard_prepare");
+        Ok(action.clone())
     }
 
-    async fn type_text(
+    async fn dispatch(
         &self,
+        _target: &mut FakeTargetState,
         _scope: &mut InteractionScope,
-        _focus: &ResolvedFocus,
-        _text: &str,
+        _boundary: &mut NativeSideEffectBoundary<'_>,
+        _action: Self::PreparedAction,
     ) -> Result<NativeDispatch, NativeError> {
         Err(NativeError::unsupported("not used by this fixture"))
     }
@@ -1052,6 +1125,61 @@ impl PlatformDriver for FakePlatform {
 }
 
 #[tokio::test]
+async fn keyboard_actions_reject_unknown_observations_before_provider_prepare() {
+    let platform = Arc::new(FakePlatform::default());
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
+    let client = id("keyboard-stale-client", ClientId::parse);
+    controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: false,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+
+    let missing = id("missing-observation", ObservationId::parse);
+    let press_error = controller
+        .press_key(
+            &client,
+            PressKeyCommand {
+                window: window_ref(),
+                request: PressKeyRequest {
+                    observation_id: missing.clone(),
+                    stroke: KeyStroke {
+                        key: "a".to_owned(),
+                        modifiers: Vec::new(),
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+    let type_error = controller
+        .type_text(
+            &client,
+            TypeTextCommand {
+                window: window_ref(),
+                request: TypeTextRequest {
+                    observation_id: missing,
+                    text: "content-never-reaches-provider".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    for error in [press_error, type_error] {
+        assert_eq!(error.code, ErrorCode::ObservationStale);
+    }
+    assert_eq!(platform.ordering.lock().unwrap().as_slice(), ["observe"]);
+}
+
+#[tokio::test]
 async fn controller_preserves_target_state_and_consumes_at_dispatch_boundary() {
     let platform = Arc::new(FakePlatform::default());
     let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
@@ -1175,6 +1303,7 @@ async fn controller_preserves_target_state_and_consumes_at_dispatch_boundary() {
             "observe",
             "preflight",
             "scope_acquired",
+            "pointer_prepare",
             "dispatch",
             "settle",
             "scope_released"
@@ -1339,6 +1468,67 @@ async fn semantic_element_dispatch_uses_the_locked_target_and_interaction_scope(
             "settle",
             "scope_released"
         ]
+    );
+}
+
+#[tokio::test]
+async fn element_click_without_exact_semantic_candidate_uses_current_observation_point_route() {
+    let platform = Arc::new(FakePlatform::default());
+    platform
+        .semantic_candidate_unusable
+        .store(true, Ordering::SeqCst);
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
+    let client = id("element-point-fallback-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    let element = observed.accessibility.as_ref().unwrap().elements[0]
+        .element_ref
+        .clone();
+
+    let receipt = controller
+        .click(
+            &client,
+            ClickCommand {
+                window: window_ref(),
+                request: ClickRequest {
+                    target: ClickTarget::Element { element },
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Vec::new(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.route, Route::TargetedPointer);
+    assert!(platform
+        .ordering
+        .lock()
+        .unwrap()
+        .contains(&"pointer_prepare"));
+    assert_eq!(
+        controller
+            .targets
+            .get(&TargetKey::from_window(client, &resolved_window()))
+            .await
+            .unwrap()
+            .state
+            .lock()
+            .await
+            .platform
+            .semantic_dispatches,
+        0
     );
 }
 
@@ -1784,6 +1974,73 @@ async fn posture_violation_remains_primary_and_keeps_every_cleanup_failure() {
 }
 
 #[tokio::test]
+async fn cancellation_before_first_native_side_effect_preserves_current_settled_observation() {
+    let platform = Arc::new(FakePlatform::default());
+    let controller = Arc::new(DriverController::new(
+        Arc::clone(&platform),
+        PlatformName::Macos,
+        "test-os",
+    ));
+    let client = id("cancel-before-boundary-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    let command = ClickCommand {
+        window: window_ref(),
+        request: ClickRequest {
+            target: ClickTarget::Point {
+                observation_id: observed.observation_id.clone(),
+                surface_id: observed.surfaces[0].id.clone(),
+                point: Point { x: 20.0, y: 20.0 },
+            },
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: Vec::new(),
+        },
+    };
+
+    platform.block_before_boundary.store(true, Ordering::SeqCst);
+    let dispatch_entered = platform.dispatch_entered.notified();
+    let action = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let client = client.clone();
+        let command = command.clone();
+        async move { controller.click(&client, command).await }
+    });
+    dispatch_entered.await;
+    action.abort();
+    assert!(action.await.unwrap_err().is_cancelled());
+    assert_eq!(platform.cleanup_count.load(Ordering::SeqCst), 1);
+
+    let target = controller
+        .targets
+        .get(&TargetKey::from_window(client.clone(), &resolved_window()))
+        .await
+        .unwrap();
+    let mut state = target.state.lock().await;
+    assert!(state.settlement.settled_evidence().is_some());
+    state
+        .observations
+        .current(&observed.observation_id, &resolved_window())
+        .expect("pre-boundary cancellation must preserve the current observation");
+    drop(state);
+
+    platform
+        .block_before_boundary
+        .store(false, Ordering::SeqCst);
+    controller.click(&client, command).await.unwrap();
+}
+
+#[tokio::test]
 async fn cancellation_inside_provider_leaves_observation_consumed_and_target_dirty() {
     let platform = Arc::new(FakePlatform::default());
     let controller = Arc::new(DriverController::new(
@@ -1908,6 +2165,67 @@ async fn cancellation_cleanup_failure_poison_is_rebuilt_by_the_next_observation(
 
     platform.block_dispatch.store(false, Ordering::SeqCst);
     platform.cleanup_failure_count.store(0, Ordering::SeqCst);
+    controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(platform.target_creations.load(Ordering::SeqCst), 2);
+    assert_eq!(platform.shutdowns.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn typed_native_cleanup_poison_removes_target_and_forces_rebuild() {
+    let platform = Arc::new(FakePlatform::default());
+    platform.dispatch_poison.store(true, Ordering::SeqCst);
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
+    let client = id("native-cleanup-poison-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    let error = controller
+        .click(
+            &client,
+            ClickCommand {
+                window: window_ref(),
+                request: ClickRequest {
+                    target: ClickTarget::Point {
+                        observation_id: observed.observation_id,
+                        surface_id: observed.surfaces[0].id.clone(),
+                        point: Point { x: 20.0, y: 20.0 },
+                    },
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Vec::new(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::DispatchFailed);
+    assert!(controller
+        .targets
+        .get(&TargetKey::from_window(client.clone(), &resolved_window()))
+        .await
+        .is_err());
+
+    platform.dispatch_poison.store(false, Ordering::SeqCst);
     controller
         .get_window_state(
             &client,
@@ -2162,6 +2480,203 @@ fn menu_state_only_publishes_stable_lifecycle_states() {
         menu.observation().unwrap(),
         MenuState::Closed { .. }
     ));
+}
+
+#[tokio::test]
+async fn native_v2_stdio_drains_deadline_owned_work_before_eof_cleanup() {
+    use cua_driver_core::{
+        protocol::{V2HandshakeRequest, V2HandshakeResponse, V2_METHODS},
+        server::{run_v2_io, V2ServerMetadata},
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn write_json(
+        writer: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        value: &impl serde::Serialize,
+    ) {
+        writer
+            .write_all(serde_json::to_string(value).unwrap().as_bytes())
+            .await
+            .unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    async fn read_json<T: serde::de::DeserializeOwned>(
+        reader: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    ) -> T {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    let platform = Arc::new(FakePlatform::default());
+    let controller = Arc::new(
+        DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os")
+            .with_mutation_timeouts(Duration::from_millis(40), Duration::from_millis(100)),
+    );
+    let targets = Arc::clone(&controller.targets);
+    let (client_stream, server_stream) = tokio::io::duplex(1024 * 1024);
+    let (server_read, server_write) = tokio::io::split(server_stream);
+    let server = tokio::spawn(run_v2_io(
+        server_read,
+        server_write,
+        controller,
+        V2ServerMetadata {
+            driver_name: "fake-macos".to_owned(),
+            driver_version: "test".to_owned(),
+            build: "test-build".to_owned(),
+        },
+    ));
+    let (client_read, mut client_write) = tokio::io::split(client_stream);
+    let mut client_read = BufReader::new(client_read);
+
+    write_json(
+        &mut client_write,
+        &V2HandshakeRequest {
+            request_id: "handshake".to_owned(),
+            minimum_version: V2_PROTOCOL_VERSION,
+            maximum_version: V2_PROTOCOL_VERSION,
+        },
+    )
+    .await;
+    let handshake: V2HandshakeResponse = read_json(&mut client_read).await;
+    assert_eq!(handshake.request_id, "handshake");
+    assert_eq!(handshake.minimum_version, V2_PROTOCOL_VERSION);
+    assert_eq!(handshake.maximum_version, V2_PROTOCOL_VERSION);
+    assert_eq!(
+        handshake.methods,
+        V2_METHODS
+            .iter()
+            .map(|method| (*method).to_owned())
+            .collect::<Vec<_>>()
+    );
+
+    for (request_id, name_contains) in [
+        ("apps-slow", "slow-protocol-read"),
+        ("apps-fast", "fast-protocol-read"),
+    ] {
+        write_json(
+            &mut client_write,
+            &V2RequestEnvelope {
+                request_id: request_id.to_owned(),
+                protocol_version: V2_PROTOCOL_VERSION,
+                command: V2Command::ListApps(ListAppsRequest {
+                    query: Some(AppQuery {
+                        name_contains: Some(name_contains.to_owned()),
+                        running: None,
+                    }),
+                }),
+            },
+        )
+        .await;
+    }
+    let fast: V2ResponseEnvelope<serde_json::Value> = read_json(&mut client_read).await;
+    let slow: V2ResponseEnvelope<serde_json::Value> = read_json(&mut client_read).await;
+    assert_eq!(fast.request_id, "apps-fast");
+    assert_eq!(slow.request_id, "apps-slow");
+
+    let mut latest_state = None;
+    for (request_id, mode) in [
+        ("state-full", AxTreeMode::Full),
+        ("state-diff", AxTreeMode::DiffIfAvailable),
+    ] {
+        write_json(
+            &mut client_write,
+            &V2RequestEnvelope {
+                request_id: request_id.to_owned(),
+                protocol_version: V2_PROTOCOL_VERSION,
+                command: V2Command::GetWindowState(GetWindowStateRequest {
+                    window: window_ref(),
+                    include_text: true,
+                    include_screenshots: false,
+                    ax_tree_mode: mode,
+                }),
+            },
+        )
+        .await;
+        let response: V2ResponseEnvelope<WindowState> = read_json(&mut client_read).await;
+        let V2ResponseBody::Result(result) = response.body else {
+            panic!("fake observation should succeed");
+        };
+        let state = result.result;
+        let accessibility = state.accessibility.as_ref().expect("fake AX state");
+        match (mode, &accessibility.tree_update) {
+            (AxTreeMode::Full, AxTreeUpdate::Full { .. })
+            | (AxTreeMode::DiffIfAvailable, AxTreeUpdate::Diff { .. }) => {}
+            other => panic!("unexpected revision mode: {other:?}"),
+        }
+        latest_state = Some(state);
+    }
+
+    assert_eq!(platform.target_creations.load(Ordering::SeqCst), 1);
+    assert_eq!(targets.len().await, 1);
+
+    let state = latest_state.expect("latest observation");
+    platform.block_dispatch.store(true, Ordering::SeqCst);
+    let click_command = ClickCommand {
+        window: window_ref(),
+        request: ClickRequest {
+            target: ClickTarget::Point {
+                observation_id: state.observation_id,
+                surface_id: state.surfaces[0].id.clone(),
+                point: Point { x: 20.0, y: 20.0 },
+            },
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: Vec::new(),
+        },
+    };
+    write_json(
+        &mut client_write,
+        &V2RequestEnvelope {
+            request_id: "click-drained-after-eof".to_owned(),
+            protocol_version: V2_PROTOCOL_VERSION,
+            command: V2Command::Click(click_command.clone()),
+        },
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while platform.dispatch_count.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("click dispatch entered before EOF");
+
+    write_json(
+        &mut client_write,
+        &V2RequestEnvelope {
+            request_id: "click-concurrent-refused".to_owned(),
+            protocol_version: V2_PROTOCOL_VERSION,
+            command: V2Command::Click(click_command),
+        },
+    )
+    .await;
+    let concurrent: V2ResponseEnvelope<serde_json::Value> = read_json(&mut client_read).await;
+    assert_eq!(concurrent.request_id, "click-concurrent-refused");
+    let V2ResponseBody::Error(failure) = concurrent.body else {
+        panic!("a second effectful request must not queue outside native deadlines");
+    };
+    assert_eq!(failure.error.code, ErrorCode::TargetBusy);
+    assert!(failure.error.retryable);
+
+    client_write.shutdown().await.unwrap();
+    drop(client_write);
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .expect("EOF drain honors the native mutation deadline")
+        .unwrap()
+        .unwrap();
+    let response: V2ResponseEnvelope<serde_json::Value> = read_json(&mut client_read).await;
+    assert_eq!(response.request_id, "click-drained-after-eof");
+    let V2ResponseBody::Error(failure) = response.body else {
+        panic!("wedged dispatch must complete with its typed native deadline failure");
+    };
+    assert_eq!(failure.error.code, ErrorCode::DispatchFailed);
+    assert_eq!(platform.cleanup_count.load(Ordering::SeqCst), 1);
+    assert!(targets.is_empty().await);
+    assert_eq!(platform.shutdowns.load(Ordering::SeqCst), 1);
 }
 
 #[allow(dead_code)]

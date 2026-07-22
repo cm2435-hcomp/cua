@@ -290,6 +290,9 @@ impl MacObservationProvider {
                 },
                 window_bounds: Some(capture.bounds),
                 capture_revision: CaptureRevision::new(),
+                observation_epoch: Some(cua_driver_core::api::observation::NativeObservationEpoch(
+                    attempt.epoch,
+                )),
                 transform: capture.transform,
                 freshness,
                 owner,
@@ -807,6 +810,7 @@ struct RawAxNode {
     value_settable: Option<bool>,
     selected_text_range: Option<bindings::AxCfRange>,
     selected_text_range_settable: Option<bool>,
+    selected_text_settable: Option<bool>,
     bounds: Option<Rect>,
     actions: Vec<String>,
     actions_proven: bool,
@@ -1001,6 +1005,9 @@ unsafe fn walk_ax(
     let selected_text_range_settable = selected_text_range
         .as_ref()
         .and_then(|_| bindings::is_attribute_settable(element, "AXSelectedTextRange").ok());
+    let selected_text_settable = selected_text_range
+        .as_ref()
+        .and_then(|_| bindings::is_attribute_settable(element, "AXSelectedText").ok());
     let bounds = element_screen_rect(element).map(|frame| Rect {
         x: frame[0],
         y: frame[1],
@@ -1040,6 +1047,7 @@ unsafe fn walk_ax(
         value_settable,
         selected_text_range,
         selected_text_range_settable,
+        selected_text_settable,
         bounds,
         actions,
         actions_proven,
@@ -1090,8 +1098,33 @@ struct RegisteredElement {
     value_settable: Option<bool>,
     selected_text_range: Option<bindings::AxCfRange>,
     selected_text_range_settable: Option<bool>,
+    selected_text_settable: Option<bool>,
     actions: Vec<String>,
     actions_proven: bool,
+}
+
+impl RegisteredElement {
+    fn snapshot(&self) -> RegisteredElementSnapshot {
+        RegisteredElementSnapshot {
+            element: self.element.clone(),
+            parent: self.parent.clone(),
+            owner: self.owner.clone(),
+            owner_window_id: self.owner_window_id,
+            role: self.role.clone(),
+            role_proven: self.role_proven,
+            subrole: self.subrole.clone(),
+            orientation: self.orientation.clone(),
+            value_proof: self.value_proof.clone(),
+            value_query_proven: self.value_query_proven,
+            string_value: self.string_value.clone(),
+            value_settable: self.value_settable,
+            selected_text_range: self.selected_text_range,
+            selected_text_range_settable: self.selected_text_range_settable,
+            selected_text_settable: self.selected_text_settable,
+            actions: self.actions.clone(),
+            actions_proven: self.actions_proven,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1110,6 +1143,7 @@ pub(crate) struct RegisteredElementSnapshot {
     pub value_settable: Option<bool>,
     pub selected_text_range: Option<bindings::AxCfRange>,
     pub selected_text_range_settable: Option<bool>,
+    pub selected_text_settable: Option<bool>,
     pub actions: Vec<String>,
     pub actions_proven: bool,
 }
@@ -1214,6 +1248,7 @@ impl MacElementRegistry {
                 value_settable: node.value_settable,
                 selected_text_range: node.selected_text_range,
                 selected_text_range_settable: node.selected_text_range_settable,
+                selected_text_settable: node.selected_text_settable,
                 actions: node.actions,
                 actions_proven: node.actions_proven,
             });
@@ -1240,47 +1275,22 @@ impl MacElementRegistry {
         self.elements
             .iter()
             .find(|element| &element.native == native && &element.id == id)
-            .map(|element| RegisteredElementSnapshot {
-                element: element.element.clone(),
-                parent: element.parent.clone(),
-                owner: element.owner.clone(),
-                owner_window_id: element.owner_window_id,
-                role: element.role.clone(),
-                role_proven: element.role_proven,
-                subrole: element.subrole.clone(),
-                orientation: element.orientation.clone(),
-                value_proof: element.value_proof.clone(),
-                value_query_proven: element.value_query_proven,
-                string_value: element.string_value.clone(),
-                value_settable: element.value_settable,
-                selected_text_range: element.selected_text_range,
-                selected_text_range_settable: element.selected_text_range_settable,
-                actions: element.actions.clone(),
-                actions_proven: element.actions_proven,
-            })
+            .map(RegisteredElement::snapshot)
+    }
+
+    pub(crate) fn registered_by_id(&self, id: &ElementId) -> Option<RegisteredElementSnapshot> {
+        let mut matches = self.elements.iter().filter(|element| &element.id == id);
+        let element = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(element.snapshot())
     }
 
     pub(crate) fn registered_snapshots(&self) -> Vec<RegisteredElementSnapshot> {
         self.elements
             .iter()
-            .map(|element| RegisteredElementSnapshot {
-                element: element.element.clone(),
-                parent: element.parent.clone(),
-                owner: element.owner.clone(),
-                owner_window_id: element.owner_window_id,
-                role: element.role.clone(),
-                role_proven: element.role_proven,
-                subrole: element.subrole.clone(),
-                orientation: element.orientation.clone(),
-                value_proof: element.value_proof.clone(),
-                value_query_proven: element.value_query_proven,
-                string_value: element.string_value.clone(),
-                value_settable: element.value_settable,
-                selected_text_range: element.selected_text_range,
-                selected_text_range_settable: element.selected_text_range_settable,
-                actions: element.actions.clone(),
-                actions_proven: element.actions_proven,
-            })
+            .map(RegisteredElement::snapshot)
             .collect()
     }
 }
@@ -1572,6 +1582,7 @@ mod tests {
                 value_settable: Some(false),
                 selected_text_range: None,
                 selected_text_range_settable: Some(false),
+                selected_text_settable: Some(false),
                 bounds: None,
                 actions: vec!["AXPress".to_owned()],
                 actions_proven: true,

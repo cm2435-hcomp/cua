@@ -9,7 +9,370 @@ use core_graphics::{
     event::{CGEvent, CGEventFlags},
     event_source::{CGEventSource, CGEventSourceStateID},
 };
+use cua_driver_core::api::{
+    contracts::{KeyStroke, Modifier},
+    errors::{ErrorCode, ErrorPhase, NativeError},
+};
 use foreign_types::ForeignType;
+
+/// A normalized physical modifier key. V2 keeps this typed through cleanup so
+/// a partial chord can release every modifier whose down event may have
+/// reached the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NormalizedModifier {
+    pub modifier: Modifier,
+    pub key_code: u16,
+    pub flag: CGEventFlags,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedChord {
+    pub key_code: u16,
+    pub modifiers: Vec<NormalizedModifier>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetedKeyEventKind {
+    ModifierDown(Modifier),
+    KeyDown,
+    KeyUp,
+    ModifierUp(Modifier),
+    UnicodeDown,
+    UnicodeUp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetedKeyEvent {
+    pub kind: TargetedKeyEventKind,
+    pub key_code: u16,
+    pub key_down: bool,
+    pub flags: CGEventFlags,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetedPostPrimitive {
+    SkyLightAuthenticated,
+    CoreGraphicsPid,
+}
+
+pub(crate) struct PreparedTargetedKeyEvent(CGEvent);
+
+/// Normalize the complete chord before any interaction lease is acquired.
+/// The mapping is the physical US ANSI key vocabulary used by the existing
+/// macOS tools. Shifted printable glyphs add Shift explicitly instead of
+/// depending on ambient keyboard state.
+pub(crate) fn normalize_chord(stroke: &KeyStroke) -> Result<NormalizedChord, NativeError> {
+    let (key_code, implied_shift) = normalized_key_code(&stroke.key).ok_or_else(|| {
+        NativeError::new(
+            ErrorCode::InvalidRequest,
+            ErrorPhase::Preflight,
+            false,
+            format!("unknown macOS key name: {}", stroke.key),
+        )
+        .with_detail("key", stroke.key.clone())
+    })?;
+
+    let mut requested = stroke.modifiers.clone();
+    if implied_shift && !requested.contains(&Modifier::Shift) {
+        requested.push(Modifier::Shift);
+    }
+    requested.sort();
+    requested.dedup();
+
+    let modifiers: Vec<_> = requested.into_iter().map(normalized_modifier).collect();
+    if modifiers
+        .iter()
+        .any(|modifier| modifier.key_code == key_code)
+    {
+        return Err(NativeError::new(
+            ErrorCode::InvalidRequest,
+            ErrorPhase::Preflight,
+            false,
+            "the main key cannot also be present in the chord modifiers",
+        )
+        .with_detail("key", stroke.key.clone()));
+    }
+    Ok(NormalizedChord {
+        key_code,
+        modifiers,
+    })
+}
+
+pub(crate) fn chord_events(chord: &NormalizedChord) -> Vec<TargetedKeyEvent> {
+    let mut events = Vec::with_capacity(chord.modifiers.len() * 2 + 2);
+    let mut flags = CGEventFlags::CGEventFlagNull;
+    for modifier in &chord.modifiers {
+        flags |= modifier.flag;
+        events.push(TargetedKeyEvent {
+            kind: TargetedKeyEventKind::ModifierDown(modifier.modifier),
+            key_code: modifier.key_code,
+            key_down: true,
+            flags,
+            text: None,
+        });
+    }
+    events.push(TargetedKeyEvent {
+        kind: TargetedKeyEventKind::KeyDown,
+        key_code: chord.key_code,
+        key_down: true,
+        flags,
+        text: None,
+    });
+    events.push(TargetedKeyEvent {
+        kind: TargetedKeyEventKind::KeyUp,
+        key_code: chord.key_code,
+        key_down: false,
+        flags,
+        text: None,
+    });
+    for modifier in chord.modifiers.iter().rev() {
+        flags.remove(modifier.flag);
+        events.push(TargetedKeyEvent {
+            kind: TargetedKeyEventKind::ModifierUp(modifier.modifier),
+            key_code: modifier.key_code,
+            key_down: false,
+            flags,
+            text: None,
+        });
+    }
+    events
+}
+
+pub(crate) fn unicode_events(text: &str) -> Vec<TargetedKeyEvent> {
+    text.chars()
+        .flat_map(|character| {
+            let text = character.to_string();
+            [
+                TargetedKeyEvent {
+                    kind: TargetedKeyEventKind::UnicodeDown,
+                    key_code: 0,
+                    key_down: true,
+                    flags: CGEventFlags::CGEventFlagNull,
+                    text: Some(text.clone()),
+                },
+                TargetedKeyEvent {
+                    kind: TargetedKeyEventKind::UnicodeUp,
+                    key_code: 0,
+                    key_down: false,
+                    flags: CGEventFlags::CGEventFlagNull,
+                    text: Some(text),
+                },
+            ]
+        })
+        .collect()
+}
+
+/// Construct the complete native keyboard event without posting it. V2 uses
+/// this split so all fallible construction precedes the controller's explicit
+/// first-native-side-effect boundary.
+pub(crate) fn prepare_targeted_event(
+    event: &TargetedKeyEvent,
+) -> Result<PreparedTargetedKeyEvent, NativeError> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| {
+        NativeError::new(
+            ErrorCode::DispatchFailed,
+            ErrorPhase::Dispatch,
+            false,
+            "CGEventSource creation failed for targeted keyboard dispatch",
+        )
+    })?;
+    let native =
+        CGEvent::new_keyboard_event(source, event.key_code, event.key_down).map_err(|_| {
+            NativeError::new(
+                ErrorCode::DispatchFailed,
+                ErrorPhase::Dispatch,
+                false,
+                "CGEvent keyboard event creation failed",
+            )
+        })?;
+    native.set_flags(event.flags);
+    if let Some(text) = &event.text {
+        native.set_string(text);
+    }
+    Ok(PreparedTargetedKeyEvent(native))
+}
+
+/// Post an already-constructed event to one pid. No fallible operation occurs
+/// before the posting primitive is attempted.
+pub(crate) fn post_prepared_targeted_event(
+    pid: i32,
+    event: &PreparedTargetedKeyEvent,
+) -> TargetedPostPrimitive {
+    let event_ptr = event.0.as_ptr() as *mut std::ffi::c_void;
+    if crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, true) {
+        TargetedPostPrimitive::SkyLightAuthenticated
+    } else {
+        event.0.post_to_pid(pid as libc::pid_t);
+        TargetedPostPrimitive::CoreGraphicsPid
+    }
+}
+
+fn normalized_modifier(modifier: Modifier) -> NormalizedModifier {
+    let (key_code, flag) = match modifier {
+        Modifier::Shift => (56, CGEventFlags::CGEventFlagShift),
+        Modifier::Control => (59, CGEventFlags::CGEventFlagControl),
+        Modifier::Alt => (58, CGEventFlags::CGEventFlagAlternate),
+        Modifier::Meta => (55, CGEventFlags::CGEventFlagCommand),
+    };
+    NormalizedModifier {
+        modifier,
+        key_code,
+        flag,
+    }
+}
+
+fn normalized_key_code(key: &str) -> Option<(u16, bool)> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if key.eq_ignore_ascii_case("plus") {
+        return Some((24, true));
+    }
+    let named = match key.to_ascii_lowercase().as_str() {
+        "return" | "enter" => Some(36),
+        "tab" => Some(48),
+        "space" => Some(49),
+        "delete" | "backspace" => Some(51),
+        "escape" | "esc" => Some(53),
+        "command" | "cmd" | "meta" => Some(55),
+        "shift" => Some(56),
+        "capslock" | "caps_lock" => Some(57),
+        "option" | "alt" => Some(58),
+        "control" | "ctrl" => Some(59),
+        "fn" => Some(63),
+        "home" => Some(115),
+        "pageup" | "page_up" => Some(116),
+        "del" | "forward_delete" => Some(117),
+        "end" => Some(119),
+        "pagedown" | "page_down" => Some(121),
+        "left" | "left_arrow" => Some(123),
+        "right" | "right_arrow" => Some(124),
+        "down" | "down_arrow" => Some(125),
+        "up" | "up_arrow" => Some(126),
+        "f1" => Some(122),
+        "f2" => Some(120),
+        "f3" => Some(99),
+        "f4" => Some(118),
+        "f5" => Some(96),
+        "f6" => Some(97),
+        "f7" => Some(98),
+        "f8" => Some(100),
+        "f9" => Some(101),
+        "f10" => Some(109),
+        "f11" => Some(103),
+        "f12" => Some(111),
+        "f13" => Some(105),
+        "f14" => Some(107),
+        "f15" => Some(113),
+        "f16" => Some(106),
+        "f17" => Some(64),
+        "f18" => Some(79),
+        "f19" => Some(80),
+        "f20" => Some(90),
+        _ => None,
+    };
+    if let Some(code) = named {
+        return Some((code, false));
+    }
+
+    let mut characters = key.chars();
+    let character = characters.next()?;
+    if characters.next().is_some() {
+        return None;
+    }
+    printable_key_code(character)
+}
+
+fn printable_key_code(character: char) -> Option<(u16, bool)> {
+    let base = match character.to_ascii_lowercase() {
+        'a' => 0,
+        's' => 1,
+        'd' => 2,
+        'f' => 3,
+        'h' => 4,
+        'g' => 5,
+        'z' => 6,
+        'x' => 7,
+        'c' => 8,
+        'v' => 9,
+        'b' => 11,
+        'q' => 12,
+        'w' => 13,
+        'e' => 14,
+        'r' => 15,
+        'y' => 16,
+        't' => 17,
+        '1' => 18,
+        '2' => 19,
+        '3' => 20,
+        '4' => 21,
+        '6' => 22,
+        '5' => 23,
+        '=' | '+' => 24,
+        '9' => 25,
+        '7' => 26,
+        '-' | '_' => 27,
+        '8' => 28,
+        '0' => 29,
+        ']' | '}' => 30,
+        'o' => 31,
+        'u' => 32,
+        '[' | '{' => 33,
+        'i' => 34,
+        'p' => 35,
+        'l' => 37,
+        'j' => 38,
+        '\'' | '"' => 39,
+        'k' => 40,
+        ';' | ':' => 41,
+        '\\' | '|' => 42,
+        ',' | '<' => 43,
+        '/' | '?' => 44,
+        'n' => 45,
+        'm' => 46,
+        '.' | '>' => 47,
+        '`' | '~' => 50,
+        '!' => 18,
+        '@' => 19,
+        '#' => 20,
+        '$' => 21,
+        '^' => 22,
+        '%' => 23,
+        '(' => 25,
+        '&' => 26,
+        '*' => 28,
+        ')' => 29,
+        ' ' => 49,
+        _ => return None,
+    };
+    let implied_shift = character.is_ascii_uppercase()
+        || matches!(
+            character,
+            '!' | '@'
+                | '#'
+                | '$'
+                | '%'
+                | '^'
+                | '&'
+                | '*'
+                | '('
+                | ')'
+                | '_'
+                | '+'
+                | '{'
+                | '}'
+                | '|'
+                | ':'
+                | '"'
+                | '<'
+                | '>'
+                | '?'
+                | '~'
+        );
+    Some((base, implied_shift))
+}
 
 /// Press and release a single key, delivered to `pid` without stealing focus.
 pub fn press_key(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
@@ -17,7 +380,7 @@ pub fn press_key(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> 
     if key == "+" || key.to_lowercase() == "plus" {
         let flags = modifier_flags(&["shift"]);
         let eq_code = key_name_to_code("=")?;
-        post_key(pid, eq_code, true,  modifier_flags(modifiers) | flags)?;
+        post_key(pid, eq_code, true, modifier_flags(modifiers) | flags)?;
         std::thread::sleep(std::time::Duration::from_millis(8));
         post_key(pid, eq_code, false, modifier_flags(modifiers) | flags)?;
         return Ok(());
@@ -143,7 +506,12 @@ fn post_key(pid: i32, key_code: u16, key_down: bool, flags: CGEventFlags) -> any
     Ok(())
 }
 
-fn post_key_no_auth(pid: i32, key_code: u16, key_down: bool, flags: CGEventFlags) -> anyhow::Result<()> {
+fn post_key_no_auth(
+    pid: i32,
+    key_code: u16,
+    key_down: bool,
+    flags: CGEventFlags,
+) -> anyhow::Result<()> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let event = CGEvent::new_keyboard_event(source, key_code, key_down)
@@ -196,16 +564,142 @@ fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
         "right" | "right_arrow" => 124,
         "down" | "down_arrow" => 125,
         "up" | "up_arrow" => 126,
-        "f1" => 122, "f2" => 120, "f3" => 99, "f4" => 118, "f5" => 96,
-        "f6" => 97, "f7" => 98, "f8" => 100, "f9" => 101, "f10" => 109,
-        "f11" => 103, "f12" => 111,
-        "a" => 0, "s" => 1, "d" => 2, "f" => 3, "h" => 4, "g" => 5, "z" => 6, "x" => 7,
-        "c" => 8, "v" => 9, "b" => 11, "q" => 12, "w" => 13, "e" => 14, "r" => 15, "y" => 16,
-        "t" => 17, "1" => 18, "2" => 19, "3" => 20, "4" => 21, "6" => 22, "5" => 23, "=" => 24,
-        "9" => 25, "7" => 26, "-" => 27, "8" => 28, "0" => 29, "]" => 30, "o" => 31, "u" => 32,
-        "[" => 33, "i" => 34, "p" => 35, "l" => 37, "j" => 38, "'" => 39, "k" => 40, ";" => 41,
-        "\\" => 42, "," => 43, "/" => 44, "n" => 45, "m" => 46, "." => 47, "`" => 50,
+        "f1" => 122,
+        "f2" => 120,
+        "f3" => 99,
+        "f4" => 118,
+        "f5" => 96,
+        "f6" => 97,
+        "f7" => 98,
+        "f8" => 100,
+        "f9" => 101,
+        "f10" => 109,
+        "f11" => 103,
+        "f12" => 111,
+        "a" => 0,
+        "s" => 1,
+        "d" => 2,
+        "f" => 3,
+        "h" => 4,
+        "g" => 5,
+        "z" => 6,
+        "x" => 7,
+        "c" => 8,
+        "v" => 9,
+        "b" => 11,
+        "q" => 12,
+        "w" => 13,
+        "e" => 14,
+        "r" => 15,
+        "y" => 16,
+        "t" => 17,
+        "1" => 18,
+        "2" => 19,
+        "3" => 20,
+        "4" => 21,
+        "6" => 22,
+        "5" => 23,
+        "=" => 24,
+        "9" => 25,
+        "7" => 26,
+        "-" => 27,
+        "8" => 28,
+        "0" => 29,
+        "]" => 30,
+        "o" => 31,
+        "u" => 32,
+        "[" => 33,
+        "i" => 34,
+        "p" => 35,
+        "l" => 37,
+        "j" => 38,
+        "'" => 39,
+        "k" => 40,
+        ";" => 41,
+        "\\" => 42,
+        "," => 43,
+        "/" => 44,
+        "n" => 45,
+        "m" => 46,
+        "." => 47,
+        "`" => 50,
         _ => anyhow::bail!("Unknown key name: {key}"),
     };
     Ok(code)
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+
+    #[test]
+    fn normalization_canonicalizes_one_chord_and_rejects_unknown_keys() {
+        let chord = normalize_chord(&KeyStroke {
+            key: "+".to_owned(),
+            modifiers: vec![
+                Modifier::Meta,
+                Modifier::Alt,
+                Modifier::Control,
+                Modifier::Shift,
+                Modifier::Meta,
+            ],
+        })
+        .unwrap();
+        assert_eq!(chord.key_code, 24);
+        assert_eq!(
+            chord
+                .modifiers
+                .iter()
+                .map(|modifier| modifier.modifier)
+                .collect::<Vec<_>>(),
+            vec![
+                Modifier::Shift,
+                Modifier::Control,
+                Modifier::Alt,
+                Modifier::Meta,
+            ]
+        );
+
+        let events = chord_events(&chord);
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec![
+                TargetedKeyEventKind::ModifierDown(Modifier::Shift),
+                TargetedKeyEventKind::ModifierDown(Modifier::Control),
+                TargetedKeyEventKind::ModifierDown(Modifier::Alt),
+                TargetedKeyEventKind::ModifierDown(Modifier::Meta),
+                TargetedKeyEventKind::KeyDown,
+                TargetedKeyEventKind::KeyUp,
+                TargetedKeyEventKind::ModifierUp(Modifier::Meta),
+                TargetedKeyEventKind::ModifierUp(Modifier::Alt),
+                TargetedKeyEventKind::ModifierUp(Modifier::Control),
+                TargetedKeyEventKind::ModifierUp(Modifier::Shift),
+            ]
+        );
+
+        assert_eq!(
+            normalize_chord(&KeyStroke {
+                key: "return".to_owned(),
+                modifiers: vec![],
+            })
+            .unwrap()
+            .key_code,
+            36
+        );
+        let uppercase = normalize_chord(&KeyStroke {
+            key: "A".to_owned(),
+            modifiers: vec![],
+        })
+        .unwrap();
+        assert_eq!(uppercase.key_code, 0);
+        assert_eq!(uppercase.modifiers[0].modifier, Modifier::Shift);
+
+        let error = normalize_chord(&KeyStroke {
+            key: "definitely-not-a-key".to_owned(),
+            modifiers: vec![],
+        })
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert_eq!(error.phase, ErrorPhase::Preflight);
+    }
 }
