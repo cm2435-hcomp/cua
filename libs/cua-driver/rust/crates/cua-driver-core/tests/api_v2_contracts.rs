@@ -1,0 +1,2168 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
+use cua_driver_core::{
+    api::*,
+    protocol::{
+        V2Command, V2Failure, V2RequestEnvelope, V2ResponseBody, V2ResponseEnvelope,
+        V2_PROTOCOL_VERSION,
+    },
+};
+use tokio::sync::Notify;
+
+fn id<T>(value: &str, parse: impl FnOnce(String) -> Result<T, String>) -> T {
+    parse(value.to_owned()).expect("valid test id")
+}
+
+fn test_mutation_deadline() -> MutationDeadline {
+    let work = Instant::now() + Duration::from_secs(30);
+    MutationDeadline::new(work, work + Duration::from_secs(5)).unwrap()
+}
+
+fn app_ref() -> AppRef {
+    AppRef {
+        id: id("app-1", AppId::parse),
+        name: Some("Fixture".to_owned()),
+        pid: Some(42),
+        running: true,
+    }
+}
+
+fn window_ref() -> WindowRef {
+    WindowRef {
+        id: id("window-1", WindowId::parse),
+        app: app_ref(),
+        title: Some("Fixture window".to_owned()),
+    }
+}
+
+fn resolved_window() -> ResolvedWindow {
+    ResolvedWindow {
+        public: window_ref(),
+        native: NativeWindowHandle::new("native-window-1").unwrap(),
+        process: NativeProcessHandle::new("process-42").unwrap(),
+        framework: Framework::AppKit,
+        geometry: WindowGeometry {
+            bounds: Rect {
+                x: 100.0,
+                y: 200.0,
+                width: 640.0,
+                height: 480.0,
+            },
+            scale_factor: 1.0,
+            revision: id("geometry-1", GeometryRevision::parse),
+        },
+        generation: WindowGeneration(1),
+        state: WindowStateKind::Visible,
+    }
+}
+
+#[test]
+fn v2_protocol_rejects_schema_drift_and_version_mismatch() {
+    let valid = serde_json::json!({
+        "request_id": "request-1",
+        "protocol_version": {"major": 2, "minor": 0},
+        "method": "driver.v2.click",
+        "params": {
+            "window": window_ref(),
+            "request": {
+                "target": {
+                    "kind": "point",
+                    "observation_id": "observation-1",
+                    "surface_id": "surface-1",
+                    "point": {"x": 10.0, "y": 20.0}
+                },
+                "button": "left",
+                "click_count": 1,
+                "modifiers": []
+            }
+        }
+    });
+    let envelope: V2RequestEnvelope =
+        serde_json::from_value(valid.clone()).expect("valid strict command");
+    assert!(matches!(envelope.command, V2Command::Click(_)));
+    envelope.validate_version().expect("supported version");
+
+    let mut unknown = valid.clone();
+    unknown["params"]["request"]["execution_mode"] = serde_json::json!("foreground");
+    assert!(serde_json::from_value::<V2RequestEnvelope>(unknown).is_err());
+
+    let mut ambiguous_union = valid.clone();
+    ambiguous_union["params"]["request"]["target"]["element"] = serde_json::json!({
+        "observation_id": "observation-1",
+        "id": "element-1"
+    });
+    assert!(serde_json::from_value::<V2RequestEnvelope>(ambiguous_union).is_err());
+
+    let mut wrong_version = valid;
+    wrong_version["protocol_version"]["minor"] = serde_json::json!(1);
+    let mismatch: V2RequestEnvelope = serde_json::from_value(wrong_version).unwrap();
+    let error = mismatch.validate_version().unwrap_err();
+    assert_eq!(error.code, ErrorCode::ProtocolMismatch);
+    assert_eq!(error.phase, ErrorPhase::Validate);
+    assert_eq!(
+        serde_json::to_value(&error).unwrap()["code"],
+        serde_json::json!("protocol_mismatch")
+    );
+
+    let both_result_and_error = serde_json::json!({
+        "request_id": "request-1",
+        "protocol_version": {"major": 2, "minor": 0},
+        "result": {},
+        "error": serde_json::to_value(&error).unwrap(),
+    });
+    assert!(
+        serde_json::from_value::<V2ResponseEnvelope<serde_json::Value>>(both_result_and_error)
+            .is_err()
+    );
+
+    let launch = LaunchResult {
+        action_id: id("launch-action", ActionId::parse),
+        app: app_ref(),
+        windows: vec![window_ref()],
+        reused_running_app: false,
+        verification: EffectVerification::EffectVerified,
+        posture: PostureResult::default(),
+        settlement: SettlementEvidence::initial(),
+    };
+    let mut invalid_launch = serde_json::to_value(launch).unwrap();
+    invalid_launch["verification"] = serde_json::json!("dispatch_verified");
+    assert!(serde_json::from_value::<LaunchResult>(invalid_launch).is_err());
+}
+
+#[test]
+fn posture_unverifiable_has_a_distinct_wire_code_and_safety_precedence() {
+    let unverifiable = NativeError::new(
+        ErrorCode::PostureUnverifiable,
+        ErrorPhase::Verify,
+        false,
+        "required posture witness was incomplete without an observed disturbance",
+    );
+    let response = V2ResponseEnvelope::<serde_json::Value> {
+        request_id: "posture-request".to_owned(),
+        protocol_version: V2_PROTOCOL_VERSION,
+        body: V2ResponseBody::Error(V2Failure {
+            error: unverifiable.clone(),
+        }),
+    };
+    let encoded = serde_json::to_value(&response).unwrap();
+    assert_eq!(
+        encoded["error"]["code"],
+        serde_json::json!("posture_unverifiable")
+    );
+    let decoded: NativeError = serde_json::from_value(encoded["error"].clone()).unwrap();
+    assert_eq!(decoded, unverifiable);
+
+    let dispatch = NativeError::new(
+        ErrorCode::DispatchFailed,
+        ErrorPhase::Dispatch,
+        false,
+        "dispatch failed",
+    );
+    let primary = NativeError::primary(vec![unverifiable.clone(), dispatch]).unwrap();
+    assert_eq!(primary.code, ErrorCode::PostureUnverifiable);
+    let violation = NativeError::new(
+        ErrorCode::PostureViolated,
+        ErrorPhase::Verify,
+        false,
+        "posture changed",
+    );
+    let primary = NativeError::primary(vec![violation, unverifiable]).unwrap();
+    assert_eq!(primary.code, ErrorCode::PostureViolated);
+
+    let incomplete = PostureResult {
+        held: false,
+        ..PostureResult::default()
+    };
+    assert_eq!(
+        NativeError::from_posture(&incomplete).unwrap().code,
+        ErrorCode::PostureUnverifiable
+    );
+    let observed = PostureResult {
+        held: false,
+        physical_cursor_moved: true,
+        ..PostureResult::default()
+    };
+    assert_eq!(
+        NativeError::from_posture(&observed).unwrap().code,
+        ErrorCode::PostureViolated
+    );
+    assert!(NativeError::from_posture(&PostureResult::default()).is_none());
+}
+
+#[test]
+fn ax_diff_round_trip_is_exact_and_malformed_ranges_fail_closed() {
+    let base = "root id=1\n  button id=2 label=Old\n  text id=3";
+    let current = "root id=1\n  button id=2 label=New\n  text id=3\n  text id=4";
+    let operations = diff_lines(base, current);
+    assert_eq!(apply_ax_diff(base, &operations).unwrap(), current);
+
+    let malformed = vec![
+        ReplaceAxLines {
+            start_line: 0,
+            delete_count: 2,
+            lines: vec![],
+        },
+        ReplaceAxLines {
+            start_line: 1,
+            delete_count: 1,
+            lines: vec!["overlap".to_owned()],
+        },
+    ];
+    let error = apply_ax_diff(base, &malformed).unwrap_err();
+    assert_eq!(error.code, ErrorCode::AxRevisionMismatch);
+
+    let mut revisions = AxRevisionState::default();
+    let prepared = revisions
+        .prepare(current, AxTreeMode::DiffIfAvailable)
+        .unwrap();
+    assert!(
+        revisions.last_revision().is_none(),
+        "preparing an observation must not advance the delivered revision"
+    );
+    revisions.commit(prepared);
+    assert!(revisions.last_revision().is_some());
+    let no_op = revisions
+        .prepare(current, AxTreeMode::DiffIfAvailable)
+        .unwrap();
+    let AxTreeUpdate::Diff {
+        base_revision,
+        revision,
+        operations,
+    } = &no_op.update
+    else {
+        panic!("a delivered base must produce a diff by default");
+    };
+    assert!(operations.is_empty());
+    assert_ne!(base_revision, revision, "even a no-op gets a new revision");
+    revisions.commit(no_op);
+    revisions.invalidate_base();
+    assert!(matches!(
+        revisions
+            .prepare(current, AxTreeMode::DiffIfAvailable)
+            .unwrap()
+            .update,
+        AxTreeUpdate::Full { .. }
+    ));
+
+    let malformed_native = NativeAccessibilityUpdate {
+        normalized_tree: current.to_owned(),
+        elements: vec![NativeAccessibilityElement {
+            id: id("element-1", ElementId::parse),
+            native: NativeElementHandle::new("native-element-1").unwrap(),
+            owner: resolved_window().stamp(),
+            role: Some("button".to_owned()),
+            label: None,
+            value: None,
+            bounds: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            }),
+            actions: Vec::new(),
+            menu_id: None,
+        }],
+        focused_element: Some(id("missing-element", ElementId::parse)),
+        selected_text: None,
+        selected_elements: Vec::new(),
+        document_text: None,
+    };
+    let error = revision_accessibility(
+        &AxRevisionState::default(),
+        &id("observation-malformed", ObservationId::parse),
+        malformed_native,
+        AxTreeMode::DiffIfAvailable,
+    )
+    .err()
+    .expect("dangling AX references must fail");
+    assert_eq!(error.code, ErrorCode::AxRevisionMismatch);
+}
+
+#[test]
+fn request_validation_rejects_unsafe_noops_and_non_finite_geometry() {
+    let observation_id = id("observation-1", ObservationId::parse);
+    let surface_id = id("surface-1", SurfaceId::parse);
+    assert!(ClickRequest {
+        target: ClickTarget::Point {
+            observation_id: observation_id.clone(),
+            surface_id: surface_id.clone(),
+            point: Point {
+                x: f64::NAN,
+                y: 1.0,
+            },
+        },
+        button: MouseButton::Left,
+        click_count: 1,
+        modifiers: Vec::new(),
+    }
+    .validate()
+    .is_err());
+    assert!(ScrollRequest::Delta {
+        observation_id,
+        surface_id,
+        point: Point { x: 1.0, y: 1.0 },
+        delta_x: f64::INFINITY,
+        delta_y: 0.0,
+    }
+    .validate()
+    .is_err());
+    assert!(PressKeyRequest {
+        observation_id: id("observation-2", ObservationId::parse),
+        stroke: KeyStroke {
+            key: "  ".to_owned(),
+            modifiers: Vec::new(),
+        },
+    }
+    .validate()
+    .is_err());
+    assert!(SelectTextRequest {
+        element: ElementRef {
+            observation_id: id("observation-3", ObservationId::parse),
+            id: id("element-1", ElementId::parse),
+        },
+        text: String::new(),
+        prefix: Some(String::new()),
+        suffix: None,
+        selection_type: SelectionType::Text,
+    }
+    .validate()
+    .is_err());
+    assert!(SecondaryActionRequest {
+        element: ElementRef {
+            observation_id: id("observation-4", ObservationId::parse),
+            id: id("element-2", ElementId::parse),
+        },
+        action: String::new(),
+    }
+    .validate()
+    .is_err());
+    assert!(Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 10.0,
+    }
+    .validate()
+    .is_err());
+}
+
+#[derive(Default)]
+struct FakeTargetState {
+    semantic_dispatches: usize,
+    verification_readback_complete: bool,
+}
+
+struct FakeFocus {
+    shutdowns: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl TargetFocusCoordinator for FakeFocus {
+    async fn shutdown(&mut self) -> Result<(), NativeError> {
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct EmptyInvalidations;
+
+#[async_trait]
+impl InvalidationSubscription for EmptyInvalidations {
+    async fn next(&mut self) -> Option<TargetInvalidation> {
+        None
+    }
+}
+
+#[derive(Default)]
+struct FakePlatform {
+    observation_count: AtomicUsize,
+    dispatch_count: AtomicUsize,
+    target_creations: AtomicUsize,
+    shutdowns: Arc<AtomicUsize>,
+    ordering: Arc<Mutex<Vec<&'static str>>>,
+    cleanup_count: Arc<AtomicUsize>,
+    preflight_action_ids: Arc<Mutex<Vec<ActionId>>>,
+    acquired_action_ids: Arc<Mutex<Vec<ActionId>>>,
+    block_dispatch: std::sync::atomic::AtomicBool,
+    dispatch_fail: std::sync::atomic::AtomicBool,
+    semantic_prepare_fail: std::sync::atomic::AtomicBool,
+    semantic_verification_fail: std::sync::atomic::AtomicBool,
+    observation_role: Mutex<Option<String>>,
+    cleanup_failure_count: AtomicUsize,
+    cleanup_posture_violated: std::sync::atomic::AtomicBool,
+    settle_pending: std::sync::atomic::AtomicBool,
+    launch_fail: std::sync::atomic::AtomicBool,
+    refresh_geometry_during_observe: std::sync::atomic::AtomicBool,
+    dispatch_entered: Notify,
+}
+
+enum FakePreparedSemantic {
+    Click,
+    SetValue,
+    Secondary,
+}
+
+struct FakeScopeCleanup {
+    ordering: Arc<Mutex<Vec<&'static str>>>,
+    cleanup_count: Arc<AtomicUsize>,
+    failure_count: usize,
+    posture_violated: bool,
+    leases: ScopeLeaseTeardown,
+}
+
+impl ScopeCleanup for FakeScopeCleanup {
+    fn cleanup(&mut self, _deadline: Instant) -> ScopeTeardownOutcome {
+        self.cleanup_count.fetch_add(1, Ordering::SeqCst);
+        self.ordering.lock().unwrap().push("scope_released");
+        let mut posture = PostureResult::default();
+        if self.posture_violated {
+            posture.held = false;
+            posture.frontmost_changed = true;
+            posture.restored_after_violation = true;
+        }
+        let failures = (0..self.failure_count)
+            .map(|index| {
+                NativeError::new(
+                    if index == 0 {
+                        ErrorCode::VerificationFailed
+                    } else {
+                        ErrorCode::Internal
+                    },
+                    ErrorPhase::Verify,
+                    false,
+                    format!("fake cleanup failure {index}"),
+                )
+            })
+            .collect();
+        ScopeTeardownOutcome {
+            posture,
+            native_evidence: NativeEvidence {
+                fields: BTreeMap::from([(
+                    "fake_cleanup".to_owned(),
+                    serde_json::json!("complete"),
+                )]),
+                ..NativeEvidence::default()
+            },
+            leases: self.leases.clone(),
+            failures,
+        }
+    }
+}
+
+impl FakePlatform {
+    fn record(&self, event: &'static str) {
+        self.ordering.lock().unwrap().push(event);
+    }
+}
+
+#[async_trait]
+impl LifecycleProvider for FakePlatform {
+    async fn readiness(&self) -> Result<Readiness, NativeError> {
+        Ok(Readiness {
+            ready: true,
+            permissions: BTreeMap::new(),
+            diagnostics: BTreeMap::new(),
+        })
+    }
+
+    async fn capabilities(&self) -> Result<CapabilityManifest, NativeError> {
+        Ok(CapabilityManifest {
+            platform: PlatformName::Macos,
+            driver_version: "test".to_owned(),
+            protocol_version: "2.0".to_owned(),
+            permissions: BTreeMap::new(),
+            cells: Vec::new(),
+        })
+    }
+
+    async fn list_apps(&self, _query: AppQuery) -> Result<Vec<AppRef>, NativeError> {
+        Ok(vec![app_ref()])
+    }
+
+    async fn launch_background(
+        &self,
+        _app: AppSelector,
+        posture: &mut LaunchPostureScope,
+    ) -> Result<NativeLaunch, NativeError> {
+        posture.begin_launch();
+        posture.record_partial_result(app_ref(), vec![window_ref()]);
+        posture.posture.held = true;
+        posture.pending_settlement = Some(PendingSettlementEvidence {
+            state: PendingSettlementState::Pending,
+            trigger_action_id: posture
+                .action_id()
+                .cloned()
+                .expect("controller launch scopes carry their action id"),
+            profile: "fake_launch".to_owned(),
+            elapsed_ms: 1,
+            observed_signals: vec![SettlementSignal::DispatchComplete],
+            missing_signals: Vec::new(),
+        });
+        if self.launch_fail.load(Ordering::SeqCst) {
+            return Err(NativeError::new(
+                ErrorCode::AppLaunchFailed,
+                ErrorPhase::Dispatch,
+                true,
+                "fake post-dispatch launch failure",
+            ));
+        }
+        Ok(NativeLaunch {
+            app: app_ref(),
+            windows: vec![window_ref()],
+            reused_running_app: false,
+            posture: posture.posture.clone(),
+            settlement: SettlementEvidence::initial(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn post_dispatch_launch_failure_keeps_exact_partial_and_pending_evidence() {
+    let platform = Arc::new(FakePlatform::default());
+    platform.launch_fail.store(true, Ordering::SeqCst);
+    let controller = DriverController::new(platform, PlatformName::Macos, "test-os");
+    let error = controller
+        .launch_app(LaunchAppRequest {
+            app: AppSelector::BundleId {
+                bundle_id: "com.example.fixture".to_owned(),
+            },
+        })
+        .await
+        .unwrap_err();
+
+    let Some(PartialEvidence::Launch {
+        action_id,
+        app,
+        windows,
+        posture,
+        pending_settlement: Some(pending),
+        ..
+    }) = error.partial_evidence.as_deref()
+    else {
+        panic!("post-dispatch launch failure must keep structured launch evidence");
+    };
+    assert_eq!(app.as_ref(), Some(&app_ref()));
+    assert_eq!(windows, &vec![window_ref()]);
+    assert!(posture.held);
+    assert_eq!(pending.trigger_action_id, *action_id);
+}
+
+#[async_trait]
+impl WindowProvider for FakePlatform {
+    async fn list_windows(&self, _app: Option<&AppRef>) -> Result<Vec<WindowRef>, NativeError> {
+        Ok(vec![window_ref()])
+    }
+
+    async fn rehydrate(
+        &self,
+        _id: &WindowId,
+        _app: Option<&AppRef>,
+    ) -> Result<WindowRef, NativeError> {
+        Ok(window_ref())
+    }
+
+    async fn resolve(&self, window: &WindowRef) -> Result<ResolvedWindow, NativeError> {
+        if window.id != window_ref().id || window.app.id != app_ref().id {
+            return Err(NativeError::stale(
+                ErrorCode::WindowIdentityChanged,
+                "fake window mismatch",
+            ));
+        }
+        Ok(resolved_window())
+    }
+}
+
+#[async_trait]
+impl ObservationProvider<FakeTargetState> for FakePlatform {
+    async fn settle(
+        &self,
+        _target: &mut FakeTargetState,
+        dirty: &DirtyState,
+        _deadline: Instant,
+    ) -> Result<SettlementAttempt, NativeError> {
+        self.record("settle");
+        if self.settle_pending.load(Ordering::SeqCst) {
+            let mut pending = dirty.pending_evidence();
+            pending.observed_signals.push(SettlementSignal::AxAction);
+            return Ok(SettlementAttempt::Pending(pending));
+        }
+        let mut signals = dirty.observed_signals.clone();
+        signals.insert(SettlementSignal::DispatchComplete);
+        signals.extend(
+            dirty
+                .profile
+                .required_terminal_signals
+                .iter()
+                .copied()
+                .filter(|signal| {
+                    *signal != SettlementSignal::VerificationReadbackComplete
+                        || _target.verification_readback_complete
+                }),
+        );
+        if !dirty.profile.required_terminal_signals.is_subset(&signals) {
+            return Ok(SettlementAttempt::Pending(PendingSettlementEvidence {
+                state: PendingSettlementState::Pending,
+                trigger_action_id: dirty.action_id.clone(),
+                profile: dirty.profile.name.clone(),
+                elapsed_ms: 1,
+                observed_signals: signals.iter().copied().collect(),
+                missing_signals: dirty
+                    .profile
+                    .required_terminal_signals
+                    .difference(&signals)
+                    .copied()
+                    .collect(),
+            }));
+        }
+        Ok(SettlementAttempt::Settled(SettlementEvidence {
+            state: SettledState::Settled,
+            trigger_action_id: Some(dirty.action_id.clone()),
+            profile: dirty.profile.name.clone(),
+            elapsed_ms: 1,
+            observed_signals: signals.into_iter().collect(),
+            terminal_signal: "fake_terminal".to_owned(),
+            quiet_window_ms: dirty.profile.quiet_window_ms,
+            resumed_from_prior_call: dirty.resumed_from_prior_call,
+        }))
+    }
+
+    async fn observe(
+        &self,
+        _target: &mut FakeTargetState,
+        window: &ResolvedWindow,
+        _request: ObserveRequest,
+    ) -> Result<NativeObservationUpdate, NativeError> {
+        let sequence = self.observation_count.fetch_add(1, Ordering::SeqCst);
+        self.record("observe");
+        let observation_suffix = sequence + 1;
+        let element_id = id("element-1", ElementId::parse);
+        let mut observed_window = window.clone();
+        if self.refresh_geometry_during_observe.load(Ordering::SeqCst) {
+            observed_window.geometry.bounds.x += 10.0;
+            observed_window.geometry.revision = id("geometry-refreshed", GeometryRevision::parse);
+        }
+        Ok(NativeObservationUpdate {
+            window: observed_window.clone(),
+            surfaces: vec![SurfaceRecord {
+                id: id(&format!("surface-{observation_suffix}"), SurfaceId::parse),
+                kind: SurfaceKind::Window,
+                owner_window: observed_window.public.clone(),
+                image_url: format!("file:///tmp/surface-{observation_suffix}.png"),
+                approximate_bytes: 16,
+                raster_size: Size {
+                    width: 640,
+                    height: 480,
+                },
+                window_bounds: Some(observed_window.geometry.bounds),
+                capture_revision: id(
+                    &format!("capture-{observation_suffix}"),
+                    CaptureRevision::parse,
+                ),
+                transform: SurfaceToWindowTransform {
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                },
+                freshness: CaptureFreshness::Fresh,
+                owner: SurfaceOwner::Target(observed_window.stamp()),
+            }],
+            accessibility: Some(NativeAccessibilityUpdate {
+                normalized_tree: format!(
+                    "window id=root\n  button id=element-1 value={observation_suffix}"
+                ),
+                elements: vec![NativeAccessibilityElement {
+                    id: element_id.clone(),
+                    native: NativeElementHandle::new("native-element-1").unwrap(),
+                    owner: observed_window.stamp(),
+                    role: Some(
+                        self.observation_role
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .unwrap_or_else(|| "button".to_owned()),
+                    ),
+                    label: Some("Fixture button".to_owned()),
+                    value: Some(observation_suffix.to_string()),
+                    bounds: Some(Rect {
+                        x: 10.0,
+                        y: 10.0,
+                        width: 100.0,
+                        height: 30.0,
+                    }),
+                    actions: vec!["AXPress".to_owned()],
+                    menu_id: None,
+                }],
+                focused_element: Some(element_id),
+                selected_text: None,
+                selected_elements: Vec::new(),
+                document_text: None,
+            }),
+            menu: NativeMenuObservation::Unchanged,
+            captured_at_unix_ms: observation_suffix as u64,
+            warnings: Vec::new(),
+            artifacts: Vec::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl SemanticActionProvider<FakeTargetState> for FakePlatform {
+    type PreparedAction = FakePreparedSemantic;
+
+    async fn prepare(
+        &self,
+        _target: &mut FakeTargetState,
+        _scope: &mut InteractionScope,
+        action: &ResolvedAction,
+    ) -> Result<Self::PreparedAction, NativeError> {
+        self.record("semantic_prepare");
+        if self.semantic_prepare_fail.load(Ordering::SeqCst) {
+            return Err(NativeError::unsupported(
+                "fake semantic shape refused during prepare",
+            ));
+        }
+        match action {
+            ResolvedAction::ElementClick { .. } => Ok(FakePreparedSemantic::Click),
+            ResolvedAction::SetValue { .. } => Ok(FakePreparedSemantic::SetValue),
+            ResolvedAction::Secondary { element, action }
+                if action == "AXPress"
+                    && element.role.as_deref().is_some_and(|role| {
+                        matches!(
+                            role,
+                            "AXMenu"
+                                | "AXMenuItem"
+                                | "AXMenuBar"
+                                | "AXMenuBarItem"
+                                | "AXPopUpButton"
+                                | "AXMenuButton"
+                        )
+                    }) =>
+            {
+                Err(NativeError::unsupported(
+                    "recipe_unproven: fake menu-managed secondary action",
+                ))
+            }
+            ResolvedAction::Secondary { .. } => Ok(FakePreparedSemantic::Secondary),
+            _ => Err(NativeError::unsupported("not used by this fixture")),
+        }
+    }
+
+    async fn dispatch(
+        &self,
+        target: &mut FakeTargetState,
+        _scope: &mut InteractionScope,
+        action: Self::PreparedAction,
+    ) -> Result<NativeDispatch, NativeError> {
+        target.semantic_dispatches += 1;
+        self.dispatch_count.fetch_add(1, Ordering::SeqCst);
+        self.record("dispatch");
+        let effect_readback = matches!(action, FakePreparedSemantic::SetValue);
+        if effect_readback {
+            target.verification_readback_complete = true;
+        }
+        if self.semantic_verification_fail.load(Ordering::SeqCst) {
+            return Err(NativeError::new(
+                ErrorCode::VerificationFailed,
+                ErrorPhase::Verify,
+                true,
+                "fake exact semantic readback mismatch",
+            ));
+        }
+        let mut dispatch = NativeDispatch::dispatch_verified();
+        if effect_readback {
+            dispatch.verification = VerificationLevel::EffectVerified;
+        }
+        Ok(dispatch)
+    }
+}
+
+#[async_trait]
+impl PointerActionProvider for FakePlatform {
+    async fn click(
+        &self,
+        _scope: &mut InteractionScope,
+        _point: ResolvedPoint,
+        _click: ClickSpec,
+    ) -> Result<NativeDispatch, NativeError> {
+        self.dispatch_count.fetch_add(1, Ordering::SeqCst);
+        self.record("dispatch");
+        if self.block_dispatch.load(Ordering::SeqCst) {
+            self.dispatch_entered.notify_waiters();
+            std::future::pending::<()>().await;
+        }
+        if self.dispatch_fail.load(Ordering::SeqCst) {
+            return Err(NativeError::new(
+                ErrorCode::DispatchFailed,
+                ErrorPhase::Dispatch,
+                false,
+                "fake dispatch failure",
+            ));
+        }
+        Ok(NativeDispatch::dispatch_verified())
+    }
+
+    async fn drag(
+        &self,
+        _scope: &mut InteractionScope,
+        _drag: ResolvedDrag,
+    ) -> Result<NativeDispatch, NativeError> {
+        Err(NativeError::unsupported("not used by this fixture"))
+    }
+
+    async fn scroll(
+        &self,
+        _scope: &mut InteractionScope,
+        _scroll: ResolvedScroll,
+    ) -> Result<NativeDispatch, NativeError> {
+        Err(NativeError::unsupported("not used by this fixture"))
+    }
+}
+
+#[async_trait]
+impl KeyboardActionProvider for FakePlatform {
+    async fn press_key(
+        &self,
+        _scope: &mut InteractionScope,
+        _focus: &ResolvedFocus,
+        _stroke: KeyStroke,
+    ) -> Result<NativeDispatch, NativeError> {
+        Err(NativeError::unsupported("not used by this fixture"))
+    }
+
+    async fn type_text(
+        &self,
+        _scope: &mut InteractionScope,
+        _focus: &ResolvedFocus,
+        _text: &str,
+    ) -> Result<NativeDispatch, NativeError> {
+        Err(NativeError::unsupported("not used by this fixture"))
+    }
+}
+
+#[async_trait]
+impl InteractionProvider<FakeTargetState, FakeFocus> for FakePlatform {
+    type NativeScopePlan = ();
+
+    async fn preflight(
+        &self,
+        _target: &mut FakeTargetState,
+        _focus: &mut FakeFocus,
+        action_id: &ActionId,
+        window: &ResolvedWindow,
+        route: Route,
+        _action: &ResolvedAction,
+        deadline: MutationDeadline,
+        requirements: ScopeRequirements,
+    ) -> Result<ScopePlan<Self::NativeScopePlan>, NativeError> {
+        self.record("preflight");
+        self.preflight_action_ids
+            .lock()
+            .unwrap()
+            .push(action_id.clone());
+        Ok(ScopePlan::new(
+            action_id.clone(),
+            window.clone(),
+            route,
+            deadline,
+            requirements,
+            (),
+        ))
+    }
+
+    async fn acquire_scope(
+        &self,
+        _target: &mut FakeTargetState,
+        _focus: &mut FakeFocus,
+        plan: ScopePlan<Self::NativeScopePlan>,
+        logical_cursor: TargetCursorHandle,
+    ) -> Result<InteractionScope, NativeError> {
+        self.record("scope_acquired");
+        self.acquired_action_ids
+            .lock()
+            .unwrap()
+            .push(plan.action_id.clone());
+        let decision = |required| {
+            if required {
+                LeaseDecision::Acquired
+            } else {
+                LeaseDecision::NotApplicable
+            }
+        };
+        let acquisition = ScopeLeaseAcquisition {
+            posture_witness: LeaseDecision::Acquired,
+            accessibility: decision(plan.requirements.accessibility),
+            containment: decision(plan.requirements.containment),
+            menu_dismissal: decision(plan.requirements.menu_dismissal),
+            target_belief: decision(plan.requirements.target_belief),
+        };
+        let teardown = |decision| match decision {
+            LeaseDecision::Acquired => LeaseTeardownStatus::Released,
+            LeaseDecision::NotApplicable => LeaseTeardownStatus::NotApplicable,
+        };
+        let mut teardown_leases = ScopeLeaseTeardown {
+            posture_witness: teardown(acquisition.posture_witness),
+            accessibility: teardown(acquisition.accessibility),
+            containment: teardown(acquisition.containment),
+            menu_dismissal: teardown(acquisition.menu_dismissal),
+            target_belief: teardown(acquisition.target_belief),
+        };
+        let failure_count = self.cleanup_failure_count.load(Ordering::SeqCst);
+        if failure_count > 0 {
+            teardown_leases.target_belief = LeaseTeardownStatus::Failed;
+        }
+        Ok(plan.into_scope(
+            acquisition,
+            logical_cursor,
+            NativeEvidence::default(),
+            Box::new(FakeScopeCleanup {
+                ordering: Arc::clone(&self.ordering),
+                cleanup_count: Arc::clone(&self.cleanup_count),
+                failure_count,
+                posture_violated: self.cleanup_posture_violated.load(Ordering::SeqCst),
+                leases: teardown_leases,
+            }),
+        ))
+    }
+}
+
+#[async_trait]
+impl PlatformDriver for FakePlatform {
+    type TargetState = FakeTargetState;
+    type TargetFocusCoordinator = FakeFocus;
+    type Lifecycle = Self;
+    type Windows = Self;
+    type Observation = Self;
+    type Semantic = Self;
+    type Pointer = Self;
+    type Keyboard = Self;
+    type Interaction = Self;
+    type Invalidations = EmptyInvalidations;
+
+    async fn create_target_state(
+        &self,
+        _window: &ResolvedWindow,
+    ) -> Result<(Self::TargetState, Self::TargetFocusCoordinator), NativeError> {
+        self.target_creations.fetch_add(1, Ordering::SeqCst);
+        Ok((
+            FakeTargetState::default(),
+            FakeFocus {
+                shutdowns: Arc::clone(&self.shutdowns),
+            },
+        ))
+    }
+
+    fn lifecycle(&self) -> &Self::Lifecycle {
+        self
+    }
+
+    fn windows(&self) -> &Self::Windows {
+        self
+    }
+
+    fn observation(&self) -> &Self::Observation {
+        self
+    }
+
+    fn semantic(&self) -> &Self::Semantic {
+        self
+    }
+
+    fn pointer(&self) -> &Self::Pointer {
+        self
+    }
+
+    fn keyboard(&self) -> &Self::Keyboard {
+        self
+    }
+
+    fn interaction(&self) -> &Self::Interaction {
+        self
+    }
+
+    fn capability_cells(&self, os_version: &str) -> Vec<CapabilityCell> {
+        vec![
+            CapabilityCell {
+                key: CapabilityKey {
+                    platform: PlatformName::Macos,
+                    os_version: os_version.to_owned(),
+                    action: ActionKind::Click,
+                    addressing: AddressingMode::CapturedPoint,
+                    framework: Framework::AppKit,
+                    window_state: WindowStateKind::Visible,
+                },
+                decision: RouteDecision::Supported {
+                    route: Route::TargetedPointer,
+                },
+            },
+            CapabilityCell {
+                key: CapabilityKey {
+                    platform: PlatformName::Macos,
+                    os_version: os_version.to_owned(),
+                    action: ActionKind::Click,
+                    addressing: AddressingMode::Element,
+                    framework: Framework::AppKit,
+                    window_state: WindowStateKind::Visible,
+                },
+                decision: RouteDecision::Supported {
+                    route: Route::Semantic,
+                },
+            },
+            CapabilityCell {
+                key: CapabilityKey {
+                    platform: PlatformName::Macos,
+                    os_version: os_version.to_owned(),
+                    action: ActionKind::PerformSecondaryAction,
+                    addressing: AddressingMode::Element,
+                    framework: Framework::AppKit,
+                    window_state: WindowStateKind::Visible,
+                },
+                decision: RouteDecision::Supported {
+                    route: Route::Semantic,
+                },
+            },
+            CapabilityCell {
+                key: CapabilityKey {
+                    platform: PlatformName::Macos,
+                    os_version: os_version.to_owned(),
+                    action: ActionKind::SetValue,
+                    addressing: AddressingMode::Element,
+                    framework: Framework::AppKit,
+                    window_state: WindowStateKind::Visible,
+                },
+                decision: RouteDecision::Supported {
+                    route: Route::Semantic,
+                },
+            },
+        ]
+    }
+
+    fn subscribe_invalidations(&self) -> Self::Invalidations {
+        EmptyInvalidations
+    }
+}
+
+#[tokio::test]
+async fn controller_preserves_target_state_and_consumes_at_dispatch_boundary() {
+    let platform = Arc::new(FakePlatform::default());
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
+    let manifest = controller.get_capabilities().await.unwrap();
+    assert_eq!(manifest.cells.len(), 4);
+    assert!(manifest.cells.iter().any(|cell| matches!(
+        cell.decision,
+        RouteDecision::Supported {
+            route: Route::TargetedPointer
+        }
+    )));
+
+    let client_one = id("client-one", ClientId::parse);
+    let first = controller
+        .get_window_state(
+            &client_one,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::DiffIfAvailable,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        first.accessibility.as_ref().unwrap().tree_update,
+        AxTreeUpdate::Full { .. }
+    ));
+
+    let second = controller
+        .get_window_state(
+            &client_one,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::DiffIfAvailable,
+            },
+        )
+        .await
+        .unwrap();
+    let AxTreeUpdate::Diff {
+        base_revision,
+        revision,
+        ..
+    } = &second.accessibility.as_ref().unwrap().tree_update
+    else {
+        panic!("second observation must be a diff");
+    };
+    assert_ne!(base_revision, revision);
+    assert_eq!(platform.target_creations.load(Ordering::SeqCst), 1);
+
+    let surface_id = second.surfaces[0].id.clone();
+    let command = ClickCommand {
+        window: window_ref(),
+        request: ClickRequest {
+            target: ClickTarget::Point {
+                observation_id: second.observation_id.clone(),
+                surface_id,
+                point: Point { x: 20.0, y: 20.0 },
+            },
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: Vec::new(),
+        },
+    };
+    let receipt = controller
+        .click(&client_one, command.clone())
+        .await
+        .unwrap();
+    assert_eq!(receipt.consumed_observation_id, second.observation_id);
+    assert_eq!(receipt.route, Route::TargetedPointer);
+    assert_eq!(receipt.settlement.state, SettledState::Settled);
+    assert_eq!(
+        platform.preflight_action_ids.lock().unwrap().as_slice(),
+        [receipt.action_id.clone()]
+    );
+    assert_eq!(
+        platform.acquired_action_ids.lock().unwrap().as_slice(),
+        [receipt.action_id.clone()]
+    );
+    let scope_evidence = receipt
+        .native_evidence
+        .interaction_scope
+        .as_ref()
+        .expect("receipt carries typed scope evidence");
+    assert_eq!(
+        scope_evidence.acquisition.posture_witness,
+        LeaseDecision::Acquired
+    );
+    assert_eq!(
+        scope_evidence
+            .teardown
+            .as_ref()
+            .expect("completed scope carries teardown evidence")
+            .target_belief,
+        LeaseTeardownStatus::Released
+    );
+    assert_eq!(
+        receipt.native_evidence.fields.get("fake_cleanup"),
+        Some(&serde_json::json!("complete"))
+    );
+
+    let mut cross_window = command.clone();
+    cross_window.window.id = id("window-2", WindowId::parse);
+    let cross_error = controller
+        .click(&client_one, cross_window)
+        .await
+        .unwrap_err();
+    assert_eq!(cross_error.code, ErrorCode::WindowIdentityChanged);
+    assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 1);
+
+    let stale = controller.click(&client_one, command).await.unwrap_err();
+    assert_eq!(stale.code, ErrorCode::ObservationStale);
+    assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        platform.ordering.lock().unwrap().as_slice(),
+        [
+            "observe",
+            "observe",
+            "preflight",
+            "scope_acquired",
+            "dispatch",
+            "settle",
+            "scope_released"
+        ]
+    );
+
+    let resynchronized = controller
+        .get_window_state(
+            &client_one,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        resynchronized.accessibility.as_ref().unwrap().tree_update,
+        AxTreeUpdate::Full { .. }
+    ));
+    platform.settle_pending.store(true, Ordering::SeqCst);
+    let pending_command = ClickCommand {
+        window: window_ref(),
+        request: ClickRequest {
+            target: ClickTarget::Point {
+                observation_id: resynchronized.observation_id.clone(),
+                surface_id: resynchronized.surfaces[0].id.clone(),
+                point: Point { x: 20.0, y: 20.0 },
+            },
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: Vec::new(),
+        },
+    };
+    let pending_error = controller
+        .click(&client_one, pending_command)
+        .await
+        .unwrap_err();
+    assert_eq!(pending_error.code, ErrorCode::UiNotSettled);
+    assert!(pending_error.pending_settlement.is_some());
+    assert!(matches!(
+        pending_error.partial_evidence.as_deref(),
+        Some(PartialEvidence::Action {
+            dispatch: Some(PartialNativeDispatch { .. }),
+            pending_settlement: Some(_),
+            ..
+        })
+    ));
+    platform.settle_pending.store(false, Ordering::SeqCst);
+    controller
+        .get_window_state(
+            &client_one,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::DiffIfAvailable,
+            },
+        )
+        .await
+        .unwrap();
+
+    let client_two = id("client-two", ClientId::parse);
+    controller
+        .get_window_state(
+            &client_two,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::DiffIfAvailable,
+            },
+        )
+        .await
+        .unwrap();
+    let first_key = TargetKey::from_window(client_one.clone(), &resolved_window());
+    let second_key = TargetKey::from_window(client_two.clone(), &resolved_window());
+    let first_target = controller.targets.get(&first_key).await.unwrap();
+    let second_target = controller.targets.get(&second_key).await.unwrap();
+    assert!(Arc::ptr_eq(
+        &first_target.mutation_lock,
+        &second_target.mutation_lock
+    ));
+
+    assert_eq!(controller.close_connection(&client_one).await.unwrap(), 1);
+    assert_eq!(controller.targets.len().await, 1);
+    assert_eq!(platform.shutdowns.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        controller
+            .targets
+            .handle_invalidation(
+                &platform,
+                TargetInvalidation::ProcessExited {
+                    process: resolved_window().process,
+                },
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(controller.targets.len().await, 0);
+    assert_eq!(platform.shutdowns.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn semantic_element_dispatch_uses_the_locked_target_and_interaction_scope() {
+    let platform = Arc::new(FakePlatform::default());
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
+    let client = id("semantic-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: false,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    let element = observed
+        .accessibility
+        .as_ref()
+        .unwrap()
+        .elements
+        .first()
+        .unwrap()
+        .element_ref
+        .clone();
+    let receipt = controller
+        .click(
+            &client,
+            ClickCommand {
+                window: window_ref(),
+                request: ClickRequest {
+                    target: ClickTarget::Element { element },
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Vec::new(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.route, Route::Semantic);
+    assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 1);
+    let key = TargetKey::from_window(client.clone(), &resolved_window());
+    let target = controller.targets.get(&key).await.unwrap();
+    assert_eq!(target.state.lock().await.platform.semantic_dispatches, 1);
+    assert_eq!(
+        platform.ordering.lock().unwrap().as_slice(),
+        [
+            "observe",
+            "preflight",
+            "scope_acquired",
+            "semantic_prepare",
+            "dispatch",
+            "settle",
+            "scope_released"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn semantic_prepare_refusal_preserves_the_observation_and_never_enters_dispatch() {
+    let platform = Arc::new(FakePlatform::default());
+    platform.semantic_prepare_fail.store(true, Ordering::SeqCst);
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
+    let client = id("semantic-prepare-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: false,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    let element = observed
+        .accessibility
+        .as_ref()
+        .unwrap()
+        .elements
+        .first()
+        .unwrap()
+        .element_ref
+        .clone();
+    let command = ClickCommand {
+        window: window_ref(),
+        request: ClickRequest {
+            target: ClickTarget::Element { element },
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: Vec::new(),
+        },
+    };
+
+    let refused = controller
+        .click(&client, command.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::UnsupportedInBackground);
+    assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 0);
+    let key = TargetKey::from_window(client.clone(), &resolved_window());
+    let target = controller.targets.get(&key).await.unwrap();
+    assert_eq!(target.state.lock().await.platform.semantic_dispatches, 0);
+
+    platform
+        .semantic_prepare_fail
+        .store(false, Ordering::SeqCst);
+    controller.click(&client, command).await.unwrap();
+    assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn menu_managed_secondary_axpress_refuses_in_prepare_without_consuming_observation() {
+    for role in [
+        "AXMenu",
+        "AXMenuItem",
+        "AXMenuBar",
+        "AXMenuBarItem",
+        "AXPopUpButton",
+        "AXMenuButton",
+    ] {
+        let platform = Arc::new(FakePlatform::default());
+        *platform.observation_role.lock().unwrap() = Some(role.to_owned());
+        let controller =
+            DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
+        let client = ClientId::parse(format!("menu-secondary-{role}")).unwrap();
+        let observed = controller
+            .get_window_state(
+                &client,
+                GetWindowStateRequest {
+                    window: window_ref(),
+                    include_text: true,
+                    include_screenshots: false,
+                    ax_tree_mode: AxTreeMode::Full,
+                },
+            )
+            .await
+            .unwrap();
+        let element = observed
+            .accessibility
+            .as_ref()
+            .unwrap()
+            .elements
+            .first()
+            .unwrap()
+            .element_ref
+            .clone();
+
+        let error = controller
+            .perform_secondary_action(
+                &client,
+                SecondaryActionCommand {
+                    window: window_ref(),
+                    request: SecondaryActionRequest {
+                        element,
+                        action: "AXPress".to_owned(),
+                    },
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::UnsupportedInBackground, "{role}");
+        assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 0, "{role}");
+        let key = TargetKey::from_window(client, &resolved_window());
+        let target = controller.targets.get(&key).await.unwrap();
+        let mut state = target.state.lock().await;
+        let current_window = state.window.clone();
+        state
+            .observations
+            .current(&observed.observation_id, &current_window)
+            .unwrap_or_else(|error| panic!("{role} observation was consumed: {error}"));
+    }
+}
+
+#[tokio::test]
+async fn semantic_readback_mismatch_settles_and_remains_the_primary_failure() {
+    let platform = Arc::new(FakePlatform::default());
+    platform
+        .semantic_verification_fail
+        .store(true, Ordering::SeqCst);
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
+    let client = id("semantic-readback-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: false,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    let element = observed
+        .accessibility
+        .as_ref()
+        .unwrap()
+        .elements
+        .first()
+        .unwrap()
+        .element_ref
+        .clone();
+
+    let error = controller
+        .set_value(
+            &client,
+            SetValueCommand {
+                window: window_ref(),
+                request: SetValueRequest {
+                    element,
+                    value: "expected exact value".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::VerificationFailed);
+    assert!(!error
+        .related_failures
+        .iter()
+        .any(|failure| failure.code == ErrorCode::UiNotSettled));
+    let Some(PartialEvidence::Action {
+        pending_settlement, ..
+    }) = error.partial_evidence.as_deref()
+    else {
+        panic!("post-dispatch verification failure must retain partial action evidence");
+    };
+    assert!(pending_settlement.is_none());
+    assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn coherent_observation_accepts_refreshed_geometry_without_relaxing_identity() {
+    let platform = Arc::new(FakePlatform::default());
+    platform
+        .refresh_geometry_during_observe
+        .store(true, Ordering::SeqCst);
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
+    let client = id("geometry-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::DiffIfAvailable,
+            },
+        )
+        .await
+        .unwrap();
+
+    let key = TargetKey::from_window(client, &resolved_window());
+    let target = controller.targets.get(&key).await.unwrap();
+    let mut state = target.state.lock().await;
+    assert_eq!(
+        state.window.geometry.revision,
+        id("geometry-refreshed", GeometryRevision::parse)
+    );
+    assert_eq!(state.window.geometry.bounds.x, 110.0);
+    let current_window = state.window.clone();
+    state
+        .observations
+        .current(&observed.observation_id, &current_window)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn target_registry_tears_down_idle_and_superseded_generations_exactly() {
+    let platform = FakePlatform::default();
+    let registry = TargetControllerRegistry::new(
+        Arc::new(ProcessMutationLockRegistry::default()),
+        Duration::ZERO,
+    );
+    let client = id("registry-client", ClientId::parse);
+    let generation_one = resolved_window();
+    registry
+        .get_or_create(
+            &platform,
+            TargetKey::from_window(client.clone(), &generation_one),
+            generation_one.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(registry.expire_idle(&platform).await.unwrap(), 1);
+    assert!(registry.is_empty().await);
+
+    registry
+        .get_or_create(
+            &platform,
+            TargetKey::from_window(client.clone(), &generation_one),
+            generation_one.clone(),
+        )
+        .await
+        .unwrap();
+    let mut generation_two = generation_one;
+    generation_two.generation = WindowGeneration(2);
+    registry
+        .get_or_create(
+            &platform,
+            TargetKey::from_window(client, &generation_two),
+            generation_two,
+        )
+        .await
+        .unwrap();
+    assert_eq!(registry.len().await, 1);
+    assert_eq!(platform.shutdowns.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn native_event_source_lag_tears_down_every_cached_target() {
+    let platform = FakePlatform::default();
+    let registry = TargetControllerRegistry::new(
+        Arc::new(ProcessMutationLockRegistry::default()),
+        Duration::from_secs(60),
+    );
+    let first = resolved_window();
+    registry
+        .get_or_create(
+            &platform,
+            TargetKey::from_window(id("lag-client-one", ClientId::parse), &first),
+            first.clone(),
+        )
+        .await
+        .unwrap();
+    registry
+        .get_or_create(
+            &platform,
+            TargetKey::from_window(id("lag-client-two", ClientId::parse), &first),
+            first,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        registry
+            .handle_invalidation(&platform, TargetInvalidation::NativeStateResyncRequired)
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(registry.is_empty().await);
+    assert_eq!(platform.shutdowns.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn interaction_scope_release_is_idempotent_and_accumulates_teardown_evidence() {
+    let cleanup_count = Arc::new(AtomicUsize::new(0));
+    let ordering = Arc::new(Mutex::new(Vec::new()));
+    let acquisition = ScopeLeaseAcquisition {
+        posture_witness: LeaseDecision::Acquired,
+        accessibility: LeaseDecision::Acquired,
+        containment: LeaseDecision::Acquired,
+        menu_dismissal: LeaseDecision::NotApplicable,
+        target_belief: LeaseDecision::Acquired,
+    };
+    let mut scope = ScopePlan::new(
+        id("idempotent-action", ActionId::parse),
+        resolved_window(),
+        Route::TargetedPointer,
+        test_mutation_deadline(),
+        ScopeRequirements::for_route(Route::TargetedPointer),
+        (),
+    )
+    .into_scope(
+        acquisition,
+        TargetCursorHandle::default(),
+        NativeEvidence::default(),
+        Box::new(FakeScopeCleanup {
+            ordering,
+            cleanup_count: Arc::clone(&cleanup_count),
+            failure_count: 2,
+            posture_violated: true,
+            leases: ScopeLeaseTeardown {
+                posture_witness: LeaseTeardownStatus::Released,
+                accessibility: LeaseTeardownStatus::Released,
+                containment: LeaseTeardownStatus::Released,
+                menu_dismissal: LeaseTeardownStatus::NotApplicable,
+                target_belief: LeaseTeardownStatus::Failed,
+            },
+        }),
+    );
+
+    let first = scope.release();
+    let second = scope.release();
+
+    assert_eq!(first, second);
+    assert_eq!(first.failures.len(), 2);
+    assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+    assert!(!scope.posture.held);
+    assert!(scope.posture.restored_after_violation);
+    assert_eq!(
+        scope.native_evidence.fields.get("fake_cleanup"),
+        Some(&serde_json::json!("complete"))
+    );
+    assert_eq!(
+        scope
+            .native_evidence
+            .interaction_scope
+            .as_ref()
+            .and_then(|evidence| evidence.teardown.as_ref())
+            .map(|teardown| teardown.target_belief),
+        Some(LeaseTeardownStatus::Failed)
+    );
+    drop(scope);
+    assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn posture_violation_remains_primary_and_keeps_every_cleanup_failure() {
+    let platform = Arc::new(FakePlatform::default());
+    platform.dispatch_fail.store(true, Ordering::SeqCst);
+    platform.settle_pending.store(true, Ordering::SeqCst);
+    platform.cleanup_failure_count.store(2, Ordering::SeqCst);
+    platform
+        .cleanup_posture_violated
+        .store(true, Ordering::SeqCst);
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
+    let client = id("failure-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::DiffIfAvailable,
+            },
+        )
+        .await
+        .unwrap();
+    let error = controller
+        .click(
+            &client,
+            ClickCommand {
+                window: window_ref(),
+                request: ClickRequest {
+                    target: ClickTarget::Point {
+                        observation_id: observed.observation_id.clone(),
+                        surface_id: observed.surfaces[0].id.clone(),
+                        point: Point { x: 20.0, y: 20.0 },
+                    },
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Vec::new(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::PostureViolated);
+    assert_eq!(error.related_failures.len(), 4);
+    for expected in [
+        ErrorCode::DispatchFailed,
+        ErrorCode::UiNotSettled,
+        ErrorCode::VerificationFailed,
+        ErrorCode::Internal,
+    ] {
+        assert!(error
+            .related_failures
+            .iter()
+            .any(|failure| failure.code == expected));
+    }
+    let Some(PartialEvidence::Action {
+        dispatch: None,
+        posture,
+        native_evidence,
+        pending_settlement: Some(_),
+        ..
+    }) = error.partial_evidence.as_deref()
+    else {
+        panic!("post-dispatch failure must keep scope and settlement evidence");
+    };
+    assert!(!posture.held);
+    assert!(posture.restored_after_violation);
+    assert_eq!(
+        native_evidence
+            .interaction_scope
+            .as_ref()
+            .and_then(|evidence| evidence.teardown.as_ref())
+            .map(|teardown| teardown.target_belief),
+        Some(LeaseTeardownStatus::Failed)
+    );
+    assert_eq!(platform.cleanup_count.load(Ordering::SeqCst), 1);
+    let missing = controller
+        .targets
+        .get(&TargetKey::from_window(client, &resolved_window()))
+        .await
+        .err()
+        .expect("failed scope teardown removes the target");
+    assert_eq!(missing.code, ErrorCode::ObservationStale);
+    assert_eq!(platform.shutdowns.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancellation_inside_provider_leaves_observation_consumed_and_target_dirty() {
+    let platform = Arc::new(FakePlatform::default());
+    let controller = Arc::new(DriverController::new(
+        Arc::clone(&platform),
+        PlatformName::Macos,
+        "test-os",
+    ));
+    let client = id("cancel-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::DiffIfAvailable,
+            },
+        )
+        .await
+        .unwrap();
+    let command = ClickCommand {
+        window: window_ref(),
+        request: ClickRequest {
+            target: ClickTarget::Point {
+                observation_id: observed.observation_id.clone(),
+                surface_id: observed.surfaces[0].id.clone(),
+                point: Point { x: 20.0, y: 20.0 },
+            },
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: Vec::new(),
+        },
+    };
+
+    platform.block_dispatch.store(true, Ordering::SeqCst);
+    let dispatch_entered = platform.dispatch_entered.notified();
+    let action = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let client = client.clone();
+        let command = command.clone();
+        async move { controller.click(&client, command).await }
+    });
+    dispatch_entered.await;
+    action.abort();
+    assert!(action.await.unwrap_err().is_cancelled());
+    assert_eq!(platform.cleanup_count.load(Ordering::SeqCst), 1);
+    platform.block_dispatch.store(false, Ordering::SeqCst);
+
+    let target = controller
+        .targets
+        .get(&TargetKey::from_window(client.clone(), &resolved_window()))
+        .await
+        .unwrap();
+    let mut state = target.state.lock().await;
+    assert!(state.settlement.settled_evidence().is_none());
+    let stale = state
+        .observations
+        .current(&observed.observation_id, &resolved_window())
+        .unwrap_err();
+    assert_eq!(stale.code, ErrorCode::ObservationStale);
+    drop(state);
+
+    let dirty = controller.click(&client, command).await.unwrap_err();
+    assert_eq!(dirty.code, ErrorCode::UiNotSettled);
+}
+
+#[tokio::test]
+async fn cancellation_cleanup_failure_poison_is_rebuilt_by_the_next_observation() {
+    let platform = Arc::new(FakePlatform::default());
+    platform.cleanup_failure_count.store(1, Ordering::SeqCst);
+    let controller = Arc::new(DriverController::new(
+        Arc::clone(&platform),
+        PlatformName::Macos,
+        "test-os",
+    ));
+    let client = id("cancel-cleanup-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::DiffIfAvailable,
+            },
+        )
+        .await
+        .unwrap();
+    let command = ClickCommand {
+        window: window_ref(),
+        request: ClickRequest {
+            target: ClickTarget::Point {
+                observation_id: observed.observation_id,
+                surface_id: observed.surfaces[0].id.clone(),
+                point: Point { x: 20.0, y: 20.0 },
+            },
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: Vec::new(),
+        },
+    };
+
+    platform.block_dispatch.store(true, Ordering::SeqCst);
+    let dispatch_entered = platform.dispatch_entered.notified();
+    let action = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let client = client.clone();
+        async move { controller.click(&client, command).await }
+    });
+    dispatch_entered.await;
+    action.abort();
+    assert!(action.await.unwrap_err().is_cancelled());
+    assert_eq!(platform.cleanup_count.load(Ordering::SeqCst), 1);
+
+    let poisoned = controller
+        .targets
+        .get(&TargetKey::from_window(client.clone(), &resolved_window()))
+        .await
+        .err()
+        .expect("cancellation cleanup failure poisons the target");
+    assert_eq!(poisoned.code, ErrorCode::WindowIdentityChanged);
+
+    platform.block_dispatch.store(false, Ordering::SeqCst);
+    platform.cleanup_failure_count.store(0, Ordering::SeqCst);
+    controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(platform.target_creations.load(Ordering::SeqCst), 2);
+    assert_eq!(platform.shutdowns.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn wedged_dispatch_deadline_releases_scope_without_reusing_observation() {
+    let platform = Arc::new(FakePlatform::default());
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os")
+        .with_mutation_timeouts(Duration::from_millis(40), Duration::from_millis(100));
+    let client = id("deadline-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::DiffIfAvailable,
+            },
+        )
+        .await
+        .unwrap();
+    let command = ClickCommand {
+        window: window_ref(),
+        request: ClickRequest {
+            target: ClickTarget::Point {
+                observation_id: observed.observation_id.clone(),
+                surface_id: observed.surfaces[0].id.clone(),
+                point: Point { x: 20.0, y: 20.0 },
+            },
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: Vec::new(),
+        },
+    };
+
+    platform.block_dispatch.store(true, Ordering::SeqCst);
+    let error = controller
+        .click(&client, command.clone())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::DispatchFailed);
+    assert_eq!(error.phase, ErrorPhase::Dispatch);
+    assert!(!error.retryable);
+    let Some(PartialEvidence::Action {
+        dispatch: None,
+        pending_settlement: Some(pending),
+        native_evidence,
+        ..
+    }) = error.partial_evidence.as_deref()
+    else {
+        panic!("dispatch deadline must keep incomplete-dispatch and teardown evidence");
+    };
+    assert!(!pending
+        .observed_signals
+        .contains(&SettlementSignal::DispatchComplete));
+    assert_eq!(
+        native_evidence.fields.get("fake_cleanup"),
+        Some(&serde_json::json!("complete"))
+    );
+    assert_eq!(platform.cleanup_count.load(Ordering::SeqCst), 1);
+    let ordering = platform.ordering.lock().unwrap();
+    let dispatch_index = ordering
+        .iter()
+        .position(|event| *event == "dispatch")
+        .unwrap();
+    let release_index = ordering
+        .iter()
+        .position(|event| *event == "scope_released")
+        .unwrap();
+    assert!(dispatch_index < release_index);
+    drop(ordering);
+
+    let target = controller
+        .targets
+        .get(&TargetKey::from_window(client.clone(), &resolved_window()))
+        .await
+        .unwrap();
+    let mut state = target.state.lock().await;
+    assert!(state.settlement.settled_evidence().is_none());
+    let stale = state
+        .observations
+        .current(&observed.observation_id, &resolved_window())
+        .unwrap_err();
+    assert_eq!(stale.code, ErrorCode::ObservationStale);
+    drop(state);
+    platform.block_dispatch.store(false, Ordering::SeqCst);
+    let dirty = controller.click(&client, command).await.unwrap_err();
+    assert_eq!(dirty.code, ErrorCode::UiNotSettled);
+}
+
+#[tokio::test]
+async fn deadline_cleanup_failure_keeps_evidence_and_removes_poisoned_target() {
+    let platform = Arc::new(FakePlatform::default());
+    platform.cleanup_failure_count.store(1, Ordering::SeqCst);
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os")
+        .with_mutation_timeouts(Duration::from_millis(40), Duration::from_millis(100));
+    let client = id("deadline-cleanup-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::DiffIfAvailable,
+            },
+        )
+        .await
+        .unwrap();
+    platform.block_dispatch.store(true, Ordering::SeqCst);
+    let error = controller
+        .click(
+            &client,
+            ClickCommand {
+                window: window_ref(),
+                request: ClickRequest {
+                    target: ClickTarget::Point {
+                        observation_id: observed.observation_id,
+                        surface_id: observed.surfaces[0].id.clone(),
+                        point: Point { x: 20.0, y: 20.0 },
+                    },
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Vec::new(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::DispatchFailed);
+    assert!(error
+        .related_failures
+        .iter()
+        .any(|failure| failure.code == ErrorCode::VerificationFailed));
+    let Some(PartialEvidence::Action {
+        dispatch: None,
+        pending_settlement: Some(pending),
+        native_evidence,
+        ..
+    }) = error.partial_evidence.as_deref()
+    else {
+        panic!("cleanup failure must retain dispatch, settlement, and scope evidence");
+    };
+    assert!(!pending
+        .observed_signals
+        .contains(&SettlementSignal::DispatchComplete));
+    assert_eq!(
+        native_evidence.fields.get("fake_cleanup"),
+        Some(&serde_json::json!("complete"))
+    );
+    assert_eq!(
+        native_evidence
+            .interaction_scope
+            .as_ref()
+            .and_then(|evidence| evidence.teardown.as_ref())
+            .map(|teardown| teardown.target_belief),
+        Some(LeaseTeardownStatus::Failed)
+    );
+    assert_eq!(platform.cleanup_count.load(Ordering::SeqCst), 1);
+    let missing = controller
+        .targets
+        .get(&TargetKey::from_window(client, &resolved_window()))
+        .await
+        .err()
+        .expect("deadline cleanup failure removes the poisoned target");
+    assert_eq!(missing.code, ErrorCode::ObservationStale);
+    assert_eq!(platform.shutdowns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn pending_settlement_progress_survives_for_the_next_attempt() {
+    let action_id = id("pending-action", ActionId::parse);
+    let profile = SettlementProfile::requiring(
+        "exact_value",
+        [
+            SettlementSignal::AxValueChanged,
+            SettlementSignal::VerificationReadbackComplete,
+        ],
+    );
+    let mut state = SettlementState::default();
+    state.mark_dirty(action_id.clone(), profile).unwrap();
+    let dirty = state.begin(false).unwrap();
+    let pending = PendingSettlementEvidence {
+        state: PendingSettlementState::Pending,
+        trigger_action_id: action_id,
+        profile: "exact_value".to_owned(),
+        elapsed_ms: 20,
+        observed_signals: vec![
+            SettlementSignal::DispatchComplete,
+            SettlementSignal::AxValueChanged,
+        ],
+        missing_signals: vec![SettlementSignal::VerificationReadbackComplete],
+    };
+    assert!(!dirty
+        .observed_signals
+        .contains(&SettlementSignal::AxValueChanged));
+    state.preserve_pending(&pending).unwrap();
+    let resumed = state.begin(true).unwrap();
+    assert!(resumed
+        .observed_signals
+        .contains(&SettlementSignal::AxValueChanged));
+    assert!(resumed.resumed_from_prior_call);
+}
+
+#[test]
+fn menu_state_only_publishes_stable_lifecycle_states() {
+    let mut menu = MenuControllerState::default();
+    let action = id("action-1", ActionId::parse);
+    let owner = resolved_window().stamp();
+    let menu_id = menu.begin_open(action.clone(), window_ref(), owner.clone());
+    let transitional = menu.observation().unwrap_err();
+    assert_eq!(transitional.code, ErrorCode::MenuStateStale);
+    menu.record_open(
+        &menu_id,
+        &menu_id,
+        &action,
+        &owner,
+        NativeMenuIdentity {
+            process: NativeProcessHandle::new("menu-process").unwrap(),
+            window: NativeWindowHandle::new("menu-window").unwrap(),
+            generation: WindowGeneration(1),
+        },
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        menu.observation().unwrap(),
+        MenuState::Open {
+            opened_by_action_id,
+            ..
+        } if opened_by_action_id == action
+    ));
+    menu.begin_dismiss(id("action-2", ActionId::parse)).unwrap();
+    menu.close();
+    assert!(matches!(
+        menu.observation().unwrap(),
+        MenuState::Closed { .. }
+    ));
+}
+
+#[allow(dead_code)]
+fn _settlement_type_assertion(_: BTreeSet<SettlementSignal>) {}

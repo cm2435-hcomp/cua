@@ -56,12 +56,16 @@
 //! queue's own thread regardless of run-loop state.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use std::time::{Duration, Instant};
 
+use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSApplicationActivationOptions, NSRunningApplication, NSWorkspace,
-    NSWorkspaceDidActivateApplicationNotification, NSWorkspaceApplicationKey,
+    NSApplicationActivationOptions, NSRunningApplication, NSWorkspace, NSWorkspaceApplicationKey,
+    NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::NSOperationQueue;
 use uuid::Uuid;
@@ -96,17 +100,39 @@ struct Entry {
     /// Provenance for tracing — e.g. `"LaunchAppTool.pre"`.
     #[allow(dead_code)]
     origin: &'static str,
+    evidence: Arc<SuppressionEvidenceState>,
+}
+
+#[derive(Debug, Default)]
+struct SuppressionEvidenceState {
+    activations: AtomicUsize,
+    restore_attempts: AtomicUsize,
+    restore_failures: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SuppressionOutcome {
+    pub activations: usize,
+    pub restore_attempts: usize,
+    pub restore_failures: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SuppressionCloseOutcome {
+    pub evidence: SuppressionOutcome,
+    /// True only when removal ran on the serial observer queue after every
+    /// containment callback already queued there.
+    pub callback_queue_drained: bool,
 }
 
 /// Singleton focus-steal preventer.
 ///
 /// Constructed lazily on first `shared()` call. Owns the dispatcher state
-/// (Sync via the inner Mutex); the NSWorkspace observer + queue are
-/// intentionally retained-and-forgotten on install so their lifetime is
-/// the whole process and we don't need to thread `!Send` Cocoa handles
-/// through this struct.
+/// (Sync via the inner Mutex); the observer token is process-lifetime and the
+/// serial callback queue is retained for bounded evidence barriers.
 pub struct FocusStealPreventer {
     dispatcher: Arc<Dispatcher>,
+    observer_queue: Retained<NSOperationQueue>,
 }
 
 impl FocusStealPreventer {
@@ -116,8 +142,11 @@ impl FocusStealPreventer {
         SINGLETON
             .get_or_init(|| {
                 let dispatcher = Arc::new(Dispatcher::new());
-                install_observer(&dispatcher);
-                Arc::new(FocusStealPreventer { dispatcher })
+                let observer_queue = install_observer(&dispatcher);
+                Arc::new(FocusStealPreventer {
+                    dispatcher,
+                    observer_queue,
+                })
             })
             .clone()
     }
@@ -133,14 +162,54 @@ impl FocusStealPreventer {
         restore_to: i32,
         origin: &'static str,
     ) -> SuppressionLease {
+        Self::begin_suppression_until(
+            target_pid,
+            restore_to,
+            origin,
+            Instant::now() + ENTRY_DEADLINE,
+        )
+    }
+
+    /// Begin a caller-bounded suppression whose leak deadline covers the
+    /// complete native operation span. Long-running v2 operations use their
+    /// own deadline instead of silently losing containment after five seconds.
+    pub fn begin_suppression_until(
+        target_pid: Option<i32>,
+        restore_to: i32,
+        origin: &'static str,
+        deadline: Instant,
+    ) -> SuppressionLease {
         let shared = Self::shared();
         let handle = shared
             .dispatcher
-            .add(target_pid, restore_to, origin);
+            .add_until(target_pid, restore_to, origin, deadline);
         SuppressionLease {
             handle,
             dispatcher: Arc::clone(&shared.dispatcher),
+            evidence: shared.dispatcher.evidence(handle),
             released: false,
+        }
+    }
+
+    /// Register containment whose dispatcher entry, rather than a future or
+    /// callback stack frame, owns the native deadline. Dropping every Rust
+    /// handle intentionally leaves the entry armed until its deadline; normal
+    /// completion must call [`DeadlineSuppression::close_with_evidence`].
+    pub fn begin_deadline_owned_suppression_until(
+        target_pid: Option<i32>,
+        restore_to: i32,
+        origin: &'static str,
+        deadline: Instant,
+    ) -> DeadlineSuppression {
+        let shared = Self::shared();
+        let handle = shared
+            .dispatcher
+            .add_until(target_pid, restore_to, origin, deadline);
+        DeadlineSuppression {
+            handle,
+            dispatcher: Arc::clone(&shared.dispatcher),
+            evidence: shared.dispatcher.evidence(handle),
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -161,10 +230,73 @@ impl FocusStealPreventer {
         f().await
     }
 
-    /// For tests. Returns the singleton's dispatcher arc.
-    #[cfg(test)]
-    fn dispatcher(&self) -> &Arc<Dispatcher> {
-        &self.dispatcher
+    /// Wait until every focus-containment callback queued before this call has
+    /// run. Callers fail closed when the bounded barrier does not complete.
+    pub fn barrier(timeout: Duration) -> bool {
+        let shared = Self::shared();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let block = block2::RcBlock::new(move || {
+            let _ = sender.send(());
+        });
+        unsafe { shared.observer_queue.addBarrierBlock(&block) };
+        receiver.recv_timeout(timeout).is_ok()
+    }
+
+    fn close_handle(
+        dispatcher: Arc<Dispatcher>,
+        handle: SuppressionHandle,
+        evidence: Arc<SuppressionEvidenceState>,
+        timeout: Duration,
+    ) -> SuppressionCloseOutcome {
+        let shared = Self::shared();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let queued_dispatcher = Arc::clone(&dispatcher);
+        let queued_evidence = Arc::clone(&evidence);
+        let block = block2::RcBlock::new(move || {
+            queued_dispatcher.remove(handle);
+            let _ = sender.send(suppression_outcome(&queued_evidence));
+        });
+        unsafe { shared.observer_queue.addBarrierBlock(&block) };
+        match receiver.recv_timeout(timeout) {
+            Ok(evidence) => SuppressionCloseOutcome {
+                evidence,
+                callback_queue_drained: true,
+            },
+            Err(_) => {
+                // Never strand containment just because the proof barrier
+                // timed out. Removal and the best evidence currently visible
+                // are still returned; the caller must classify this as
+                // posture_unverifiable rather than success.
+                dispatcher.remove(handle);
+                SuppressionCloseOutcome {
+                    evidence: suppression_outcome(&evidence),
+                    callback_queue_drained: false,
+                }
+            }
+        }
+    }
+
+    fn narrow_handle(
+        dispatcher: Arc<Dispatcher>,
+        handle: SuppressionHandle,
+        target_pid: i32,
+        timeout: Duration,
+    ) -> bool {
+        let shared = Self::shared();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let queued_dispatcher = Arc::clone(&dispatcher);
+        let block = block2::RcBlock::new(move || {
+            queued_dispatcher.retarget(handle, Some(target_pid));
+            let _ = sender.send(());
+        });
+        unsafe { shared.observer_queue.addBarrierBlock(&block) };
+        if receiver.recv_timeout(timeout).is_ok() {
+            true
+        } else {
+            // Preserve containment even when the ordering proof is lost.
+            dispatcher.retarget(handle, Some(target_pid));
+            false
+        }
     }
 }
 
@@ -177,11 +309,79 @@ pub fn begin_suppression(
     FocusStealPreventer::begin_suppression(target_pid, restore_to, origin)
 }
 
+/// Begin suppression through a caller-owned bounded native deadline.
+pub fn begin_suppression_until(
+    target_pid: Option<i32>,
+    restore_to: i32,
+    origin: &'static str,
+    deadline: Instant,
+) -> SuppressionLease {
+    FocusStealPreventer::begin_suppression_until(target_pid, restore_to, origin, deadline)
+}
+
+pub fn begin_deadline_owned_suppression_until(
+    target_pid: Option<i32>,
+    restore_to: i32,
+    origin: &'static str,
+    deadline: Instant,
+) -> DeadlineSuppression {
+    FocusStealPreventer::begin_deadline_owned_suppression_until(
+        target_pid, restore_to, origin, deadline,
+    )
+}
+
+/// Cloneable handle to a dispatcher-owned containment entry. `Drop` is
+/// intentionally a no-op: cancellation must not disarm a LaunchServices
+/// callback that can still activate an app before the native deadline.
+#[derive(Clone)]
+pub struct DeadlineSuppression {
+    handle: SuppressionHandle,
+    dispatcher: Arc<Dispatcher>,
+    evidence: Arc<SuppressionEvidenceState>,
+    closed: Arc<AtomicBool>,
+}
+
+impl DeadlineSuppression {
+    /// Narrow a launch wildcard to the pid returned by LaunchServices without
+    /// a remove/add gap. The serial-queue result is evidence, not best effort.
+    pub fn narrow_to_target(&self, target_pid: i32, timeout: Duration) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        FocusStealPreventer::narrow_handle(
+            Arc::clone(&self.dispatcher),
+            self.handle,
+            target_pid,
+            timeout,
+        )
+    }
+
+    pub fn close_with_evidence(&self, timeout: Duration) -> SuppressionCloseOutcome {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return SuppressionCloseOutcome {
+                evidence: suppression_outcome(&self.evidence),
+                callback_queue_drained: true,
+            };
+        }
+        FocusStealPreventer::close_handle(
+            Arc::clone(&self.dispatcher),
+            self.handle,
+            Arc::clone(&self.evidence),
+            timeout,
+        )
+    }
+
+    pub fn outcome(&self) -> SuppressionOutcome {
+        suppression_outcome(&self.evidence)
+    }
+}
+
 /// RAII lease. `Drop` ends the entry synchronously, so the entry is
 /// removed even if a future is cancelled mid-await.
 pub struct SuppressionLease {
     handle: SuppressionHandle,
     dispatcher: Arc<Dispatcher>,
+    evidence: Arc<SuppressionEvidenceState>,
     released: bool,
 }
 
@@ -191,6 +391,35 @@ impl SuppressionLease {
     pub fn release(mut self) {
         self.dispatcher.remove(self.handle);
         self.released = true;
+    }
+
+    pub fn release_with_evidence(mut self) -> SuppressionOutcome {
+        self.dispatcher.remove(self.handle);
+        self.released = true;
+        suppression_outcome(&self.evidence)
+    }
+
+    pub fn close_with_evidence(mut self, timeout: Duration) -> SuppressionCloseOutcome {
+        let outcome = FocusStealPreventer::close_handle(
+            Arc::clone(&self.dispatcher),
+            self.handle,
+            Arc::clone(&self.evidence),
+            timeout,
+        );
+        self.released = true;
+        outcome
+    }
+
+    pub fn outcome(&self) -> SuppressionOutcome {
+        suppression_outcome(&self.evidence)
+    }
+}
+
+fn suppression_outcome(state: &SuppressionEvidenceState) -> SuppressionOutcome {
+    SuppressionOutcome {
+        activations: state.activations.load(Ordering::Acquire),
+        restore_attempts: state.restore_attempts.load(Ordering::Acquire),
+        restore_failures: state.restore_failures.load(Ordering::Acquire),
     }
 }
 
@@ -236,18 +465,35 @@ impl Dispatcher {
     /// subsequent adds would skip the kick and the janitor never
     /// started, leaving deadline-reaping entirely up to the
     /// `snapshot_matches` reap fallback (only fires on an activation).
+    #[cfg(test)]
     fn add(
         self: &Arc<Self>,
         target_pid: Option<i32>,
         restore_to: i32,
         origin: &'static str,
     ) -> SuppressionHandle {
+        self.add_until(
+            target_pid,
+            restore_to,
+            origin,
+            Instant::now() + ENTRY_DEADLINE,
+        )
+    }
+
+    fn add_until(
+        self: &Arc<Self>,
+        target_pid: Option<i32>,
+        restore_to: i32,
+        origin: &'static str,
+        deadline: Instant,
+    ) -> SuppressionHandle {
         let id = Uuid::new_v4();
         let entry = Entry {
             target_pid,
             restore_to,
-            deadline: Instant::now() + ENTRY_DEADLINE,
+            deadline,
             origin,
+            evidence: Arc::new(SuppressionEvidenceState::default()),
         };
         {
             let mut guard = self.entries.lock().unwrap();
@@ -259,6 +505,18 @@ impl Dispatcher {
         // fresh tokio interval on the next tick).
         let _ = self.janitor_active.send(true);
         SuppressionHandle(id)
+    }
+
+    fn evidence(&self, handle: SuppressionHandle) -> Arc<SuppressionEvidenceState> {
+        Arc::clone(
+            &self
+                .entries
+                .lock()
+                .expect("focus suppression dispatcher poisoned")
+                .get(&handle.0)
+                .expect("new suppression entry must retain evidence")
+                .evidence,
+        )
     }
 
     /// Remove an entry. When the map drains to empty, signals the janitor
@@ -274,10 +532,21 @@ impl Dispatcher {
         }
     }
 
+    fn retarget(&self, handle: SuppressionHandle, target_pid: Option<i32>) {
+        if let Some(entry) = self
+            .entries
+            .lock()
+            .expect("focus suppression dispatcher poisoned")
+            .get_mut(&handle.0)
+        {
+            entry.target_pid = target_pid;
+        }
+    }
+
     /// Snapshot the entries (cloned to a small Vec) — used by tests
     /// and the activation handler to evaluate matches without holding
     /// the lock across the restore call.
-    fn snapshot_matches(&self, activated_pid: i32) -> Vec<i32> {
+    fn snapshot_matches(&self, activated_pid: i32) -> Vec<(i32, Arc<SuppressionEvidenceState>)> {
         let mut guard = self.entries.lock().unwrap();
         // Reap expired entries first — keeps the dispatcher honest even
         // if the janitor hasn't ticked yet.
@@ -294,7 +563,7 @@ impl Dispatcher {
                     None => activated_pid != e.restore_to,
                 }
             })
-            .map(|e| e.restore_to)
+            .map(|e| (e.restore_to, Arc::clone(&e.evidence)))
             .collect()
     }
 
@@ -393,7 +662,7 @@ impl Dispatcher {
 /// down. Forgetting avoids having to thread `!Send` `Retained<...>`
 /// handles through `FocusStealPreventer` (which lives in `Arc<...>` /
 /// `OnceLock<...>` and therefore needs to be `Send + Sync`).
-fn install_observer(dispatcher: &Arc<Dispatcher>) {
+fn install_observer(dispatcher: &Arc<Dispatcher>) -> Retained<NSOperationQueue> {
     use block2::RcBlock;
     use objc2_foundation::NSNotification;
     use std::ptr::NonNull;
@@ -430,11 +699,11 @@ fn install_observer(dispatcher: &Arc<Dispatcher>) {
         )
     };
 
-    // Intentionally leak both — the observer needs to outlive any
-    // particular `Arc<FocusStealPreventer>` and the singleton has
-    // process lifetime.
+    // The observer token is process-lifetime. The singleton retains the queue
+    // so bounded callers can enqueue an exact barrier on this same callback
+    // stream before reading suppression evidence.
     std::mem::forget(token);
-    std::mem::forget(queue);
+    queue
 }
 
 /// Match a single activation notification against the dispatcher and,
@@ -442,10 +711,7 @@ fn install_observer(dispatcher: &Arc<Dispatcher>) {
 ///
 /// Runs on the observer queue's background thread — safe to call
 /// blocking system APIs.
-fn handle_activation(
-    dispatcher: &Arc<Dispatcher>,
-    note: &objc2_foundation::NSNotification,
-) {
+fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNotification) {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
 
@@ -457,8 +723,7 @@ fn handle_activation(
         // userInfo[NSWorkspaceApplicationKey] -> NSRunningApplication*.
         // We go through a raw msg_send to avoid Retained generic
         // bookkeeping for the cross-cast.
-        let app_ptr: *mut AnyObject =
-            msg_send![&*info, objectForKey: NSWorkspaceApplicationKey];
+        let app_ptr: *mut AnyObject = msg_send![&*info, objectForKey: NSWorkspaceApplicationKey];
         if app_ptr.is_null() {
             return;
         }
@@ -467,21 +732,24 @@ fn handle_activation(
     };
 
     let restore_pids = dispatcher.snapshot_matches(activated_pid);
-    for pid in restore_pids {
-        restore_focus(pid);
+    for (pid, evidence) in restore_pids {
+        evidence.activations.fetch_add(1, Ordering::AcqRel);
+        evidence.restore_attempts.fetch_add(1, Ordering::AcqRel);
+        if !restore_focus(pid) {
+            evidence.restore_failures.fetch_add(1, Ordering::AcqRel);
+        }
     }
 }
 
 /// Re-activate `pid` if it's still running. Safe to call from any
 /// thread — Apple documents `activateWithOptions:` as thread-safe.
-fn restore_focus(pid: i32) {
+fn restore_focus(pid: i32) -> bool {
     unsafe {
-        if let Some(app) =
-            NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
-        {
-            let _ = app.activateWithOptions(NSApplicationActivationOptions(0));
+        if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
+            return app.activateWithOptions(NSApplicationActivationOptions(0));
         }
     }
+    false
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -503,7 +771,10 @@ mod tests {
         let h = d.add(Some(42), 7, "test.add");
         assert_eq!(d.len(), 1);
         let matches = d.snapshot_matches(42);
-        assert_eq!(matches, vec![7]);
+        assert_eq!(
+            matches.into_iter().map(|(pid, _)| pid).collect::<Vec<_>>(),
+            vec![7]
+        );
         // Non-matching pid: no restore candidates.
         assert!(d.snapshot_matches(99).is_empty());
         d.remove(h);
@@ -517,7 +788,13 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let _h = d.add(None, 7, "test.wild");
         // pid 99 != restore_to 7 → should match.
-        assert_eq!(d.snapshot_matches(99), vec![7]);
+        assert_eq!(
+            d.snapshot_matches(99)
+                .into_iter()
+                .map(|(pid, _)| pid)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
         // pid 7 == restore_to → must NOT match (don't fight ourselves).
         assert!(d.snapshot_matches(7).is_empty());
     }
@@ -531,6 +808,7 @@ mod tests {
         let lease = SuppressionLease {
             handle: h,
             dispatcher: Arc::clone(&d),
+            evidence: d.evidence(h),
             released: false,
         };
         assert_eq!(d.len(), 1);
@@ -546,6 +824,7 @@ mod tests {
         let lease = SuppressionLease {
             handle: h,
             dispatcher: Arc::clone(&d),
+            evidence: d.evidence(h),
             released: false,
         };
         lease.release();
@@ -568,6 +847,7 @@ mod tests {
                     restore_to: 7,
                     deadline: Instant::now() - Duration::from_secs(1),
                     origin: "test.leak",
+                    evidence: Arc::new(SuppressionEvidenceState::default()),
                 },
             );
         }
@@ -576,6 +856,59 @@ mod tests {
         let matches = d.snapshot_matches(42);
         assert!(matches.is_empty(), "expired entry should not fire");
         assert_eq!(d.len(), 0, "snapshot_matches should purge expired");
+    }
+
+    #[test]
+    fn caller_deadline_covers_long_native_operation_span() {
+        let d = Arc::new(Dispatcher::new());
+        let requested = Instant::now() + Duration::from_secs(12);
+        let handle = d.add_until(Some(42), 7, "test.long_operation", requested);
+        let recorded = d.entries.lock().unwrap().get(&handle.0).unwrap().deadline;
+        assert_eq!(recorded, requested);
+        d.remove(handle);
+    }
+
+    #[test]
+    fn deadline_owned_containment_survives_owner_cancellation_until_deadline() {
+        let d = Arc::new(Dispatcher::new());
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let handle = d.add_until(None, 7, "test.detached_launch", deadline);
+        let containment = DeadlineSuppression {
+            handle,
+            dispatcher: Arc::clone(&d),
+            evidence: d.evidence(handle),
+            closed: Arc::new(AtomicBool::new(false)),
+        };
+        drop(containment);
+        assert_eq!(d.len(), 1, "Drop must not disarm a late LS callback");
+        assert_eq!(d.entries.lock().unwrap()[&handle.0].deadline, deadline);
+        d.remove(handle);
+    }
+
+    #[test]
+    fn wildcard_narrows_in_place_without_a_remove_add_gap() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(None, 7, "test.narrow");
+        d.retarget(handle, Some(42));
+        assert!(d.snapshot_matches(99).is_empty());
+        assert_eq!(d.snapshot_matches(42).len(), 1);
+        assert_eq!(d.len(), 1);
+        d.remove(handle);
+    }
+
+    #[test]
+    fn serial_close_removes_after_preceding_containment_callbacks() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(Some(42), 7, "test.serial_close");
+        let lease = SuppressionLease {
+            handle,
+            dispatcher: Arc::clone(&d),
+            evidence: d.evidence(handle),
+            released: false,
+        };
+        let close = lease.close_with_evidence(Duration::from_secs(1));
+        assert!(close.callback_queue_drained);
+        assert_eq!(d.len(), 0);
     }
 
     /// Janitor lifecycle: starts on first add, stops when empty,
@@ -661,7 +994,13 @@ mod tests {
         let matches = d.snapshot_matches(42);
         assert_eq!(matches.len(), 2);
         // Set equality — order is HashMap-dependent.
-        assert!(matches.contains(&1));
-        assert!(matches.contains(&2));
+        let restore_pids: Vec<_> = matches.into_iter().map(|(pid, _)| pid).collect();
+        assert!(restore_pids.contains(&1));
+        assert!(restore_pids.contains(&2));
+    }
+
+    #[test]
+    fn retained_observer_queue_exposes_a_bounded_teardown_barrier() {
+        assert!(FocusStealPreventer::barrier(Duration::from_secs(1)));
     }
 }

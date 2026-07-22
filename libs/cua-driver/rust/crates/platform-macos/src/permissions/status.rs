@@ -66,6 +66,17 @@ pub fn screen_recording_granted() -> bool {
     unsafe { CGPreflightScreenCaptureAccess() }
 }
 
+/// Live ScreenCaptureKit capability probe. Unlike the CoreGraphics preflight
+/// boolean, this asks the capture framework whether the responsible process
+/// can enumerate shareable displays right now.
+pub fn screen_recording_capturable() -> bool {
+    use screencapturekit::prelude::SCShareableContent;
+
+    SCShareableContent::get()
+        .map(|content| !content.displays().is_empty())
+        .unwrap_or(false)
+}
+
 /// Raise the Accessibility TCC prompt if not yet granted.  No-op when
 /// already active.  Mirrors Swift `Permissions.requestAccessibility()`.
 pub fn request_accessibility() -> bool {

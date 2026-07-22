@@ -28,25 +28,100 @@
 //! hand-roll the binding in [`apple_event`] via `extern_methods!`.
 
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration,
+    NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace, NSWorkspaceApplicationKey,
+    NSWorkspaceDidActivateApplicationNotification, NSWorkspaceDidDeactivateApplicationNotification,
+    NSWorkspaceDidLaunchApplicationNotification, NSWorkspaceDidTerminateApplicationNotification,
+    NSWorkspaceOpenConfiguration,
 };
 use objc2_foundation::{
-    NSAppleEventDescriptor, NSArray, NSDictionary, NSError, NSString, NSURL,
+    NSAppleEventDescriptor, NSArray, NSDictionary, NSError, NSNotification, NSNotificationName,
+    NSOperationQueue, NSString, NSURL,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceEventKind {
+    Launched,
+    Terminated,
+    Activated,
+    Deactivated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceEvent {
+    pub kind: WorkspaceEventKind,
+    pub pid: i32,
+    pub bundle_id: Option<String>,
+    pub process_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningApplicationInfo {
+    pub pid: i32,
+    pub name: Option<String>,
+    pub bundle_id: Option<String>,
+    pub executable_path: Option<String>,
+    pub process_generation: Option<u64>,
+    pub active: bool,
+    pub hidden: bool,
+    pub finished_launching: bool,
+    pub regular: bool,
+}
+
+/// Process-wide NSWorkspace notification fanout. AppKit owns the observer
+/// registrations for the daemon lifetime; individual callers own bounded
+/// broadcast receivers and cannot leak suppression or callback state.
+pub struct WorkspaceEventHub {
+    sender: tokio::sync::broadcast::Sender<WorkspaceEvent>,
+    observer_queue: Retained<NSOperationQueue>,
+}
+
+impl WorkspaceEventHub {
+    pub fn shared() -> Arc<Self> {
+        static HUB: OnceLock<Arc<WorkspaceEventHub>> = OnceLock::new();
+        HUB.get_or_init(|| {
+            let (sender, _) = tokio::sync::broadcast::channel(256);
+            // All four lifecycle notifications share one serial queue. Besides
+            // preserving native order, this gives bounded witnesses a real
+            // barrier: an operation enqueued after native teardown runs only
+            // after every previously delivered workspace callback.
+            let observer_queue = unsafe { NSOperationQueue::new() };
+            unsafe { observer_queue.setMaxConcurrentOperationCount(1) };
+            let hub = Arc::new(Self {
+                sender,
+                observer_queue,
+            });
+            install_workspace_observers(&hub);
+            hub
+        })
+        .clone()
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<WorkspaceEvent> {
+        self.sender.subscribe()
+    }
+
+    /// Wait until every workspace callback queued before this call has run.
+    /// A timeout is not treated as success by posture witnesses.
+    pub fn barrier(&self, timeout: Duration) -> bool {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let block = RcBlock::new(move || {
+            let _ = sender.send(());
+        });
+        unsafe { self.observer_queue.addBarrierBlock(&block) };
+        receiver.recv_timeout(timeout).is_ok()
+    }
+}
 
 /// FourCharCode helper — packs a 4-byte ASCII tag into a `u32` the same way
 /// Apple's CoreServices headers do (`kCoreEventClass = 'aevt'` etc).
 const fn fourcc(s: &[u8; 4]) -> u32 {
-    ((s[0] as u32) << 24)
-        | ((s[1] as u32) << 16)
-        | ((s[2] as u32) << 8)
-        | (s[3] as u32)
+    ((s[0] as u32) << 24) | ((s[1] as u32) << 16) | ((s[2] as u32) << 8) | (s[3] as u32)
 }
 
 const K_CORE_EVENT_CLASS: u32 = fourcc(b"aevt"); // kCoreEventClass
@@ -87,8 +162,8 @@ pub enum LaunchError {
     Cocoa(String),
     #[error("NSWorkspace launch returned no NSRunningApplication and no NSError")]
     NoApp,
-    #[error("NSWorkspace launch did not complete within {:?}", COMPLETION_TIMEOUT)]
-    Timeout,
+    #[error("NSWorkspace launch did not complete within {0:?}")]
+    Timeout(Duration),
     #[error("invalid url: {0}")]
     BadUrl(String),
 }
@@ -129,14 +204,35 @@ pub fn open_application(
         ?app_url, "calling openApplicationAtURL");
 
     unsafe {
-        ws.openApplicationAtURL_configuration_completionHandler(
-            &url,
-            &config,
-            Some(&block),
-        );
+        ws.openApplicationAtURL_configuration_completionHandler(&url, &config, Some(&block));
     }
 
-    wait_for_completion(rx)
+    wait_for_completion(rx, COMPLETION_TIMEOUT)
+}
+
+/// Launch with a caller-owned completion deadline and return only the pid.
+/// Keeping the Cocoa object inside the callback avoids sending AppKit's
+/// non-Send `NSRunningApplication` across the worker channel.
+pub fn open_application_pid_with_timeout<F: Fn(i32) + Send + Sync + 'static>(
+    app_url: &str,
+    cfg: &OpenConfig,
+    timeout: Duration,
+    on_completion_pid: F,
+) -> Result<i32, LaunchError> {
+    let ws = unsafe { NSWorkspace::sharedWorkspace() };
+    let url = resolve_application_url(&ws, app_url)?;
+    let config = build_configuration(cfg);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<PidCompletionResult>(1);
+    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+    let block = make_pid_completion_block(tx, Arc::new(on_completion_pid));
+    unsafe {
+        ws.openApplicationAtURL_configuration_completionHandler(&url, &config, Some(&block));
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(LaunchError::Timeout(timeout)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(LaunchError::NoApp),
+    }
 }
 
 /// Launch the application bundle at `app_url` and hand it `urls` via
@@ -179,7 +275,7 @@ pub fn open_urls_with_application(
         );
     }
 
-    wait_for_completion(rx)
+    wait_for_completion(rx, COMPLETION_TIMEOUT)
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -291,6 +387,38 @@ fn file_or_app_url(s: &str) -> Result<Retained<NSURL>, LaunchError> {
 }
 
 type CompletionResult = Result<Retained<NSRunningApplication>, LaunchError>;
+type PidCompletionResult = Result<i32, LaunchError>;
+
+fn make_pid_completion_block<F: Fn(i32) + Send + Sync + 'static>(
+    tx: Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<PidCompletionResult>>>>,
+    on_completion_pid: Arc<F>,
+) -> RcBlock<dyn Fn(*mut NSRunningApplication, *mut NSError)> {
+    RcBlock::new(
+        move |app_ptr: *mut NSRunningApplication, err_ptr: *mut NSError| {
+            let result = unsafe {
+                if !err_ptr.is_null() {
+                    let description = (&*err_ptr).localizedDescription();
+                    Err(LaunchError::Cocoa(description.to_string()))
+                } else if app_ptr.is_null() {
+                    Err(LaunchError::NoApp)
+                } else {
+                    Ok((&*app_ptr).processIdentifier())
+                }
+            };
+            if let Ok(pid) = result.as_ref() {
+                // Narrow detached wildcard containment before waking the
+                // awaiting task. The callback can outlive timeout/cancellation;
+                // its deadline-owned registry entry does not depend on this
+                // stack frame remaining alive.
+                on_completion_pid(*pid);
+            }
+            let sender = tx.lock().ok().and_then(|mut guard| guard.take());
+            if let Some(sender) = sender {
+                let _ = sender.send(result);
+            }
+        },
+    )
+}
 
 /// Build the `(NSRunningApplication?, NSError?) -> Void` completion block.
 ///
@@ -330,12 +458,120 @@ fn make_completion_block(
 /// the completion handler never fires (wedged LaunchServices).
 fn wait_for_completion(
     rx: std::sync::mpsc::Receiver<CompletionResult>,
+    timeout: Duration,
 ) -> Result<Retained<NSRunningApplication>, LaunchError> {
-    match rx.recv_timeout(COMPLETION_TIMEOUT) {
+    match rx.recv_timeout(timeout) {
         Ok(r) => r,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(LaunchError::Timeout),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(LaunchError::Timeout(timeout)),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(LaunchError::NoApp),
     }
+}
+
+/// Enumerate regular GUI applications without shelling out to System Events.
+pub fn running_applications() -> Vec<RunningApplicationInfo> {
+    use objc2::msg_send_id;
+
+    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
+    let applications: Retained<NSArray<NSRunningApplication>> =
+        unsafe { msg_send_id![&*workspace, runningApplications] };
+    (0..applications.count())
+        .map(|index| unsafe { applications.objectAtIndex(index) })
+        .map(|application| running_application_info(&application))
+        .filter(|application| application.regular)
+        .collect()
+}
+
+pub fn running_application(pid: i32) -> Option<RunningApplicationInfo> {
+    let application =
+        unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) }?;
+    Some(running_application_info(&application))
+}
+
+fn running_application_info(application: &NSRunningApplication) -> RunningApplicationInfo {
+    let pid = unsafe { application.processIdentifier() };
+    let name = unsafe { application.localizedName() }.map(|value| value.to_string());
+    let bundle_id = unsafe { application.bundleIdentifier() }.map(|value| value.to_string());
+    let executable_path = unsafe { application.executableURL() }
+        .and_then(|url| unsafe { url.path() })
+        .map(|path| path.to_string());
+    let process_generation = unsafe { application.launchDate() }
+        .map(|date| unsafe { date.timeIntervalSince1970() }.to_bits());
+    RunningApplicationInfo {
+        pid,
+        name,
+        bundle_id,
+        executable_path,
+        process_generation,
+        active: unsafe { application.isActive() },
+        hidden: unsafe { application.isHidden() },
+        finished_launching: unsafe { application.isFinishedLaunching() },
+        regular: unsafe { application.activationPolicy() }
+            == NSApplicationActivationPolicy::Regular,
+    }
+}
+
+fn install_workspace_observers(hub: &Arc<WorkspaceEventHub>) {
+    install_workspace_observer(
+        hub,
+        unsafe { NSWorkspaceDidLaunchApplicationNotification },
+        WorkspaceEventKind::Launched,
+    );
+    install_workspace_observer(
+        hub,
+        unsafe { NSWorkspaceDidTerminateApplicationNotification },
+        WorkspaceEventKind::Terminated,
+    );
+    install_workspace_observer(
+        hub,
+        unsafe { NSWorkspaceDidActivateApplicationNotification },
+        WorkspaceEventKind::Activated,
+    );
+    install_workspace_observer(
+        hub,
+        unsafe { NSWorkspaceDidDeactivateApplicationNotification },
+        WorkspaceEventKind::Deactivated,
+    );
+}
+
+fn install_workspace_observer(
+    hub: &Arc<WorkspaceEventHub>,
+    name: &'static NSNotificationName,
+    kind: WorkspaceEventKind,
+) {
+    use objc2::{msg_send, runtime::AnyObject};
+
+    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
+    let center = unsafe { workspace.notificationCenter() };
+    let queue = hub.observer_queue.clone();
+    let hub = Arc::clone(hub);
+    let block = RcBlock::new(move |note_ptr: NonNull<NSNotification>| {
+        let note = unsafe { note_ptr.as_ref() };
+        let Some(info) = (unsafe { note.userInfo() }) else {
+            return;
+        };
+        let app_ptr: *mut AnyObject =
+            unsafe { msg_send![&*info, objectForKey: NSWorkspaceApplicationKey] };
+        if app_ptr.is_null() {
+            return;
+        }
+        // The notification owns the NSRunningApplication for the callback
+        // span, including termination notifications where the process has
+        // already disappeared from the global running-app registry. Read the
+        // launch generation from that exact object so app-exit invalidation
+        // cannot accidentally target a newer process that reused the pid.
+        let application = unsafe { &*app_ptr.cast::<NSRunningApplication>() };
+        let application = running_application_info(application);
+        let _ = hub.sender.send(WorkspaceEvent {
+            kind,
+            pid: application.pid,
+            bundle_id: application.bundle_id,
+            process_generation: application.process_generation,
+        });
+    });
+    let token = unsafe {
+        center.addObserverForName_object_queue_usingBlock(Some(name), None, Some(&queue), &block)
+    };
+    std::mem::forget(token);
 }
 
 /// Hand-rolled binding for
@@ -344,8 +580,8 @@ fn wait_for_completion(
 /// is not exposed by `objc2-foundation 0.2.2`.
 mod apple_event {
     use super::{
-        NSAppleEventDescriptor, NSString, Retained, K_AE_OPEN_APPLICATION,
-        K_ANY_TRANSACTION_ID, K_AUTO_GENERATE_RETURN_ID, K_CORE_EVENT_CLASS,
+        NSAppleEventDescriptor, NSString, Retained, K_AE_OPEN_APPLICATION, K_ANY_TRANSACTION_ID,
+        K_AUTO_GENERATE_RETURN_ID, K_CORE_EVENT_CLASS,
     };
     use objc2::msg_send_id;
     use objc2::rc::Allocated;
@@ -354,13 +590,11 @@ mod apple_event {
     /// Build an `aevt/oapp` AppleEvent addressed to the bundle id `bid`.
     pub fn open_application_event(bid: &str) -> Retained<NSAppleEventDescriptor> {
         let target_string = NSString::from_str(bid);
-        let target: Retained<NSAppleEventDescriptor> = unsafe {
-            NSAppleEventDescriptor::descriptorWithBundleIdentifier(&target_string)
-        };
+        let target: Retained<NSAppleEventDescriptor> =
+            unsafe { NSAppleEventDescriptor::descriptorWithBundleIdentifier(&target_string) };
 
         unsafe {
-            let alloc: Allocated<NSAppleEventDescriptor> =
-                NSAppleEventDescriptor::alloc();
+            let alloc: Allocated<NSAppleEventDescriptor> = NSAppleEventDescriptor::alloc();
             // initWithEventClass:eventID:targetDescriptor:returnID:transactionID:
             let event: Retained<NSAppleEventDescriptor> = msg_send_id![
                 alloc,
@@ -374,4 +608,3 @@ mod apple_event {
         }
     }
 }
-

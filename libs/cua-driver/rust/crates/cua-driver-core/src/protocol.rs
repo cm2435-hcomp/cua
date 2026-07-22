@@ -3,6 +3,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::api::{
+    CheckReadinessRequest, ClickCommand, DragCommand, GetCapabilitiesRequest, GetWindowRequest,
+    GetWindowStateRequest, LaunchAppRequest, ListAppsRequest, ListWindowsRequest, NativeError,
+    PressKeyCommand, ScrollCommand, SecondaryActionCommand, SelectTextCommand, SetValueCommand,
+    TypeTextCommand,
+};
+
 // ── Request ──────────────────────────────────────────────────────────────────
 
 /// An incoming JSON-RPC 2.0 request or notification.
@@ -39,6 +46,128 @@ impl Request {
 pub struct ToolCall {
     pub name: String,
     pub args: Value,
+}
+
+// ── Background driver v2 ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2ProtocolVersion {
+    pub major: u16,
+    pub minor: u16,
+}
+
+pub const V2_PROTOCOL_VERSION: V2ProtocolVersion = V2ProtocolVersion { major: 2, minor: 0 };
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params", deny_unknown_fields)]
+pub enum V2Command {
+    #[serde(rename = "driver.v2.check_readiness")]
+    CheckReadiness(CheckReadinessRequest),
+    #[serde(rename = "driver.v2.get_capabilities")]
+    GetCapabilities(GetCapabilitiesRequest),
+    #[serde(rename = "driver.v2.list_apps")]
+    ListApps(ListAppsRequest),
+    #[serde(rename = "driver.v2.launch_app")]
+    LaunchApp(LaunchAppRequest),
+    #[serde(rename = "driver.v2.list_windows")]
+    ListWindows(ListWindowsRequest),
+    #[serde(rename = "driver.v2.get_window")]
+    GetWindow(GetWindowRequest),
+    #[serde(rename = "driver.v2.get_window_state")]
+    GetWindowState(GetWindowStateRequest),
+    #[serde(rename = "driver.v2.click")]
+    Click(ClickCommand),
+    #[serde(rename = "driver.v2.drag")]
+    Drag(DragCommand),
+    #[serde(rename = "driver.v2.scroll")]
+    Scroll(ScrollCommand),
+    #[serde(rename = "driver.v2.press_key")]
+    PressKey(PressKeyCommand),
+    #[serde(rename = "driver.v2.type_text")]
+    TypeText(TypeTextCommand),
+    #[serde(rename = "driver.v2.set_value")]
+    SetValue(SetValueCommand),
+    #[serde(rename = "driver.v2.select_text")]
+    SelectText(SelectTextCommand),
+    #[serde(rename = "driver.v2.perform_secondary_action")]
+    PerformSecondaryAction(SecondaryActionCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2RequestEnvelope {
+    pub request_id: String,
+    pub protocol_version: V2ProtocolVersion,
+    #[serde(flatten)]
+    pub command: V2Command,
+}
+
+impl V2RequestEnvelope {
+    pub fn validate_version(&self) -> Result<(), NativeError> {
+        if self.protocol_version != V2_PROTOCOL_VERSION {
+            return Err(NativeError::new(
+                crate::api::ErrorCode::ProtocolMismatch,
+                crate::api::ErrorPhase::Validate,
+                false,
+                format!(
+                    "unsupported v2 protocol {}.{}; driver requires {}.{}",
+                    self.protocol_version.major,
+                    self.protocol_version.minor,
+                    V2_PROTOCOL_VERSION.major,
+                    V2_PROTOCOL_VERSION.minor
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2HandshakeRequest {
+    pub request_id: String,
+    pub minimum_version: V2ProtocolVersion,
+    pub maximum_version: V2ProtocolVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2HandshakeResponse {
+    pub request_id: String,
+    pub minimum_version: V2ProtocolVersion,
+    pub maximum_version: V2ProtocolVersion,
+    pub driver_name: String,
+    pub driver_version: String,
+    pub build: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2ResponseEnvelope<T> {
+    pub request_id: String,
+    pub protocol_version: V2ProtocolVersion,
+    #[serde(flatten)]
+    pub body: V2ResponseBody<T>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum V2ResponseBody<T> {
+    Result(V2Success<T>),
+    Error(V2Failure),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2Success<T> {
+    pub result: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2Failure {
+    pub error: NativeError,
 }
 
 // ── Response ─────────────────────────────────────────────────────────────────
