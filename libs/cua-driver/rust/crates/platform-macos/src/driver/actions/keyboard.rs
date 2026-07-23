@@ -1132,7 +1132,10 @@ pub(crate) fn keyboard_capability_cells(os_version: &str) -> Vec<CapabilityCell>
                 WindowStateKind::Visible | WindowStateKind::Occluded
                     if matches!(
                         framework,
-                        Framework::AppKit | Framework::Chromium | Framework::WebKit
+                        Framework::Unknown
+                            | Framework::AppKit
+                            | Framework::Chromium
+                            | Framework::WebKit
                     ) =>
                 {
                     RouteDecision::Supported {
@@ -1481,6 +1484,21 @@ mod tests {
             .filter(|cell| {
                 cell.key.action == ActionKind::TypeText && cell.key.framework == Framework::Unknown
             })
-            .all(|cell| matches!(cell.decision, RouteDecision::Unsupported { .. })));
+            .all(|cell| {
+                matches!(
+                    (&cell.key.window_state, &cell.decision),
+                    (
+                        WindowStateKind::Visible | WindowStateKind::Occluded,
+                        RouteDecision::Supported {
+                            route: Route::Semantic
+                        }
+                    ) | (
+                        WindowStateKind::Minimized
+                            | WindowStateKind::OffSpace
+                            | WindowStateKind::Unknown,
+                        RouteDecision::Unsupported { .. }
+                    )
+                )
+            }));
     }
 }

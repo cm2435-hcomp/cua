@@ -107,7 +107,7 @@ pub(crate) fn pointer_capability_cells(os_version: &str) -> Vec<CapabilityCell> 
             for state in &states {
                 let proven_click = os_version == "26.5.1"
                     && architecture == "arm64"
-                    && framework == Framework::Chromium
+                    && framework != Framework::Catalyst
                     && *action == ActionKind::Click
                     && *state == WindowStateKind::Visible;
                 let decision = if proven_click {
@@ -174,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn targeted_pointer_cells_publish_only_the_proven_chromium_click_posture() {
+    fn targeted_pointer_cells_publish_the_exact_click_posture_without_framework_guessing() {
         let cells = pointer_capability_cells("26.5.1");
         assert_eq!(cells.len(), 90);
         let supported: Vec<_> = cells
@@ -182,11 +182,10 @@ mod tests {
             .filter(|cell| matches!(cell.decision, RouteDecision::Supported { .. }))
             .collect();
         if std::env::consts::ARCH == "aarch64" {
-            assert_eq!(supported.len(), 1);
+            assert_eq!(supported.len(), 5);
             assert!(supported.iter().all(|cell| {
                 cell.key.action == ActionKind::Click
                     && cell.key.addressing == AddressingMode::CapturedPoint
-                    && cell.key.framework == Framework::Chromium
                     && cell.key.window_state == WindowStateKind::Visible
                     && matches!(
                         cell.decision,
@@ -194,6 +193,15 @@ mod tests {
                             route: Route::TargetedPointer
                         }
                     )
+            }));
+            assert!(supported
+                .iter()
+                .any(|cell| cell.key.framework == Framework::Unknown));
+            assert!(cells.iter().any(|cell| {
+                cell.key.action == ActionKind::Click
+                    && cell.key.framework == Framework::Catalyst
+                    && cell.key.window_state == WindowStateKind::Visible
+                    && matches!(cell.decision, RouteDecision::Unsupported { .. })
             }));
             assert!(cells.iter().any(|cell| {
                 cell.key.action == ActionKind::Click

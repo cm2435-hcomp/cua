@@ -99,7 +99,7 @@ impl PlatformDriver for MacDriver {
                 facts.cg_window_id,
                 self.invalidations.clone(),
             )?,
-            MacTargetFocusCoordinator::default(),
+            MacTargetFocusCoordinator::new(facts.pid, facts.cg_window_id)?,
         ))
     }
 

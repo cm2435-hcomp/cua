@@ -1,26 +1,32 @@
-//! Pure macOS interaction recipes and target-only SLPS make-key leases.
+//! Exact macOS interaction recipes and durable synthetic app-focus belief.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
+use core_foundation::base::{CFRelease, CFTypeRef};
 use cua_driver_core::api::{
     capabilities::Framework,
-    contracts::{ActionId, MouseButton, Route},
+    contracts::{MouseButton, Point, Rect, Route},
     errors::{ErrorCode, ErrorPhase, NativeError},
-    interaction::ScopeRequirements,
+    interaction::{NativeEvidence, ScopeRequirements},
     platform::ResolvedAction,
 };
 
-use crate::input::slps_make_key::{self, SlpsMakeKeyState};
+use crate::{
+    apps,
+    ax::bindings::{copy_bool_attr, AXUIElementCreateApplication},
+    input::synthesized_event,
+};
 
-use super::target::{MacActiveBelief, MacFocusState};
+use super::{target::MacFocusState, windows::MacWindowFacts};
 
 const PROVEN_OS_VERSION: &str = "26.5.1";
 const PROVEN_ARCHITECTURE: &str = "arm64";
-// The live F1b recipe posted KeyFocusReturned followed by NewFront. Route B's
-// recovered SLPS record has no subtype field, so those two grants are the same
-// make-key byte shape but must still be posted twice, in order.
-const PROVEN_CHROMIUM_GRANT_RECORDS: [SlpsMakeKeyState; 2] =
-    [SlpsMakeKeyState::MakeKey, SlpsMakeKeyState::MakeKey];
+const BELIEF_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const BELIEF_ACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRecipeContext {
@@ -65,7 +71,7 @@ pub enum MenuSuppressionRecipe {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetBeliefRecipe {
     NotApplicable,
-    ChromiumPointClickSlpsMakeKeyHost26_5_1Arm64,
+    SwiftCoordinateClick,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,8 +85,8 @@ impl MacScopeRecipe {
     pub fn evidence_name(self) -> &'static str {
         match self.target_belief {
             TargetBeliefRecipe::NotApplicable => "semantic_no_target_belief",
-            TargetBeliefRecipe::ChromiumPointClickSlpsMakeKeyHost26_5_1Arm64 => {
-                "chromium_point_click_two_slps_make_key_records_macos_26_5_1_arm64"
+            TargetBeliefRecipe::SwiftCoordinateClick => {
+                "swift_coordinate_click_cps_key_focus_returned_macos_26_5_1_arm64"
             }
         }
     }
@@ -102,6 +108,15 @@ pub fn select_scope_recipe(
             "exact per-pid and per-menu event-tap predicate is not proved",
         ));
     }
+    if route == Route::TargetedPointer && *framework == Framework::Catalyst {
+        return Err(recipe_unproven(
+            host,
+            framework,
+            route,
+            action,
+            "the helper's Catalyst preparation and focus reassertion branch is not ported",
+        ));
+    }
 
     let accessibility = if requirements.accessibility && *framework == Framework::Chromium {
         AccessibilityRecipe::ChromiumPriorStatePreserving
@@ -115,10 +130,9 @@ pub fn select_scope_recipe(
             if requirements.target_belief
                 && host.os_version == PROVEN_OS_VERSION
                 && host.architecture == PROVEN_ARCHITECTURE
-                && *framework == Framework::Chromium
                 && is_exact_proven_point_click(action) =>
         {
-            TargetBeliefRecipe::ChromiumPointClickSlpsMakeKeyHost26_5_1Arm64
+            TargetBeliefRecipe::SwiftCoordinateClick
         }
         _ => {
             return Err(recipe_unproven(
@@ -126,7 +140,7 @@ pub fn select_scope_recipe(
                 framework,
                 route,
                 action,
-                "no exact target-belief recipe is proved for this host/framework/action cell",
+                "no exact target-belief recipe is proved for this host/action cell",
             ));
         }
     };
@@ -179,161 +193,213 @@ fn recipe_unproven(
         .with_detail("action", action_shape(action))
 }
 
-pub(crate) trait TargetBeliefPoster: Send + Sync {
-    fn post(&self, pid: i32, window_id: u32, state: SlpsMakeKeyState) -> Result<(), NativeError>;
+pub(crate) trait TargetFocusPoster: Send + Sync {
+    fn post_key_focus_returned(&self, pid: i32) -> Result<(), NativeError>;
+    fn post_app_activated(
+        &self,
+        pid: i32,
+        cg_window_id: u32,
+        window_bounds: Rect,
+        activation_point: Option<Point>,
+    ) -> Result<usize, NativeError>;
+}
+
+pub(crate) trait TargetFocusReader: Send + Sync {
+    fn application_is_active(&self, pid: i32) -> bool;
+    fn application_believes_frontmost(&self, pid: i32) -> Option<bool>;
 }
 
 #[derive(Default)]
-pub(crate) struct SystemTargetBeliefPoster;
+pub(crate) struct SystemTargetFocusPoster;
 
-impl TargetBeliefPoster for SystemTargetBeliefPoster {
-    fn post(&self, pid: i32, window_id: u32, state: SlpsMakeKeyState) -> Result<(), NativeError> {
-        slps_make_key::post_target_only(pid, window_id, &[state]).map_err(|error| {
-            NativeError::new(
-                ErrorCode::UnsupportedInBackground,
-                ErrorPhase::Preflight,
-                false,
-                format!("target-only SLPS make-key record failed: {error}"),
-            )
-            .with_detail("pid", pid)
-            .with_detail("cg_window_id", window_id)
-            .with_detail("slps_record_state", state.evidence_name())
+impl TargetFocusPoster for SystemTargetFocusPoster {
+    fn post_key_focus_returned(&self, pid: i32) -> Result<(), NativeError> {
+        synthesized_event::post_key_focus_returned(pid).map_err(|mut error| {
+            error.phase = ErrorPhase::Preflight;
+            error
+                .with_detail("pid", pid)
+                .with_detail("cps_notification", "key_focus_returned")
         })
+    }
+
+    fn post_app_activated(
+        &self,
+        pid: i32,
+        cg_window_id: u32,
+        window_bounds: Rect,
+        activation_point: Option<Point>,
+    ) -> Result<usize, NativeError> {
+        synthesized_event::post_app_activated(pid, cg_window_id, window_bounds, activation_point)
+            .map_err(|mut error| {
+                error.phase = ErrorPhase::Preflight;
+                error
+                    .with_detail("pid", pid)
+                    .with_detail("appkit_notification", "app_activated")
+            })
     }
 }
 
-pub(crate) struct TargetBeliefLease {
-    action_id: ActionId,
-    pid: i32,
-    window_id: u32,
+#[derive(Default)]
+pub(crate) struct SystemTargetFocusReader;
+
+impl TargetFocusReader for SystemTargetFocusReader {
+    fn application_is_active(&self, pid: i32) -> bool {
+        apps::frontmost_pid() == Some(pid)
+    }
+
+    fn application_believes_frontmost(&self, pid: i32) -> Option<bool> {
+        unsafe {
+            let application = AXUIElementCreateApplication(pid);
+            if application.is_null() {
+                return None;
+            }
+            let frontmost = copy_bool_attr(application, "AXFrontmost");
+            CFRelease(application as CFTypeRef);
+            frontmost
+        }
+    }
+}
+
+pub(crate) fn prepare_target_focus(
+    recipe: TargetBeliefRecipe,
+    facts: &MacWindowFacts,
     state: Arc<Mutex<MacFocusState>>,
-    poster: Arc<dyn TargetBeliefPoster>,
-    released: bool,
-}
-
-impl TargetBeliefLease {
-    pub fn acquire(
-        action_id: ActionId,
-        pid: i32,
-        window_id: u32,
-        state: Arc<Mutex<MacFocusState>>,
-    ) -> Result<Self, NativeError> {
-        Self::acquire_with(
-            action_id,
-            pid,
-            window_id,
+    deadline: Instant,
+) -> Result<Option<NativeEvidence>, NativeError> {
+    match recipe {
+        TargetBeliefRecipe::NotApplicable => Ok(None),
+        TargetBeliefRecipe::SwiftCoordinateClick => prepare_target_focus_with(
+            facts,
             state,
-            Arc::new(SystemTargetBeliefPoster),
+            deadline,
+            &SystemTargetFocusPoster,
+            &SystemTargetFocusReader,
         )
-    }
-
-    fn acquire_with(
-        action_id: ActionId,
-        pid: i32,
-        window_id: u32,
-        state: Arc<Mutex<MacFocusState>>,
-        poster: Arc<dyn TargetBeliefPoster>,
-    ) -> Result<Self, NativeError> {
-        {
-            let mut state_guard = state.lock().expect("macOS focus coordinator poisoned");
-            if state_guard.shutdown {
-                return Err(NativeError::new(
-                    ErrorCode::WindowIdentityChanged,
-                    ErrorPhase::Preflight,
-                    false,
-                    "target focus coordinator is shut down",
-                ));
-            }
-            if let Some(active) = &state_guard.active_belief {
-                return Err(NativeError::new(
-                    ErrorCode::TargetBusy,
-                    ErrorPhase::Preflight,
-                    true,
-                    "target already owns an active belief lease",
-                )
-                .with_detail("active_action_id", active.action_id.to_string()));
-            }
-            state_guard.active_belief = Some(MacActiveBelief {
-                action_id: action_id.clone(),
-                pid,
-                cg_window_id: window_id,
-            });
-        }
-
-        let mut grants_posted = 0usize;
-        for grant in PROVEN_CHROMIUM_GRANT_RECORDS {
-            if let Err(error) = poster.post(pid, window_id, grant) {
-                let mut error = error
-                    .with_detail("grant_records_posted", grants_posted)
-                    .with_detail(
-                        "grant_records_expected",
-                        PROVEN_CHROMIUM_GRANT_RECORDS.len(),
-                    );
-                let mut rollback_complete = true;
-                if grants_posted > 0 {
-                    if let Err(cleanup) = poster.post(pid, window_id, SlpsMakeKeyState::RemoveKey) {
-                        rollback_complete = false;
-                        error = error.with_related(&cleanup);
-                    }
-                }
-                if rollback_complete {
-                    state
-                        .lock()
-                        .expect("macOS focus coordinator poisoned")
-                        .active_belief = None;
-                }
-                return Err(error);
-            }
-            grants_posted += 1;
-        }
-
-        Ok(Self {
-            action_id,
-            pid,
-            window_id,
-            state,
-            poster,
-            released: false,
-        })
-    }
-
-    pub fn release(&mut self) -> Result<(), NativeError> {
-        if self.released {
-            return Ok(());
-        }
-        self.poster
-            .post(self.pid, self.window_id, SlpsMakeKeyState::RemoveKey)
-            .map_err(|error| {
-                NativeError::new(
-                    error.code,
-                    ErrorPhase::Verify,
-                    error.retryable,
-                    error.message,
-                )
-                .with_detail("action_id", self.action_id.to_string())
-                .with_detail("pid", self.pid)
-                .with_detail("cg_window_id", self.window_id)
-            })?;
-        self.state
-            .lock()
-            .expect("macOS focus coordinator poisoned")
-            .active_belief = None;
-        self.released = true;
-        Ok(())
+        .map(Some),
     }
 }
 
-impl Drop for TargetBeliefLease {
-    fn drop(&mut self) {
-        if let Err(error) = self.release() {
-            tracing::error!(error = %error, "failed to post target-only SLPS remove-key record");
+fn prepare_target_focus_with(
+    facts: &MacWindowFacts,
+    state: Arc<Mutex<MacFocusState>>,
+    deadline: Instant,
+    poster: &dyn TargetFocusPoster,
+    reader: &dyn TargetFocusReader,
+) -> Result<NativeEvidence, NativeError> {
+    let pid = facts.pid;
+    let cg_window_id = facts.cg_window_id;
+    let application_is_active = reader.application_is_active(pid);
+    let (should_post_key_focus_returned, should_post_app_activated) = {
+        let mut state = state.lock().expect("macOS focus coordinator poisoned");
+        if state.shutdown {
+            return Err(NativeError::stale(
+                ErrorCode::WindowIdentityChanged,
+                "target focus coordinator is shut down",
+            ));
+        }
+        if state.pid != pid || state.cg_window_id != cg_window_id {
+            return Err(NativeError::stale(
+                ErrorCode::WindowIdentityChanged,
+                "target focus coordinator identity no longer matches the interaction target",
+            ));
+        }
+        state.application_is_active = application_is_active;
+        if application_is_active {
+            state.application_believes_it_is_active = true;
+            state.application_believes_it_has_focus = true;
+        }
+        (
+            !state.application_is_active && !state.application_believes_it_has_focus,
+            !state.application_is_active && !state.application_believes_it_is_active,
+        )
+    };
+
+    if should_post_key_focus_returned {
+        poster.post_key_focus_returned(pid)?;
+        let mut state = state.lock().expect("macOS focus coordinator poisoned");
+        state.application_believes_it_has_focus = true;
+    }
+    let app_activation_event_count = if should_post_app_activated {
+        let event_count =
+            poster.post_app_activated(pid, cg_window_id, facts.bounds, facts.activation_point)?;
+        let mut state = state.lock().expect("macOS focus coordinator poisoned");
+        state.application_believes_it_is_active = true;
+        event_count
+    } else {
+        0
+    };
+
+    let ack_deadline = deadline.min(Instant::now() + BELIEF_ACK_TIMEOUT);
+    let mut ax_frontmost_acknowledged = application_is_active;
+    while !ax_frontmost_acknowledged && Instant::now() <= ack_deadline {
+        ax_frontmost_acknowledged = reader.application_believes_frontmost(pid) == Some(true);
+        if !ax_frontmost_acknowledged {
+            thread::sleep(
+                BELIEF_ACK_POLL_INTERVAL
+                    .min(ack_deadline.saturating_duration_since(Instant::now())),
+            );
         }
     }
+    if !ax_frontmost_acknowledged {
+        return Err(NativeError::new(
+            ErrorCode::PostureUnverifiable,
+            ErrorPhase::Preflight,
+            true,
+            "target did not acknowledge the synthetic focus belief through AXFrontmost",
+        )
+        .with_detail("pid", pid)
+        .with_detail("cg_window_id", cg_window_id)
+        .with_detail(
+            "cps_key_focus_returned_posted",
+            should_post_key_focus_returned,
+        )
+        .with_detail("app_activated_posted", should_post_app_activated)
+        .with_detail("app_activation_event_count", app_activation_event_count)
+        .with_detail(
+            "belief_ack_timeout_ms",
+            BELIEF_ACK_TIMEOUT.as_millis() as u64,
+        ));
+    }
+
+    let mut evidence = NativeEvidence::default();
+    evidence.fields.insert(
+        "target_application_was_active".to_owned(),
+        application_is_active.into(),
+    );
+    evidence.fields.insert(
+        "target_focus_notification_posted".to_owned(),
+        should_post_key_focus_returned.into(),
+    );
+    evidence.fields.insert(
+        "target_focus_notification".to_owned(),
+        "cps_key_focus_returned".into(),
+    );
+    evidence.fields.insert(
+        "target_app_activation_posted".to_owned(),
+        should_post_app_activated.into(),
+    );
+    evidence.fields.insert(
+        "target_app_activation_event_count".to_owned(),
+        app_activation_event_count.into(),
+    );
+    evidence.fields.insert(
+        "target_ax_frontmost_acknowledged".to_owned(),
+        ax_frontmost_acknowledged.into(),
+    );
+    evidence.fields.insert(
+        "target_focus_lifetime".to_owned(),
+        "target_controller".into(),
+    );
+    evidence.fields.insert(
+        "target_focus_event_taps".to_owned(),
+        "process_notification,target_mouse,view_bridge_keyboard_when_present".into(),
+    );
+    Ok(evidence)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{collections::VecDeque, sync::Mutex};
 
     use cua_driver_core::api::{
         contracts::{CaptureRevision, GeometryRevision, Point, Rect, SurfaceId, WindowGeneration},
@@ -347,34 +413,50 @@ mod tests {
     use super::*;
 
     struct FakePoster {
-        signals: Mutex<Vec<SlpsMakeKeyState>>,
-        fail_at: Vec<usize>,
+        posts: Mutex<Vec<(&'static str, i32)>>,
     }
 
-    impl TargetBeliefPoster for FakePoster {
-        fn post(
+    impl TargetFocusPoster for FakePoster {
+        fn post_key_focus_returned(&self, pid: i32) -> Result<(), NativeError> {
+            self.posts.lock().unwrap().push(("key_focus_returned", pid));
+            Ok(())
+        }
+
+        fn post_app_activated(
             &self,
-            _pid: i32,
-            _window_id: u32,
-            signal: SlpsMakeKeyState,
-        ) -> Result<(), NativeError> {
-            let mut signals = self.signals.lock().unwrap();
-            let index = signals.len();
-            signals.push(signal);
-            if self.fail_at.contains(&index) {
-                Err(NativeError::new(
-                    ErrorCode::Internal,
-                    ErrorPhase::Preflight,
-                    false,
-                    "injected SLPS failure",
-                ))
-            } else {
-                Ok(())
-            }
+            pid: i32,
+            cg_window_id: u32,
+            window_bounds: Rect,
+            activation_point: Option<Point>,
+        ) -> Result<usize, NativeError> {
+            assert_eq!(cg_window_id, 99);
+            assert_eq!(window_bounds.width, 10.0);
+            assert_eq!(activation_point, Some(Point { x: 1.0, y: 1.0 }));
+            self.posts.lock().unwrap().push(("app_activated", pid));
+            Ok(3)
         }
     }
 
-    fn point_click(button: MouseButton, count: u8) -> ResolvedAction {
+    struct FakeReader {
+        active: bool,
+        frontmost: Mutex<VecDeque<Option<bool>>>,
+    }
+
+    impl TargetFocusReader for FakeReader {
+        fn application_is_active(&self, _pid: i32) -> bool {
+            self.active
+        }
+
+        fn application_believes_frontmost(&self, _pid: i32) -> Option<bool> {
+            self.frontmost
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Some(true))
+        }
+    }
+
+    fn point_click(framework: Framework, button: MouseButton, count: u8) -> ResolvedAction {
         let app = cua_driver_core::api::contracts::AppRef {
             id: cua_driver_core::api::contracts::AppId::parse("app").unwrap(),
             name: None,
@@ -390,7 +472,7 @@ mod tests {
             public,
             native: NativeWindowHandle::new("native").unwrap(),
             process: NativeProcessHandle::new("process").unwrap(),
-            framework: Framework::Chromium,
+            framework,
             geometry: WindowGeometry {
                 bounds: Rect {
                     x: 0.0,
@@ -426,177 +508,106 @@ mod tests {
         }
     }
 
+    fn focus_facts() -> MacWindowFacts {
+        let ResolvedAction::PointClick { point, .. } =
+            point_click(Framework::Unknown, MouseButton::Left, 1)
+        else {
+            unreachable!("fixture is a point click");
+        };
+        MacWindowFacts {
+            stamp: point.window.stamp(),
+            pid: 44,
+            process_generation: 1,
+            cg_window_id: 99,
+            owner_name: "Fixture".to_owned(),
+            layer: 0,
+            bounds: point.window.geometry.bounds,
+            activation_point: Some(Point { x: 1.0, y: 1.0 }),
+            scale_factor: Some(1.0),
+            state: cua_driver_core::api::capabilities::WindowStateKind::Visible,
+            is_on_screen: true,
+            on_current_space: Some(true),
+            space_ids: Some(vec![1]),
+            minimized: Some(false),
+        }
+    }
+
     #[test]
-    fn recipe_selector_accepts_only_the_proven_pointer_cell() {
+    fn recipe_selector_uses_exact_host_and_action_facts_not_framework_guessing() {
         let host = HostRecipeContext {
             os_version: PROVEN_OS_VERSION.to_owned(),
             architecture: PROVEN_ARCHITECTURE.to_owned(),
         };
         let requirements = ScopeRequirements::for_route(Route::TargetedPointer);
-        let recipe = select_scope_recipe(
-            &host,
-            &Framework::Chromium,
-            Route::TargetedPointer,
-            &point_click(MouseButton::Left, 1),
-            &requirements,
-        )
-        .unwrap();
-        assert_eq!(
-            recipe.target_belief,
-            TargetBeliefRecipe::ChromiumPointClickSlpsMakeKeyHost26_5_1Arm64
-        );
-
-        for (host, framework, action) in [
-            (
-                HostRecipeContext {
-                    os_version: "26.5.2".to_owned(),
-                    architecture: "arm64".to_owned(),
-                },
-                Framework::Chromium,
-                point_click(MouseButton::Left, 1),
-            ),
-            (
-                HostRecipeContext {
-                    os_version: PROVEN_OS_VERSION.to_owned(),
-                    architecture: "x86_64".to_owned(),
-                },
-                Framework::Chromium,
-                point_click(MouseButton::Left, 1),
-            ),
-            (
-                host.clone(),
-                Framework::Electron,
-                point_click(MouseButton::Left, 1),
-            ),
-            (
-                host.clone(),
-                Framework::Chromium,
-                point_click(MouseButton::Right, 1),
-            ),
-        ] {
-            let error = select_scope_recipe(
+        for framework in [Framework::Unknown, Framework::Chromium, Framework::Electron] {
+            let recipe = select_scope_recipe(
                 &host,
                 &framework,
                 Route::TargetedPointer,
-                &action,
+                &point_click(framework.clone(), MouseButton::Left, 1),
                 &requirements,
             )
-            .unwrap_err();
-            assert_eq!(error.code, ErrorCode::UnsupportedInBackground);
-            assert_eq!(error.details["recipe_status"], "recipe_unproven");
+            .unwrap();
+            assert_eq!(
+                recipe.target_belief,
+                TargetBeliefRecipe::SwiftCoordinateClick
+            );
         }
+        let catalyst_error = select_scope_recipe(
+            &host,
+            &Framework::Catalyst,
+            Route::TargetedPointer,
+            &point_click(Framework::Catalyst, MouseButton::Left, 1),
+            &requirements,
+        )
+        .unwrap_err();
+        assert_eq!(catalyst_error.code, ErrorCode::UnsupportedInBackground);
+        let error = select_scope_recipe(
+            &host,
+            &Framework::Unknown,
+            Route::TargetedPointer,
+            &point_click(Framework::Unknown, MouseButton::Right, 1),
+            &requirements,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedInBackground);
     }
 
     #[test]
-    fn target_belief_grant_and_revoke_are_target_only_and_stateful() {
-        let state = Arc::new(Mutex::new(MacFocusState::default()));
-        let poster = Arc::new(FakePoster {
-            signals: Mutex::new(Vec::new()),
-            fail_at: Vec::new(),
-        });
-        let mut lease = TargetBeliefLease::acquire_with(
-            ActionId::parse("action").unwrap(),
-            44,
-            99,
+    fn focus_belief_posts_once_and_remains_owned_by_the_target_controller() {
+        let facts = focus_facts();
+        let state = Arc::new(Mutex::new(MacFocusState::new(44, 99)));
+        let poster = FakePoster {
+            posts: Mutex::new(Vec::new()),
+        };
+        let reader = FakeReader {
+            active: false,
+            frontmost: Mutex::new(VecDeque::from([Some(false), Some(true)])),
+        };
+        prepare_target_focus_with(
+            &facts,
             Arc::clone(&state),
-            poster.clone(),
+            Instant::now() + Duration::from_secs(1),
+            &poster,
+            &reader,
         )
         .unwrap();
-        assert_eq!(
-            poster.signals.lock().unwrap().as_slice(),
-            [SlpsMakeKeyState::MakeKey, SlpsMakeKeyState::MakeKey]
-        );
-        assert!(state.lock().unwrap().active_belief.is_some());
-        lease.release().unwrap();
-        assert_eq!(
-            poster.signals.lock().unwrap().as_slice(),
-            [
-                SlpsMakeKeyState::MakeKey,
-                SlpsMakeKeyState::MakeKey,
-                SlpsMakeKeyState::RemoveKey
-            ]
-        );
-        assert!(state.lock().unwrap().active_belief.is_none());
-    }
-
-    #[test]
-    fn failed_make_key_record_clears_controller_ownership_without_claiming_a_grant() {
-        let state = Arc::new(Mutex::new(MacFocusState::default()));
-        let poster = Arc::new(FakePoster {
-            signals: Mutex::new(Vec::new()),
-            fail_at: vec![0],
-        });
-        let error = TargetBeliefLease::acquire_with(
-            ActionId::parse("action").unwrap(),
-            44,
-            99,
+        prepare_target_focus_with(
+            &facts,
             Arc::clone(&state),
-            poster.clone(),
+            Instant::now() + Duration::from_secs(1),
+            &poster,
+            &reader,
         )
-        .err()
         .unwrap();
-        assert_eq!(error.phase, ErrorPhase::Preflight);
-        assert_eq!(
-            poster.signals.lock().unwrap().as_slice(),
-            [SlpsMakeKeyState::MakeKey]
-        );
-        assert!(state.lock().unwrap().active_belief.is_none());
-    }
 
-    #[test]
-    fn second_grant_failure_posts_paired_revoke_and_clears_ownership() {
-        let state = Arc::new(Mutex::new(MacFocusState::default()));
-        let poster = Arc::new(FakePoster {
-            signals: Mutex::new(Vec::new()),
-            fail_at: vec![1],
-        });
-        let error = TargetBeliefLease::acquire_with(
-            ActionId::parse("action").unwrap(),
-            44,
-            99,
-            Arc::clone(&state),
-            poster.clone(),
-        )
-        .err()
-        .expect("second grant failure must refuse the lease");
-        assert_eq!(error.phase, ErrorPhase::Preflight);
-        assert_eq!(error.details["grant_records_posted"], 1);
         assert_eq!(
-            poster.signals.lock().unwrap().as_slice(),
-            [
-                SlpsMakeKeyState::MakeKey,
-                SlpsMakeKeyState::MakeKey,
-                SlpsMakeKeyState::RemoveKey
-            ]
+            *poster.posts.lock().unwrap(),
+            [("key_focus_returned", 44), ("app_activated", 44)]
         );
-        assert!(state.lock().unwrap().active_belief.is_none());
-    }
-
-    #[test]
-    fn failed_partial_grant_rollback_keeps_ownership_for_poison_and_shutdown_retry() {
-        let state = Arc::new(Mutex::new(MacFocusState::default()));
-        let poster = Arc::new(FakePoster {
-            signals: Mutex::new(Vec::new()),
-            fail_at: vec![1, 2],
-        });
-        let error = TargetBeliefLease::acquire_with(
-            ActionId::parse("action").unwrap(),
-            44,
-            99,
-            Arc::clone(&state),
-            poster.clone(),
-        )
-        .err()
-        .expect("grant and rollback failure must refuse the lease");
-        assert_eq!(error.related_failures.len(), 1);
-        assert_eq!(
-            poster.signals.lock().unwrap().as_slice(),
-            [
-                SlpsMakeKeyState::MakeKey,
-                SlpsMakeKeyState::MakeKey,
-                SlpsMakeKeyState::RemoveKey
-            ]
-        );
-        assert!(state.lock().unwrap().active_belief.is_some());
+        let state = state.lock().unwrap();
+        assert!(state.application_believes_it_is_active);
+        assert!(state.application_believes_it_has_focus);
+        assert!(!state.application_is_active);
     }
 }

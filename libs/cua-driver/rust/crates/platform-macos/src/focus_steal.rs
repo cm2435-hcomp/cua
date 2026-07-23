@@ -12,7 +12,10 @@
 //! all do exactly that — so a "background" launch flashes the target on
 //! top of the user's work for a few frames.
 //!
-//! The preventer subscribes to
+//! The v2 target-focus registration mirrors the helper's controller-lifetime
+//! process-notification, ViewBridge keyboard, and per-target mouse event-tap
+//! inputs, and reconciles the target's three focus-state booleans from the
+//! process-wide workspace observer. The final restoration guard subscribes to
 //! `NSWorkspace.didActivateApplicationNotification` and, when an activation
 //! matches a registered suppression entry, immediately re-activates the
 //! prior frontmost app on a background thread. AppKit's
@@ -56,12 +59,19 @@
 //! queue's own thread regardless of run-loop state.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex, OnceLock,
+    mpsc, Arc, Mutex, OnceLock, Weak,
 };
+use std::thread;
 use std::time::{Duration, Instant};
 
+use core_foundation::{
+    base::{CFRelease, CFTypeRef},
+    runloop::{kCFRunLoopDefaultMode, CFRunLoop},
+};
+use cua_driver_core::api::errors::{ErrorCode, ErrorPhase, NativeError};
 use objc2::rc::Retained;
 use objc2_app_kit::{
     NSApplicationActivationOptions, NSRunningApplication, NSWorkspace, NSWorkspaceApplicationKey,
@@ -69,6 +79,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::NSOperationQueue;
 use uuid::Uuid;
+
+use crate::apps::nsworkspace::{WorkspaceEventHub, WorkspaceEventKind};
 
 /// Per-entry deadline. After this much wall-clock time the dispatcher's
 /// observer (and the janitor) treats the entry as leaked and prunes it
@@ -78,6 +90,400 @@ const ENTRY_DEADLINE: Duration = Duration::from_secs(5);
 /// Janitor tick interval. The task wakes up this often while the
 /// dispatcher is non-empty and prunes expired entries.
 const JANITOR_TICK: Duration = Duration::from_secs(1);
+const FOCUS_TAP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
+const FOCUS_TAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SYNTHESIZED_ACTION_WINDOW: Duration = Duration::from_secs(1);
+
+fn synthesized_action_marker() -> &'static Mutex<Option<(i32, Instant)>> {
+    static LAST_SYNTHESIZED_ACTION: OnceLock<Mutex<Option<(i32, Instant)>>> = OnceLock::new();
+    LAST_SYNTHESIZED_ACTION.get_or_init(|| Mutex::new(None))
+}
+
+/// Record the same process-scoped synthesized-action marker used by the
+/// signed helper's event-tap containment.
+pub(crate) fn record_synthesized_action(pid: i32) {
+    *synthesized_action_marker()
+        .lock()
+        .expect("synthesized-action marker poisoned") = Some((pid, Instant::now()));
+}
+
+fn synthesized_action_is_recent(pid: i32) -> bool {
+    synthesized_action_marker()
+        .lock()
+        .expect("synthesized-action marker poisoned")
+        .is_some_and(|(marked_pid, marked_at)| {
+            marked_pid == pid && marked_at.elapsed() <= SYNTHESIZED_ACTION_WINDOW
+        })
+}
+
+/// Controller-lifetime event-tap inputs corresponding to the helper's
+/// process-notification, keyboard, and per-target mouse observation.
+pub(crate) struct TargetFocusTapRegistration {
+    close: mpsc::Sender<()>,
+    run_loop: Arc<AtomicUsize>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl TargetFocusTapRegistration {
+    pub(crate) fn start(
+        pid: i32,
+        state: Weak<Mutex<crate::driver::target::MacFocusState>>,
+    ) -> Result<Self, NativeError> {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (close_tx, close_rx) = mpsc::channel();
+        let run_loop = Arc::new(AtomicUsize::new(0));
+        let thread_run_loop = Arc::clone(&run_loop);
+        let workspace_events = WorkspaceEventHub::shared().subscribe();
+        let thread = thread::Builder::new()
+            .name(format!("cua-focus-taps-{pid}"))
+            .spawn(move || {
+                run_target_focus_taps(
+                    pid,
+                    state,
+                    workspace_events,
+                    &thread_run_loop,
+                    &started_tx,
+                    &close_rx,
+                )
+            })
+            .map_err(|error| {
+                focus_tap_error(format!("failed to spawn focus-tap thread: {error}"))
+            })?;
+        match started_rx.recv_timeout(FOCUS_TAP_HANDSHAKE_TIMEOUT) {
+            Ok(Ok(())) => Ok(Self {
+                close: close_tx,
+                run_loop,
+                thread: Some(thread),
+            }),
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = close_tx.send(());
+                let run_loop = run_loop.load(Ordering::Acquire);
+                if run_loop != 0 {
+                    unsafe { CFRunLoopStop(run_loop as *mut c_void) };
+                }
+                let _ = thread.join();
+                Err(focus_tap_error(
+                    "focus event-tap registration exceeded its bounded handshake",
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn close(&mut self) {
+        if self.thread.is_none() {
+            return;
+        }
+        let _ = self.close.send(());
+        let run_loop = self.run_loop.load(Ordering::Acquire);
+        if run_loop != 0 {
+            unsafe { CFRunLoopStop(run_loop as *mut c_void) };
+        }
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::error!("macOS target focus-tap thread panicked during teardown");
+            }
+        }
+    }
+}
+
+impl Drop for TargetFocusTapRegistration {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+struct FocusTapContext {
+    pid: i32,
+    state: Weak<Mutex<crate::driver::target::MacFocusState>>,
+}
+
+unsafe extern "C" fn focus_tap_callback(
+    _proxy: *const c_void,
+    event_type: u32,
+    event: *mut c_void,
+    user_info: *mut c_void,
+) -> *mut c_void {
+    let context = &*(user_info as *const FocusTapContext);
+    if let Some(state) = context.state.upgrade() {
+        let real_active = crate::apps::frontmost_pid() == Some(context.pid);
+        reconcile_real_active(&state, real_active);
+        if synthesized_action_is_recent(context.pid)
+            && matches!(event_type, 1 | 2 | 3 | 4 | 10 | 11 | 12 | 21 | 25 | 26)
+        {
+            let mut state = state.lock().expect("macOS focus coordinator poisoned");
+            state.application_believes_it_is_active = true;
+            state.application_believes_it_has_focus = true;
+        }
+    }
+    event
+}
+
+fn run_target_focus_taps(
+    pid: i32,
+    state: Weak<Mutex<crate::driver::target::MacFocusState>>,
+    mut workspace_events: tokio::sync::broadcast::Receiver<
+        crate::apps::nsworkspace::WorkspaceEvent,
+    >,
+    run_loop_slot: &AtomicUsize,
+    started: &mpsc::SyncSender<Result<(), NativeError>>,
+    close: &mpsc::Receiver<()>,
+) {
+    let context = Box::new(FocusTapContext {
+        pid,
+        state: state.clone(),
+    });
+    let context_ptr = Box::into_raw(context);
+    let process_tap =
+        unsafe { CGEventTapCreate(2, 1, 1, 1_u64 << 21, focus_tap_callback, context_ptr.cast()) };
+    let mouse_tap = unsafe {
+        CGEventTapCreateForPid(
+            pid,
+            1,
+            1,
+            (1_u64 << 1)
+                | (1_u64 << 2)
+                | (1_u64 << 3)
+                | (1_u64 << 4)
+                | (1_u64 << 25)
+                | (1_u64 << 26),
+            focus_tap_callback,
+            context_ptr.cast(),
+        )
+    };
+    let view_bridge_tap = view_bridge_pid().map(|view_bridge_pid| unsafe {
+        CGEventTapCreateForPid(
+            view_bridge_pid,
+            1,
+            1,
+            (1_u64 << 10) | (1_u64 << 11) | (1_u64 << 12),
+            focus_tap_callback,
+            context_ptr.cast(),
+        )
+    });
+    if process_tap.is_null()
+        || mouse_tap.is_null()
+        || view_bridge_tap.is_some_and(|tap| tap.is_null())
+    {
+        let taps = [Some(process_tap), view_bridge_tap, Some(mouse_tap)];
+        unsafe {
+            release_taps(&taps);
+            drop(Box::from_raw(context_ptr));
+        }
+        let _ = started.send(Err(focus_tap_error(
+            "required process-notification, keyboard, or target mouse event tap is unavailable",
+        )));
+        return;
+    }
+    let taps = [Some(process_tap), view_bridge_tap, Some(mouse_tap)];
+
+    let sources = taps.map(|tap| {
+        tap.map(|tap| unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0) })
+    });
+    if sources.iter().flatten().any(|source| source.is_null()) {
+        unsafe {
+            release_sources(&sources);
+            release_taps(&taps);
+            drop(Box::from_raw(context_ptr));
+        }
+        let _ = started.send(Err(focus_tap_error(
+            "required focus event tap has no run-loop source",
+        )));
+        return;
+    }
+    let run_loop = unsafe { CFRunLoopGetCurrent() };
+    run_loop_slot.store(run_loop as usize, Ordering::Release);
+    for source in sources.iter().flatten().copied() {
+        unsafe {
+            CFRunLoopAddSource(run_loop, source, kCFRunLoopDefaultMode.cast::<c_void>());
+        }
+    }
+    for tap in taps.iter().flatten().copied() {
+        unsafe { CGEventTapEnable(tap, true) };
+    }
+    if started.send(Ok(())).is_err() {
+        for source in sources.iter().flatten().copied() {
+            unsafe {
+                CFRunLoopRemoveSource(run_loop, source, kCFRunLoopDefaultMode.cast::<c_void>());
+            }
+        }
+        run_loop_slot.store(0, Ordering::Release);
+        unsafe {
+            release_sources(&sources);
+            release_taps(&taps);
+            drop(Box::from_raw(context_ptr));
+        }
+        return;
+    }
+
+    loop {
+        drain_workspace_focus_events(pid, &state, &mut workspace_events);
+        match close.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {
+                CFRunLoop::run_in_mode(
+                    unsafe { kCFRunLoopDefaultMode },
+                    FOCUS_TAP_POLL_INTERVAL,
+                    true,
+                );
+            }
+        }
+    }
+    for source in sources.iter().flatten().copied() {
+        unsafe {
+            CFRunLoopRemoveSource(run_loop, source, kCFRunLoopDefaultMode.cast::<c_void>());
+        }
+    }
+    run_loop_slot.store(0, Ordering::Release);
+    unsafe {
+        release_sources(&sources);
+        release_taps(&taps);
+        drop(Box::from_raw(context_ptr));
+    }
+}
+
+fn drain_workspace_focus_events(
+    pid: i32,
+    state: &Weak<Mutex<crate::driver::target::MacFocusState>>,
+    events: &mut tokio::sync::broadcast::Receiver<crate::apps::nsworkspace::WorkspaceEvent>,
+) {
+    loop {
+        match events.try_recv() {
+            Ok(event)
+                if matches!(
+                    event.kind,
+                    WorkspaceEventKind::Activated | WorkspaceEventKind::Deactivated
+                ) =>
+            {
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                reconcile_real_active(&state, crate::apps::frontmost_pid() == Some(pid));
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                reconcile_real_active(&state, crate::apps::frontmost_pid() == Some(pid));
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return,
+        }
+    }
+}
+
+fn reconcile_real_active(
+    state: &Arc<Mutex<crate::driver::target::MacFocusState>>,
+    application_is_active: bool,
+) {
+    let mut state = state.lock().expect("macOS focus coordinator poisoned");
+    let changed = state.application_is_active != application_is_active;
+    state.application_is_active = application_is_active;
+    if changed {
+        state.application_believes_it_is_active = application_is_active;
+        state.application_believes_it_has_focus = application_is_active;
+    }
+}
+
+fn view_bridge_pid() -> Option<i32> {
+    let capacity = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if capacity <= 0 {
+        return None;
+    }
+    let mut pids = vec![0_i32; capacity as usize];
+    let byte_len = pids
+        .len()
+        .checked_mul(std::mem::size_of::<i32>())
+        .and_then(|value| i32::try_from(value).ok())?;
+    let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), byte_len) };
+    for pid in pids.into_iter().take(count.max(0) as usize) {
+        if pid <= 0 {
+            continue;
+        }
+        let mut name = [0_u8; 256];
+        let length = unsafe {
+            libc::proc_name(
+                pid,
+                name.as_mut_ptr().cast(),
+                u32::try_from(name.len()).expect("process name buffer length fits u32"),
+            )
+        };
+        if length > 0
+            && std::str::from_utf8(&name[..length as usize]).ok() == Some("ViewBridgeAuxiliary")
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+unsafe fn release_sources(sources: &[Option<*mut c_void>; 3]) {
+    for source in sources
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|source| !source.is_null())
+    {
+        CFRelease(source as CFTypeRef);
+    }
+}
+
+unsafe fn release_taps(taps: &[Option<*mut c_void>; 3]) {
+    for tap in taps.iter().flatten().copied().filter(|tap| !tap.is_null()) {
+        CFRelease(tap as CFTypeRef);
+    }
+}
+
+fn focus_tap_error(message: impl Into<String>) -> NativeError {
+    NativeError::new(
+        ErrorCode::UnsupportedInBackground,
+        ErrorPhase::Preflight,
+        false,
+        message,
+    )
+    .with_detail("recipe_status", "recipe_unproven")
+}
+
+type EventTapCallback =
+    unsafe extern "C" fn(*const c_void, u32, *mut c_void, *mut c_void) -> *mut c_void;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventTapCreate(
+        location: u32,
+        placement: u32,
+        options: u32,
+        event_mask: u64,
+        callback: EventTapCallback,
+        user_info: *mut c_void,
+    ) -> *mut c_void;
+    fn CGEventTapCreateForPid(
+        pid: i32,
+        placement: u32,
+        options: u32,
+        event_mask: u64,
+        callback: EventTapCallback,
+        user_info: *mut c_void,
+    ) -> *mut c_void;
+    fn CGEventTapEnable(tap: *mut c_void, enable: bool);
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFMachPortCreateRunLoopSource(
+        allocator: *const c_void,
+        port: *mut c_void,
+        order: isize,
+    ) -> *mut c_void;
+    fn CFRunLoopGetCurrent() -> *mut c_void;
+    fn CFRunLoopAddSource(run_loop: *mut c_void, source: *mut c_void, mode: *const c_void);
+    fn CFRunLoopRemoveSource(run_loop: *mut c_void, source: *mut c_void, mode: *const c_void);
+    fn CFRunLoopStop(run_loop: *mut c_void);
+}
 
 /// Identifier for a suppression. `with_suppression` and `begin_suppression`
 /// hand one of these back; `end_suppression` consumes it.
@@ -762,6 +1168,32 @@ fn restore_focus(pid: i32) -> bool {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn real_active_transitions_reconcile_belief_without_revoking_synthetic_state() {
+        let state = Arc::new(Mutex::new(crate::driver::target::MacFocusState {
+            shutdown: false,
+            pid: 42,
+            cg_window_id: 7,
+            application_is_active: false,
+            application_believes_it_is_active: true,
+            application_believes_it_has_focus: true,
+        }));
+
+        reconcile_real_active(&state, false);
+        {
+            let state = state.lock().unwrap();
+            assert!(state.application_believes_it_is_active);
+            assert!(state.application_believes_it_has_focus);
+        }
+
+        reconcile_real_active(&state, true);
+        reconcile_real_active(&state, false);
+        let state = state.lock().unwrap();
+        assert!(!state.application_is_active);
+        assert!(!state.application_believes_it_is_active);
+        assert!(!state.application_believes_it_has_focus);
+    }
 
     /// Dispatcher::add returns a handle, the entry is reachable by
     /// match, and remove() drops it.

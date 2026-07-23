@@ -27,6 +27,7 @@
 //! selector which `objc2-foundation 0.2.2` does not bind natively — we
 //! hand-roll the binding in [`apple_event`] via `extern_methods!`.
 
+use std::mem::{size_of, MaybeUninit};
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -494,8 +495,10 @@ fn running_application_info(application: &NSRunningApplication) -> RunningApplic
     let executable_path = unsafe { application.executableURL() }
         .and_then(|url| unsafe { url.path() })
         .map(|path| path.to_string());
-    let process_generation = unsafe { application.launchDate() }
-        .map(|date| unsafe { date.timeIntervalSince1970() }.to_bits());
+    let process_generation = process_generation(pid).or_else(|| {
+        unsafe { application.launchDate() }
+            .and_then(|date| generation_from_epoch_seconds(unsafe { date.timeIntervalSince1970() }))
+    });
     RunningApplicationInfo {
         pid,
         name,
@@ -508,6 +511,45 @@ fn running_application_info(application: &NSRunningApplication) -> RunningApplic
         regular: unsafe { application.activationPolicy() }
             == NSApplicationActivationPolicy::Regular,
     }
+}
+
+/// Exact live-process generation derived from the kernel's BSD process row.
+///
+/// `NSRunningApplication.launchDate` is legitimately nil for long-lived
+/// regular processes including Finder and Docker Desktop. `proc_pidinfo`
+/// exposes the process start timestamp for those same PIDs, so use that as
+/// the canonical identity and retain launchDate only as a late-notification
+/// fallback after the kernel row has disappeared.
+pub(crate) fn process_generation(pid: i32) -> Option<u64> {
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let expected = size_of::<libc::proc_bsdinfo>();
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(expected).ok()?,
+        )
+    };
+    if usize::try_from(written).ok()? != expected {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != u32::try_from(pid).ok()? || info.pbi_start_tvsec == 0 {
+        return None;
+    }
+    info.pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)
+}
+
+fn generation_from_epoch_seconds(seconds: f64) -> Option<u64> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    let micros = (seconds * 1_000_000.0).round();
+    (micros <= u64::MAX as f64).then_some(micros as u64)
 }
 
 fn install_workspace_observers(hub: &Arc<WorkspaceEventHub>) {
@@ -606,5 +648,18 @@ mod apple_event {
             ];
             event
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_generation;
+
+    #[test]
+    fn live_process_generation_is_kernel_backed_and_stable() {
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let first = process_generation(pid).expect("current process must have a BSD start time");
+        let second = process_generation(pid).expect("current process must remain readable");
+        assert_eq!(first, second);
     }
 }

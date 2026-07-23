@@ -48,6 +48,7 @@ use super::{
 const MAX_AX_ELEMENTS: usize = 2_000;
 const MAX_AX_DEPTH: usize = 25;
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+const SCK_CAPTURE_TEARDOWN_RESERVE: Duration = Duration::from_millis(100);
 static SCK_CAPTURE_SLOTS: Semaphore = Semaphore::const_new(2);
 
 #[derive(Clone)]
@@ -74,42 +75,58 @@ impl MacObservationProvider {
         target: &mut MacTargetState,
         deadline: Instant,
     ) -> Result<CaptureFreshness, NativeError> {
-        let epoch = target.signals.epoch();
-        let facts_a = self.windows.facts_for_identity(&target.window).await?;
-        validate_observable(&facts_a)?;
-        let pending = capture(&facts_a, SurfaceKind::Window, deadline).await?;
-        let facts_b = self.windows.facts_for_identity(&facts_a.stamp).await?;
-        if facts_a != facts_b || !same_stable_identity(&target.window, &facts_b.stamp) {
-            return Err(NativeError::stale(
-                ErrorCode::ObservationRaced,
-                "target changed while producing FreshFrame evidence",
-            ));
-        }
-        let journal = target.signals.clone();
-        let freshness = journal
-            .commit_if_epoch(epoch, || {
+        let mut race_count = 0_u64;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(NativeError::stale(
+                    ErrorCode::ObservationRaced,
+                    "target did not hold a coherent FreshFrame bracket before settlement deadline",
+                )
+                .with_detail("race_count", race_count));
+            }
+            let epoch = target.signals.epoch();
+            let facts_a = self.windows.facts_for_identity(&target.window).await?;
+            validate_observable(&facts_a)?;
+            let pending = capture(&facts_a, SurfaceKind::Window, deadline).await?;
+            let facts_b = self.windows.facts_for_identity(&facts_a.stamp).await?;
+            if !same_stable_identity(&target.window, &facts_b.stamp) {
+                return Err(NativeError::stale(
+                    ErrorCode::WindowIdentityChanged,
+                    "target identity changed while producing FreshFrame evidence",
+                ));
+            }
+            if facts_a != facts_b {
+                race_count = race_count.saturating_add(1);
+                continue;
+            }
+            let journal = target.signals.clone();
+            let Some(freshness) = journal.commit_if_epoch(epoch, || {
                 target.frames.classify_and_commit(
                     pending.cg_window_id,
                     &pending.sample,
                     pending.scale_factor,
                 )
             })?
-            .ok_or_else(|| {
-                NativeError::stale(
-                    ErrorCode::ObservationRaced,
-                    "target signaled a mutation while producing FreshFrame evidence",
-                )
-            })?;
-        if !freshness.action_safe() {
-            return Err(NativeError::stale(
-                ErrorCode::SurfaceStale,
-                "ScreenCaptureKit did not produce action-safe FreshFrame evidence",
-            ));
+            else {
+                // Target notifications during post-action capture are expected
+                // evidence that the UI is still moving. Discard the raced
+                // sample and immediately recapture inside the same owned
+                // deadline; do not turn normal settlement progress into a
+                // fatal observation race.
+                race_count = race_count.saturating_add(1);
+                continue;
+            };
+            if !freshness.action_safe() {
+                return Err(NativeError::stale(
+                    ErrorCode::SurfaceStale,
+                    "ScreenCaptureKit did not produce action-safe FreshFrame evidence",
+                ));
+            }
+            target
+                .signals
+                .record(cua_driver_core::api::settlement::SettlementSignal::FreshFrame);
+            return Ok(freshness);
         }
-        target
-            .signals
-            .record(cua_driver_core::api::settlement::SettlementSignal::FreshFrame);
-        Ok(freshness)
     }
 
     async fn attempt(
@@ -540,9 +557,15 @@ async fn capture_sample_until(
         .await
         .map_err(|_| capture_deadline_error(window_id))?
         .map_err(|_| capture_deadline_error(window_id))?;
+    let capture_timeout = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .saturating_sub(SCK_CAPTURE_TEARDOWN_RESERVE);
+    if capture_timeout.is_zero() {
+        return Err(capture_deadline_error(window_id));
+    }
     let worker = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        capture_window_sample(window_id, scale)
+        capture_window_sample(window_id, scale, capture_timeout)
     });
     tokio::time::timeout_at(deadline, worker)
         .await
@@ -607,9 +630,15 @@ fn validated_surface_transform(
     expected_scale: f64,
 ) -> Result<SurfaceToWindowTransform, NativeError> {
     let metadata = &sample.metadata;
-    let scale = metadata.scale_factor.ok_or_else(missing_frame_metadata)?;
-    let content_scale = metadata.content_scale.ok_or_else(missing_frame_metadata)?;
-    let content = metadata.content_rect.ok_or_else(missing_frame_metadata)?;
+    let scale = metadata
+        .scale_factor
+        .ok_or_else(|| missing_frame_metadata(metadata))?;
+    let content_scale = metadata
+        .content_scale
+        .ok_or_else(|| missing_frame_metadata(metadata))?;
+    let content = metadata
+        .content_rect
+        .ok_or_else(|| missing_frame_metadata(metadata))?;
     let sampled = sample.source_frame;
     let surface_width = f64::from(sample.pixel_width) / scale;
     let surface_height = f64::from(sample.pixel_height) / scale;
@@ -630,6 +659,27 @@ fn validated_surface_transform(
         return Err(NativeError::stale(
             ErrorCode::SurfaceStale,
             "ScreenCaptureKit source frame, content rectangle and raster geometry disagree",
+        )
+        .with_detail("expected_source_bounds", rect_detail(source))
+        .with_detail("sample_source_frame", frame_rect_detail(sampled))
+        .with_detail("target_bounds", rect_detail(target))
+        .with_detail(
+            "pixel_size",
+            serde_json::json!({
+                "width": sample.pixel_width,
+                "height": sample.pixel_height,
+            }),
+        )
+        .with_detail("expected_scale_factor", expected_scale)
+        .with_detail("sample_scale_factor", scale)
+        .with_detail("content_scale", content_scale)
+        .with_detail("content_rect", frame_rect_detail(content))
+        .with_detail(
+            "surface_points_from_raster",
+            serde_json::json!({
+                "width": surface_width,
+                "height": surface_height,
+            }),
         ));
     }
     Ok(SurfaceToWindowTransform {
@@ -642,6 +692,24 @@ fn validated_surface_transform(
 
 fn approximately(left: f64, right: f64) -> bool {
     left.is_finite() && right.is_finite() && (left - right).abs() <= 0.75
+}
+
+fn rect_detail(rect: Rect) -> serde_json::Value {
+    serde_json::json!({
+        "x": rect.x,
+        "y": rect.y,
+        "width": rect.width,
+        "height": rect.height,
+    })
+}
+
+fn frame_rect_detail(rect: crate::video_sckit::FrameRect) -> serde_json::Value {
+    serde_json::json!({
+        "x": rect.x,
+        "y": rect.y,
+        "width": rect.width,
+        "height": rect.height,
+    })
 }
 
 #[derive(Default)]
@@ -663,11 +731,21 @@ impl MacFrameHistory {
         expected_scale: f64,
     ) -> Result<CaptureFreshness, NativeError> {
         let metadata = &sample.metadata;
-        let status = metadata.frame_status.ok_or_else(missing_frame_metadata)?;
-        let display_time = metadata.display_time.ok_or_else(missing_frame_metadata)?;
-        let scale = metadata.scale_factor.ok_or_else(missing_frame_metadata)?;
-        let content_scale = metadata.content_scale.ok_or_else(missing_frame_metadata)?;
-        let content_rect = metadata.content_rect.ok_or_else(missing_frame_metadata)?;
+        let status = metadata
+            .frame_status
+            .ok_or_else(|| missing_frame_metadata(metadata))?;
+        let display_time = metadata
+            .display_time
+            .ok_or_else(|| missing_frame_metadata(metadata))?;
+        let scale = metadata
+            .scale_factor
+            .ok_or_else(|| missing_frame_metadata(metadata))?;
+        let content_scale = metadata
+            .content_scale
+            .ok_or_else(|| missing_frame_metadata(metadata))?;
+        let content_rect = metadata
+            .content_rect
+            .ok_or_else(|| missing_frame_metadata(metadata))?;
         if metadata.completion_unix_ms == 0
             || !scale.is_finite()
             || (scale - expected_scale).abs() > 0.05
@@ -678,7 +756,8 @@ impl MacFrameHistory {
             || content_rect.width <= 0.0
             || content_rect.height <= 0.0
         {
-            return Err(missing_frame_metadata());
+            return Err(missing_frame_metadata(metadata)
+                .with_detail("expected_scale_factor", expected_scale));
         }
 
         let freshness = if status.has_content() {
@@ -712,11 +791,61 @@ impl MacFrameHistory {
     }
 }
 
-fn missing_frame_metadata() -> NativeError {
-    NativeError::stale(
+fn missing_frame_metadata(metadata: &crate::video_sckit::WindowFrameMetadata) -> NativeError {
+    let mut missing_fields = Vec::new();
+    if metadata.completion_unix_ms == 0 {
+        missing_fields.push("completion_unix_ms");
+    }
+    if metadata.display_time.is_none() {
+        missing_fields.push("display_time");
+    }
+    if metadata.frame_status.is_none() {
+        missing_fields.push("frame_status");
+    }
+    if metadata.scale_factor.is_none() {
+        missing_fields.push("scale_factor");
+    }
+    if metadata.content_scale.is_none() {
+        missing_fields.push("content_scale");
+    }
+    if metadata.content_rect.is_none() {
+        missing_fields.push("content_rect");
+    }
+
+    let mut invalid_fields = Vec::new();
+    if metadata
+        .scale_factor
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        invalid_fields.push("scale_factor");
+    }
+    if metadata
+        .content_scale
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        invalid_fields.push("content_scale");
+    }
+    if metadata.content_rect.is_some_and(|rect| {
+        !rect.x.is_finite()
+            || !rect.y.is_finite()
+            || !rect.width.is_finite()
+            || !rect.height.is_finite()
+            || rect.width <= 0.0
+            || rect.height <= 0.0
+    }) {
+        invalid_fields.push("content_rect");
+    }
+
+    let mut error = NativeError::stale(
         ErrorCode::SurfaceStale,
         "same-sample ScreenCaptureKit freshness metadata is missing or incoherent",
     )
+    .with_detail("missing_fields", serde_json::json!(missing_fields))
+    .with_detail("invalid_fields", serde_json::json!(invalid_fields));
+    if let Some(status) = metadata.frame_status {
+        error = error.with_detail("frame_status", status.to_string());
+    }
+    error
 }
 
 pub struct RetainedAxElement(usize);
@@ -917,16 +1046,9 @@ fn capture_ax_snapshot(
                 "target AX tree is not materialized; Plan003 observation is read-only and will not durably enable application accessibility",
             ));
         }
-        let focused = match focused_element_of_pid(pid) {
-            Some(element) if bindings::ax_get_window_id(element) == Some(target_window_id) => {
-                Some(RetainedAxElement(element as usize))
-            }
-            Some(element) => {
-                CFRelease(element as CFTypeRef);
-                None
-            }
-            None => None,
-        };
+        let focused = focused_element_of_pid(pid)
+            .map(|element| RetainedAxElement(element as usize))
+            .filter(|focused| nodes.iter().any(|node| node.element.same_identity(focused)));
         let selected_text = focused
             .as_ref()
             .and_then(|element| copy_string_attr(element.as_ptr(), "AXSelectedText"));
@@ -1015,8 +1137,14 @@ unsafe fn walk_ax(
         height: frame[3],
     });
     let native_window_id = bindings::ax_get_window_id(element);
-    let owner_window_id = native_window_id.unwrap_or(inherited_owner_window_id);
-    if let (Some(window_id), Some(kind)) = (native_window_id, transient_kind(&role)) {
+    let related_kind = transient_kind(&role);
+    let owner_window_id = structural_owner_window_id(
+        native_window_id,
+        related_kind,
+        target_window_id,
+        inherited_owner_window_id,
+    );
+    if let (Some(window_id), Some(kind)) = (native_window_id, related_kind) {
         if window_id != target_window_id {
             related_windows.push(RawRelatedWindow {
                 window_id,
@@ -1078,6 +1206,18 @@ fn transient_kind(role: &str) -> Option<SurfaceKind> {
         "AXPopover" => Some(SurfaceKind::Popover),
         "AXSheet" => Some(SurfaceKind::Sheet),
         _ => None,
+    }
+}
+
+fn structural_owner_window_id(
+    native_window_id: Option<u32>,
+    transient_kind: Option<SurfaceKind>,
+    target_window_id: u32,
+    inherited_owner_window_id: u32,
+) -> u32 {
+    match (native_window_id, transient_kind) {
+        (Some(window_id), Some(_)) if window_id != target_window_id => window_id,
+        _ => inherited_owner_window_id,
     }
 }
 
@@ -1668,6 +1808,10 @@ mod tests {
                 width: 100.0,
                 height: 50.0,
             },
+            activation_point: Some(cua_driver_core::api::contracts::Point {
+                x: x + 10.0,
+                y: 16.0,
+            }),
             scale_factor: Some(2.0),
             state: WindowStateKind::Visible,
             is_on_screen: true,
@@ -1709,12 +1853,26 @@ mod tests {
         let mut history = MacFrameHistory::default();
         let mut incomplete = sample(SCFrameStatus::Complete, 10, b"pixels");
         incomplete.metadata.display_time = None;
+        let error = history
+            .classify_and_commit(1, &incomplete, 2.0)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::SurfaceStale);
         assert_eq!(
-            history
-                .classify_and_commit(1, &incomplete, 2.0)
-                .unwrap_err()
-                .code,
-            ErrorCode::SurfaceStale
+            error.details.get("missing_fields"),
+            Some(&serde_json::json!(["display_time"]))
+        );
+        assert_eq!(
+            error.details.get("invalid_fields"),
+            Some(&serde_json::json!([]))
+        );
+    }
+
+    #[test]
+    fn embedded_remote_ax_children_inherit_target_ownership_but_transients_do_not() {
+        assert_eq!(structural_owner_window_id(Some(99), None, 1, 1), 1);
+        assert_eq!(
+            structural_owner_window_id(Some(99), Some(SurfaceKind::Popover), 1, 1),
+            99
         );
     }
 }

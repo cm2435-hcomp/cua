@@ -246,46 +246,53 @@ impl LifecycleProvider for MacLifecycle {
                         ],
                         Vec::new(),
                     ));
-                    match nsworkspace::running_application(pid) {
-                    None => Err(launch_error(
-                        "NSWorkspace returned an application that is not in the running-app registry",
-                    )
-                    .with_detail("pid", pid)),
-                    Some(application) => match application.process_generation {
+                    match nsworkspace::process_generation(pid) {
                         None => Err(launch_error(
-                            "NSWorkspace returned an application without an exact process generation",
+                            "NSWorkspace returned a pid without an exact live process generation",
                         )
                         .with_detail("pid", pid)),
-                        Some(generation) => {
-                            let app = app_ref_for_running(&application);
-                            posture_scope.record_partial_result(app.clone(), Vec::new());
-                            wait_for_stable_windows(
-                                &self.windows,
-                                LaunchWait {
-                                    app: &app,
-                                    pid,
-                                    expected_generation: generation,
-                                    baseline_windows: &baseline_windows,
-                                    dispatched: true,
-                                    settlement_action_id: &settlement_action_id,
-                                    profile: "macos_background_launch",
-                                    started,
-                                    deadline,
-                                },
-                                &mut events,
-                                &mut witness,
-                                posture_scope,
-                            )
-                            .await
-                            .map(|stable| LaunchAttempt {
-                                reused_running_app: preexisting
-                                    .as_ref()
-                                    .is_some_and(|prior| same_process_identity(prior, &application)),
-                                app,
-                                stable,
-                            })
-                        }
-                    },
+                        Some(generation) => match wait_for_registered_application(
+                            pid,
+                            generation,
+                            &resolved,
+                            deadline,
+                            &mut events,
+                            nsworkspace::running_application,
+                        )
+                        .await
+                        {
+                            Err(error) => Err(error),
+                            Ok(application) => {
+                                witness.drain_events();
+                                let app = app_ref_for_running(&application);
+                                posture_scope.record_partial_result(app.clone(), Vec::new());
+                                wait_for_stable_windows(
+                                    &self.windows,
+                                    LaunchWait {
+                                        app: &app,
+                                        pid,
+                                        expected_generation: generation,
+                                        baseline_windows: &baseline_windows,
+                                        dispatched: true,
+                                        settlement_action_id: &settlement_action_id,
+                                        profile: "macos_background_launch",
+                                        started,
+                                        deadline,
+                                    },
+                                    &mut events,
+                                    &mut witness,
+                                    posture_scope,
+                                )
+                                .await
+                                .map(|stable| LaunchAttempt {
+                                    reused_running_app: preexisting.as_ref().is_some_and(|prior| {
+                                        same_process_identity(prior, &application)
+                                    }),
+                                    app,
+                                    stable,
+                                })
+                            }
+                        },
                     }
                 }
             },
@@ -355,6 +362,82 @@ struct LaunchWait<'a> {
     deadline: Instant,
 }
 
+async fn wait_for_registered_application<F>(
+    pid: i32,
+    expected_generation: u64,
+    resolved: &ResolvedLaunch,
+    deadline: Instant,
+    events: &mut tokio::sync::broadcast::Receiver<nsworkspace::WorkspaceEvent>,
+    mut lookup: F,
+) -> Result<RunningApplicationInfo, NativeError>
+where
+    F: FnMut(i32) -> Option<RunningApplicationInfo>,
+{
+    let mut poll = tokio::time::interval(Duration::from_millis(25));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        if let Some(application) = lookup(pid) {
+            if let Some(false) = resolved.compares_to(&application) {
+                return Err(launch_settle_error(
+                    "NSWorkspace launch pid resolved to a different application",
+                )
+                .with_detail("pid", pid)
+                .with_detail(
+                    "actual_bundle_id",
+                    application.bundle_id.clone().unwrap_or_default(),
+                ));
+            }
+            match application.process_generation {
+                Some(generation) if generation != expected_generation => {
+                    return Err(NativeError::new(
+                        ErrorCode::WindowIdentityChanged,
+                        ErrorPhase::Settle,
+                        true,
+                        "launched process identity changed before registration completed",
+                    )
+                    .with_detail("pid", pid)
+                    .with_detail("expected_process_generation", expected_generation)
+                    .with_detail("current_process_generation", generation));
+                }
+                Some(_)
+                    if application.finished_launching
+                        && resolved.compares_to(&application) == Some(true) =>
+                {
+                    return Ok(application)
+                }
+                Some(_) | None => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(launch_settle_error(
+                "launched app did not register and finish launching before its deadline",
+            )
+            .with_detail("pid", pid));
+        }
+        tokio::select! {
+            _ = poll.tick() => {}
+            event = events.recv() => match event {
+                Ok(event) => {
+                    if let Some(error) = launch_event_failure(pid, &event) {
+                        return Err(error);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(launch_settle_error(
+                        "workspace lifecycle event stream closed before app registration",
+                    )
+                    .with_detail("pid", pid));
+                }
+            },
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                return Err(launch_settle_error("app launch deadline elapsed before registration")
+                    .with_detail("pid", pid));
+            }
+        }
+    }
+}
+
 async fn wait_for_stable_windows(
     registry: &MacWindowRegistry,
     wait: LaunchWait<'_>,
@@ -367,7 +450,7 @@ async fn wait_for_stable_windows(
     let mut stability = LaunchWindowStability::new(Instant::now());
     loop {
         if Instant::now() >= wait.deadline {
-            return Err(launch_error(
+            return Err(launch_settle_error(
                 "app launch did not reach a stable window set before its deadline",
             )
             .with_detail("pid", wait.pid));
@@ -386,22 +469,22 @@ async fn wait_for_stable_windows(
                     // the conservative resynchronization boundary.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return Err(launch_error("workspace lifecycle event stream closed during launch"));
+                        return Err(launch_settle_error("workspace lifecycle event stream closed during launch"));
                     }
                 }
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wait.deadline)) => {
-                return Err(launch_error("app launch deadline elapsed")
+                return Err(launch_settle_error("app launch deadline elapsed")
                     .with_detail("pid", wait.pid));
             }
         }
         witness.drain_events();
         let application = nsworkspace::running_application(wait.pid).ok_or_else(|| {
-            launch_error("app disappeared before launch settlement completed")
+            launch_settle_error("app disappeared before launch settlement completed")
                 .with_detail("pid", wait.pid)
         })?;
         if application.process_generation != Some(wait.expected_generation) {
-            return Err(launch_error(
+            return Err(launch_settle_error(
                 "process identity changed before launch settlement completed",
             )
             .with_detail("pid", wait.pid)
@@ -554,7 +637,8 @@ impl LaunchWindowStability {
 
 fn launch_event_failure(pid: i32, event: &nsworkspace::WorkspaceEvent) -> Option<NativeError> {
     (event.pid == pid && event.kind == WorkspaceEventKind::Terminated).then(|| {
-        launch_error("app terminated before launch settlement completed").with_detail("pid", pid)
+        launch_settle_error("app terminated before launch settlement completed")
+            .with_detail("pid", pid)
     })
 }
 
@@ -568,22 +652,31 @@ struct ResolvedLaunch {
 }
 
 impl ResolvedLaunch {
-    fn matches(&self, application: &RunningApplicationInfo) -> bool {
+    /// Compare only identity fields that NSRunningApplication has published.
+    /// `None` means registry publication is still incomplete, not a mismatch.
+    fn compares_to(&self, application: &RunningApplicationInfo) -> Option<bool> {
         if let Some(bundle_id) = &self.bundle_id {
-            return application.bundle_id.as_ref() == Some(bundle_id);
+            return application
+                .bundle_id
+                .as_ref()
+                .map(|candidate| candidate == bundle_id);
         }
         if let Some(executable) = &self.executable_path {
             return application
                 .executable_path
                 .as_ref()
-                .is_some_and(|path| Path::new(path) == executable);
+                .map(|path| Path::new(path) == executable);
         }
-        self.name.as_ref().is_some_and(|name| {
+        self.name.as_ref().and_then(|name| {
             application
                 .name
                 .as_ref()
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+                .map(|candidate| candidate.eq_ignore_ascii_case(name))
         })
+    }
+
+    fn matches(&self, application: &RunningApplicationInfo) -> bool {
+        self.compares_to(application) == Some(true)
     }
 }
 
@@ -618,7 +711,67 @@ impl LaunchCatalog for SystemLaunchCatalog {
 }
 
 fn resolve_launch(selector: AppSelector) -> Result<ResolvedLaunch, NativeError> {
+    if let AppSelector::Name { name } = &selector {
+        if name.trim().is_empty() {
+            return Err(NativeError::invalid("app name cannot be empty"));
+        }
+        if let Some(resolved) = resolve_running_name(name, &nsworkspace::running_applications())? {
+            return Ok(resolved);
+        }
+    }
     resolve_launch_with_catalog(selector, &SystemLaunchCatalog)
+}
+
+fn resolve_running_name(
+    name: &str,
+    applications: &[RunningApplicationInfo],
+) -> Result<Option<ResolvedLaunch>, NativeError> {
+    let matches: Vec<_> = applications
+        .iter()
+        .filter(|application| {
+            application
+                .name
+                .as_ref()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+        })
+        .collect();
+    if matches.len() > 1 {
+        return Err(NativeError::invalid(
+            "app name matched multiple running macOS processes; use a bundle id or executable",
+        )
+        .with_detail("name", name.to_owned())
+        .with_detail(
+            "pids",
+            matches
+                .iter()
+                .map(|application| application.pid)
+                .collect::<Vec<_>>(),
+        ));
+    }
+    let Some(application) = matches.first() else {
+        return Ok(None);
+    };
+    let app_ref = application
+        .bundle_id
+        .clone()
+        .or_else(|| application.executable_path.clone())
+        .ok_or_else(|| {
+            NativeError::new(
+                ErrorCode::AppNotFound,
+                ErrorPhase::Preflight,
+                false,
+                "running macOS app has neither a bundle id nor executable path",
+            )
+            .with_detail("name", name.to_owned())
+            .with_detail("pid", application.pid)
+        })?;
+    Ok(Some(ResolvedLaunch {
+        app_ref,
+        bundle_id: application.bundle_id.clone(),
+        executable_path: application.executable_path.as_deref().map(PathBuf::from),
+        name: Some(name.to_owned()),
+        arguments: Vec::new(),
+    }))
 }
 
 fn resolve_launch_with_catalog(
@@ -841,6 +994,15 @@ fn launch_error(message: impl Into<String>) -> NativeError {
     )
 }
 
+fn launch_settle_error(message: impl Into<String>) -> NativeError {
+    NativeError::new(
+        ErrorCode::AppLaunchFailed,
+        ErrorPhase::Settle,
+        true,
+        message,
+    )
+}
+
 fn join_error(error: tokio::task::JoinError) -> NativeError {
     NativeError::new(
         ErrorCode::Internal,
@@ -1025,6 +1187,64 @@ mod tests {
     }
 
     #[test]
+    fn running_name_resolution_handles_core_services_and_rejects_ambiguity() {
+        let mut finder = running_fixture();
+        finder.name = Some("Finder".to_owned());
+        finder.bundle_id = Some("com.apple.finder".to_owned());
+        finder.executable_path =
+            Some("/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder".to_owned());
+        let resolved = resolve_running_name("finder", &[finder.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.app_ref, "com.apple.finder");
+        assert_eq!(resolved.bundle_id.as_deref(), Some("com.apple.finder"));
+
+        let mut duplicate = finder.clone();
+        duplicate.pid += 1;
+        duplicate.process_generation = Some(8);
+        let error = resolve_running_name("Finder", &[finder, duplicate]).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert_eq!(error.phase, ErrorPhase::Validate);
+    }
+
+    #[tokio::test]
+    async fn cold_launch_waits_for_registry_publication_and_finished_state() {
+        let resolved = ResolvedLaunch {
+            app_ref: "com.example.fixture".to_owned(),
+            bundle_id: Some("com.example.fixture".to_owned()),
+            executable_path: None,
+            name: None,
+            arguments: Vec::new(),
+        };
+        let (_sender, mut events) = tokio::sync::broadcast::channel(4);
+        let mut lookups = 0;
+        let application = wait_for_registered_application(
+            120,
+            7,
+            &resolved,
+            Instant::now() + Duration::from_millis(250),
+            &mut events,
+            move |_| {
+                lookups += 1;
+                match lookups {
+                    1 => None,
+                    2 => {
+                        let mut application = running_fixture();
+                        application.bundle_id = None;
+                        application.finished_launching = false;
+                        Some(application)
+                    }
+                    _ => Some(running_fixture()),
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(application.finished_launching);
+        assert_eq!(application.process_generation, Some(7));
+    }
+
+    #[test]
     fn settlement_reports_only_signals_that_were_observed() {
         let started = Instant::now();
         let empty_dispatch =
@@ -1089,7 +1309,7 @@ mod tests {
         };
         let error = launch_event_failure(120, &target).unwrap();
         assert_eq!(error.code, ErrorCode::AppLaunchFailed);
-        assert_eq!(error.phase, ErrorPhase::Dispatch);
+        assert_eq!(error.phase, ErrorPhase::Settle);
     }
 
     #[test]

@@ -22,21 +22,23 @@
 //!   3. `stop()` calls `stop_capture()` (which finalises the mp4 moov
 //!      atom) and returns the elapsed-time metadata.
 
-use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    ffi::c_void,
+    path::Path,
+    sync::mpsc::{sync_channel, RecvTimeoutError},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use cua_driver_core::video::{VideoBackend, VideoBackendFactory, VideoMetadata};
 
+use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, SCFrameStatus};
 use screencapturekit::prelude::{
-    SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration,
+    CMSampleBuffer, SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration,
+    SCStreamOutputType,
 };
 use screencapturekit::recording_output::{
     SCRecordingOutput, SCRecordingOutputCodec, SCRecordingOutputConfiguration,
     SCRecordingOutputFileType,
-};
-use screencapturekit::{
-    cm::{CMSampleBufferExt, CMSampleBufferSCExt, SCFrameStatus},
-    screenshot_manager::SCScreenshotManager,
 };
 
 pub struct SckitVideoBackendFactory;
@@ -84,16 +86,25 @@ impl Drop for TemporaryCapturePath {
 ///
 /// This is intentionally separate from the long-lived recording stream. A
 /// v2 observation needs one bounded sample whose pixels, frame status,
-/// display timestamp and scale attachments are coherent. The old
-/// `screencapture` CLI helper cannot provide that contract and is never called
-/// here.
+/// display timestamp and scale attachments are coherent. Apple's one-shot
+/// `SCScreenshotManager.captureSampleBuffer` returns pixels without
+/// `SCStreamFrameInfo` attachments on current macOS, so observations use one
+/// exact-window `SCStream` callback instead. The old `screencapture` CLI
+/// helper cannot provide this contract and is never called here.
 pub fn capture_window_sample(
     window_id: u32,
     expected_scale_factor: f64,
+    timeout: Duration,
 ) -> anyhow::Result<WindowFrameSample> {
     if !expected_scale_factor.is_finite() || expected_scale_factor <= 0.0 {
         anyhow::bail!("invalid expected scale factor for window {window_id}");
     }
+    if timeout.is_zero() {
+        anyhow::bail!("ScreenCaptureKit window {window_id} sample deadline elapsed");
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow::anyhow!("invalid ScreenCaptureKit sample timeout"))?;
 
     let content = SCShareableContent::get()
         .map_err(|error| anyhow::anyhow!("SCShareableContent::get failed: {error}"))?;
@@ -109,12 +120,50 @@ pub fn capture_window_sample(
     let configuration = SCStreamConfiguration::new()
         .with_width(width)
         .with_height(height)
+        .with_queue_depth(2)
         .with_ignores_shadows_single_window(true)
         .with_shows_cursor(false)
         .with_captures_audio(false);
 
-    let sample = SCScreenshotManager::capture_sample_buffer(&filter, &configuration)
-        .map_err(|error| anyhow::anyhow!("ScreenCaptureKit sample failed: {error}"))?;
+    let (sender, receiver) = sync_channel(2);
+    let mut stream = SCStream::new(&filter, &configuration);
+    stream
+        .add_output_handler(
+            move |sample, _| {
+                let completion_unix_ms = unix_ms_now();
+                let _ = sender.try_send((sample, completion_unix_ms));
+            },
+            SCStreamOutputType::Screen,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!("ScreenCaptureKit failed to register output for window {window_id}")
+        })?;
+    stream
+        .start_capture()
+        .map_err(|error| anyhow::anyhow!("ScreenCaptureKit stream start failed: {error}"))?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let received = if remaining.is_zero() {
+        Err(anyhow::anyhow!(
+            "ScreenCaptureKit window {window_id} sample deadline elapsed"
+        ))
+    } else {
+        receiver
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                RecvTimeoutError::Timeout => anyhow::anyhow!(
+                    "ScreenCaptureKit window {window_id} produced no sample before its deadline"
+                ),
+                RecvTimeoutError::Disconnected => anyhow::anyhow!(
+                    "ScreenCaptureKit output for window {window_id} disconnected before a sample"
+                ),
+            })
+    };
+    let stop_result = stream.stop_capture().map_err(|error| {
+        anyhow::anyhow!("ScreenCaptureKit stream stop failed for window {window_id}: {error}")
+    });
+    let (sample, completion_unix_ms) = received?;
+    stop_result?;
+
     let frame_info = sample.frame_info();
     let image = sample
         .cg_image()
@@ -139,15 +188,17 @@ pub fn capture_window_sample(
         anyhow::bail!("ScreenCaptureKit produced an empty PNG for window {window_id}");
     }
 
-    let completion_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64;
     let metadata = WindowFrameMetadata {
         completion_unix_ms,
         display_time: frame_info.as_ref().and_then(|info| info.display_time),
-        frame_status: frame_info.as_ref().and_then(|info| info.frame_status),
+        // screencapturekit 6.0.1 casts the attachment's NSNumber directly to
+        // Swift's SCFrameStatus enum and silently loses it. Read the numeric
+        // attachment through CoreFoundation until the dependency fixes that
+        // bridge; never infer status from pixels or timestamps.
+        frame_status: frame_info
+            .as_ref()
+            .and_then(|info| info.frame_status)
+            .or_else(|| frame_status_from_attachment(&sample)),
         scale_factor: frame_info.as_ref().and_then(|info| info.scale_factor),
         content_scale: frame_info.as_ref().and_then(|info| info.content_scale),
         content_rect: frame_info
@@ -172,6 +223,65 @@ pub fn capture_window_sample(
         },
         metadata,
     })
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+/// Decode `SCStreamFrameInfoStatus` from the sample attachment dictionary.
+///
+/// ScreenCaptureKit stores the enum as a CFNumber/NSNumber. This deliberately
+/// uses Apple's exported key constant rather than copying its string value.
+fn frame_status_from_attachment(sample: &CMSampleBuffer) -> Option<SCFrameStatus> {
+    type CFIndex = isize;
+    type CFTypeId = usize;
+    const CF_NUMBER_SINT32_TYPE: i32 = 3;
+
+    #[link(name = "CoreMedia", kind = "framework")]
+    unsafe extern "C" {
+        fn CMSampleBufferGetSampleAttachmentsArray(
+            sample_buffer: *mut c_void,
+            create_if_necessary: u8,
+        ) -> *const c_void;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFArrayGetCount(array: *const c_void) -> CFIndex;
+        fn CFArrayGetValueAtIndex(array: *const c_void, index: CFIndex) -> *const c_void;
+        fn CFDictionaryGetValue(dictionary: *const c_void, key: *const c_void) -> *const c_void;
+        fn CFGetTypeID(value: *const c_void) -> CFTypeId;
+        fn CFNumberGetTypeID() -> CFTypeId;
+        fn CFNumberGetValue(number: *const c_void, number_type: i32, value: *mut c_void) -> u8;
+    }
+    #[link(name = "ScreenCaptureKit", kind = "framework")]
+    unsafe extern "C" {
+        static SCStreamFrameInfoStatus: *const c_void;
+    }
+
+    unsafe {
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample.as_ptr(), 0);
+        if attachments.is_null() || CFArrayGetCount(attachments) < 1 {
+            return None;
+        }
+        let dictionary = CFArrayGetValueAtIndex(attachments, 0);
+        if dictionary.is_null() {
+            return None;
+        }
+        let number = CFDictionaryGetValue(dictionary, SCStreamFrameInfoStatus);
+        if number.is_null() || CFGetTypeID(number) != CFNumberGetTypeID() {
+            return None;
+        }
+        let mut raw = 0_i32;
+        if CFNumberGetValue(number, CF_NUMBER_SINT32_TYPE, (&mut raw as *mut i32).cast()) == 0 {
+            return None;
+        }
+        SCFrameStatus::from_raw(raw)
+    }
 }
 
 fn scaled_dimension(points: f64, scale: f64, name: &str) -> anyhow::Result<u32> {

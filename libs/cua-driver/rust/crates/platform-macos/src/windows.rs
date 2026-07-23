@@ -274,15 +274,33 @@ pub fn display_scale_for_bounds(bounds: &WindowBounds) -> Option<f64> {
         let right = (bounds.x + bounds.width).min(frame.origin.x + frame.size.width);
         let bottom = (bounds.y + bounds.height).min(frame.origin.y + frame.size.height);
         let area = (right - left).max(0.0) * (bottom - top).max(0.0);
-        if area <= 0.0 || frame.size.width <= 0.0 {
+        if area <= 0.0 {
             continue;
         }
-        let scale = display.pixels_wide() as f64 / frame.size.width;
+        // CGDisplayPixelsWide and CGDisplayBounds both report logical mode
+        // dimensions on Retina displays, so their ratio is incorrectly 1.0.
+        // The current display mode exposes both logical and physical widths;
+        // their ratio matches NSScreen.backingScaleFactor without requiring
+        // AppKit access from the registry worker.
+        let Some(mode) = display.display_mode() else {
+            continue;
+        };
+        let Some(scale) = backing_scale(mode.width(), mode.pixel_width()) else {
+            continue;
+        };
         if best.map_or(true, |(best_area, _)| area > best_area) {
             best = Some((area, scale));
         }
     }
     best.map(|(_, scale)| scale)
+}
+
+fn backing_scale(logical_width: u64, physical_width: u64) -> Option<f64> {
+    if logical_width == 0 || physical_width == 0 {
+        return None;
+    }
+    let scale = physical_width as f64 / logical_width as f64;
+    (scale.is_finite() && scale > 0.0).then_some(scale)
 }
 
 type CopySpacesForWindowsFn = unsafe extern "C" fn(
@@ -426,4 +444,15 @@ fn copy_current_space_ids(connection: u32) -> Option<Vec<u64>> {
         }
     }
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backing_scale;
+
+    #[test]
+    fn backing_scale_uses_physical_display_mode_pixels_on_retina() {
+        assert_eq!(backing_scale(1_710, 3_420), Some(2.0));
+        assert_eq!(backing_scale(1_920, 3_840), Some(2.0));
+    }
 }

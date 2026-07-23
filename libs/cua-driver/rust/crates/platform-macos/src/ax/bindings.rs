@@ -356,6 +356,53 @@ pub unsafe fn copy_cf_range_attr(
     }
 }
 
+/// Copy a `kAXValueCGPointType` attribute. Missing and unsupported attributes
+/// are optional; query and type failures remain distinguishable to callers
+/// that need an exact read.
+pub unsafe fn copy_point_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Result<Option<(f64, f64)>, AXError> {
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err == kAXErrorNoValue || err == kAXErrorAttributeUnsupported {
+        return Ok(None);
+    }
+    if err != kAXErrorSuccess {
+        return Err(err);
+    }
+    if value.is_null() {
+        return Ok(None);
+    }
+    if core_foundation::base::CFGetTypeID(value) != AXValueGetTypeID() {
+        CFRelease(value);
+        return Err(kAXErrorFailure);
+    }
+    let value = value as AXValueRef;
+    if AXValueGetType(value) != kAXValueCGPointType {
+        CFRelease(value as CFTypeRef);
+        return Err(kAXErrorFailure);
+    }
+    #[repr(C)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    let mut point = CGPoint { x: 0.0, y: 0.0 };
+    let copied = AXValueGetValue(
+        value,
+        kAXValueCGPointType,
+        &mut point as *mut _ as *mut c_void,
+    );
+    CFRelease(value as CFTypeRef);
+    if copied {
+        Ok(Some((point.x, point.y)))
+    } else {
+        Err(kAXErrorFailure)
+    }
+}
+
 /// Set a `kAXValueCFRangeType` attribute.
 pub unsafe fn set_cf_range_attr(
     element: AXUIElementRef,

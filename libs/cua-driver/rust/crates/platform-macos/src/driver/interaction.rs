@@ -25,22 +25,19 @@ use crate::{
     apps::nsworkspace::WorkspaceEventHub,
     ax::enablement::AxEnablementLease,
     focus_steal::{SuppressionLease, SuppressionOutcome},
-    input::{keyboard::normalize_chord, slps_make_key},
+    input::keyboard::normalize_chord,
 };
 
 use super::{
     focus::{
-        select_scope_recipe, AccessibilityRecipe, HostRecipeContext, MacScopeRecipe,
-        MenuSuppressionRecipe, TargetBeliefLease, TargetBeliefRecipe,
+        prepare_target_focus, select_scope_recipe, AccessibilityRecipe, HostRecipeContext,
+        MacScopeRecipe, MenuSuppressionRecipe, TargetBeliefRecipe,
     },
     menu::{self, MenuSuppressionPlan},
     posture::MacInteractionPostureWitness,
     target::{MacFocusState, MacTargetFocusCoordinator, MacTargetState},
     windows::{MacWindowFacts, MacWindowRegistry},
 };
-
-#[cfg(test)]
-use super::target::MacActiveBelief;
 
 const CONTAINMENT_BARRIER_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -95,14 +92,13 @@ trait MacInteractionHooks: Send + Sync {
         plan: &MenuSuppressionPlan,
     ) -> Result<Option<Box<dyn LeaseResource>>, NativeError>;
 
-    fn acquire_target_belief(
+    fn prepare_target_belief(
         &self,
         recipe: TargetBeliefRecipe,
-        action_id: &ActionId,
-        pid: i32,
-        cg_window_id: u32,
+        facts: &MacWindowFacts,
         focus_state: Arc<Mutex<MacFocusState>>,
-    ) -> Result<Option<Box<dyn LeaseResource>>, NativeError>;
+        deadline: Instant,
+    ) -> Result<Option<NativeEvidence>, NativeError>;
 }
 
 #[derive(Default)]
@@ -163,22 +159,14 @@ impl MacInteractionHooks for SystemInteractionHooks {
         })
     }
 
-    fn acquire_target_belief(
+    fn prepare_target_belief(
         &self,
         recipe: TargetBeliefRecipe,
-        action_id: &ActionId,
-        pid: i32,
-        cg_window_id: u32,
+        facts: &MacWindowFacts,
         focus_state: Arc<Mutex<MacFocusState>>,
-    ) -> Result<Option<Box<dyn LeaseResource>>, NativeError> {
-        match recipe {
-            TargetBeliefRecipe::NotApplicable => Ok(None),
-            TargetBeliefRecipe::ChromiumPointClickSlpsMakeKeyHost26_5_1Arm64 => {
-                Ok(Some(Box::new(BeliefLeaseResource(
-                    TargetBeliefLease::acquire(action_id.clone(), pid, cg_window_id, focus_state)?,
-                ))))
-            }
-        }
+        deadline: Instant,
+    ) -> Result<Option<NativeEvidence>, NativeError> {
+        prepare_target_focus(recipe, facts, focus_state, deadline)
     }
 }
 
@@ -307,22 +295,6 @@ impl LeaseResource for MenuResourceAdapter {
     }
 }
 
-struct BeliefLeaseResource(TargetBeliefLease);
-
-impl LeaseResource for BeliefLeaseResource {
-    fn release(&mut self, _deadline: Instant) -> LeaseRelease {
-        let mut evidence = NativeEvidence::default();
-        let failure = self.0.release().err();
-        evidence
-            .fields
-            .insert("target_belief_release_attempted".to_owned(), true.into());
-        evidence
-            .fields
-            .insert("target_belief_revoked".to_owned(), failure.is_none().into());
-        LeaseRelease { evidence, failure }
-    }
-}
-
 fn remaining(deadline: Instant) -> Duration {
     deadline
         .saturating_duration_since(Instant::now())
@@ -371,15 +343,6 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
         }
         let recipe =
             select_scope_recipe(&self.host, &window.framework, route, action, &requirements)?;
-        if recipe.target_belief != TargetBeliefRecipe::NotApplicable && !slps_make_key::available()
-        {
-            return Err(NativeError::unsupported(
-                "recipe_unproven: target-only SLPS make-key symbols are unavailable on this host",
-            )
-            .with_detail("recipe_status", "recipe_unproven")
-            .with_detail("os_version", self.host.os_version.clone())
-            .with_detail("architecture", self.host.architecture.clone()));
-        }
         let menu = if requirements.menu_dismissal {
             return Err(NativeError::unsupported(
                 "recipe_unproven: required menu suppression has no exact predicate",
@@ -477,6 +440,7 @@ fn acquire_resources(
 ) -> Result<AcquiredResources, NativeError> {
     let posture = hooks.acquire_posture()?;
     let mut cleanup = MacScopeCleanup::new(poison, posture.resource, plan.deadline.teardown);
+    let mut target_belief_evidence = None;
 
     let result = (|| {
         cleanup.accessibility =
@@ -488,36 +452,21 @@ fn acquire_resources(
             plan.deadline.teardown,
         )?;
         cleanup.menu = hooks.acquire_menu(plan.native.recipe.menu, &plan.native.menu)?;
-        cleanup.target_belief = hooks.acquire_target_belief(
+        target_belief_evidence = hooks.prepare_target_belief(
             plan.native.recipe.target_belief,
-            &plan.action_id,
-            plan.native.facts.pid,
-            plan.native.facts.cg_window_id,
+            &plan.native.facts,
             Arc::clone(&focus_state),
+            plan.deadline.work,
         )?;
         Ok::<(), NativeError>(())
     })();
 
     if let Err(primary) = result {
         let outcome = cleanup.cleanup(plan.deadline.teardown);
-        let belief_still_active = focus_state
-            .lock()
-            .expect("macOS focus coordinator poisoned")
-            .active_belief
-            .is_some();
-        if belief_still_active {
-            cleanup.poison.store(true, Ordering::Release);
-        }
         let mut failures = Vec::with_capacity(1 + outcome.failures.len());
         failures.push(primary);
         failures.extend(outcome.failures);
-        let mut combined = NativeError::primary(failures).expect("acquisition failure is nonempty");
-        if belief_still_active {
-            combined = combined
-                .with_detail("target_poisoned", true)
-                .with_target_invalidated();
-        }
-        return Err(combined);
+        return Err(NativeError::primary(failures).expect("acquisition failure is nonempty"));
     }
 
     let acquisition = ScopeLeaseAcquisition {
@@ -525,7 +474,11 @@ fn acquire_resources(
         accessibility: decision(&cleanup.accessibility),
         containment: decision(&cleanup.containment),
         menu_dismissal: decision(&cleanup.menu),
-        target_belief: decision(&cleanup.target_belief),
+        target_belief: if target_belief_evidence.is_some() {
+            LeaseDecision::Acquired
+        } else {
+            LeaseDecision::NotApplicable
+        },
     };
     let mut evidence = NativeEvidence::default();
     evidence.fields.insert(
@@ -547,6 +500,9 @@ fn acquire_resources(
         "cg_window_id".to_owned(),
         plan.native.facts.cg_window_id.into(),
     );
+    if let Some(target_belief_evidence) = target_belief_evidence {
+        evidence.merge(target_belief_evidence);
+    }
     Ok(AcquiredResources {
         acquisition,
         evidence,
@@ -569,7 +525,6 @@ struct MacScopeCleanup {
     accessibility: Option<Box<dyn LeaseResource>>,
     containment: Option<Box<dyn LeaseResource>>,
     menu: Option<Box<dyn LeaseResource>>,
-    target_belief: Option<Box<dyn LeaseResource>>,
     outcome: Option<ScopeTeardownOutcome>,
 }
 
@@ -586,7 +541,6 @@ impl MacScopeCleanup {
             accessibility: None,
             containment: None,
             menu: None,
-            target_belief: None,
             outcome: None,
         }
     }
@@ -600,12 +554,6 @@ impl ScopeCleanup for MacScopeCleanup {
 
         let mut evidence = NativeEvidence::default();
         let mut failures = Vec::new();
-        let target_belief = release_lease(
-            &mut self.target_belief,
-            deadline,
-            &mut evidence,
-            &mut failures,
-        );
         let menu_dismissal = release_lease(&mut self.menu, deadline, &mut evidence, &mut failures);
         let containment = release_lease(
             &mut self.containment,
@@ -658,7 +606,7 @@ impl ScopeCleanup for MacScopeCleanup {
                 accessibility,
                 containment,
                 menu_dismissal,
-                target_belief,
+                target_belief: LeaseTeardownStatus::NotApplicable,
             },
             failures,
         };
@@ -792,7 +740,6 @@ mod tests {
         log: Arc<Mutex<Vec<&'static str>>>,
         containment_deadlines: Arc<Mutex<Vec<Instant>>>,
         fail_at: Option<&'static str>,
-        poison_belief: bool,
     }
 
     impl LoggingHooks {
@@ -854,31 +801,23 @@ mod tests {
             self.acquire("menu+", "menu-")
         }
 
-        fn acquire_target_belief(
+        fn prepare_target_belief(
             &self,
             _recipe: TargetBeliefRecipe,
-            _action_id: &ActionId,
-            _pid: i32,
-            _cg_window_id: u32,
-            focus_state: Arc<Mutex<MacFocusState>>,
-        ) -> Result<Option<Box<dyn LeaseResource>>, NativeError> {
-            if self.poison_belief {
-                focus_state
-                    .lock()
-                    .expect("macOS focus coordinator poisoned")
-                    .active_belief = Some(MacActiveBelief {
-                    action_id: ActionId::parse("partial-belief").unwrap(),
-                    pid: 44,
-                    cg_window_id: 99,
-                });
+            _facts: &MacWindowFacts,
+            _focus_state: Arc<Mutex<MacFocusState>>,
+            _deadline: Instant,
+        ) -> Result<Option<NativeEvidence>, NativeError> {
+            self.log.lock().unwrap().push("belief+");
+            if self.fail_at == Some("belief+") {
                 return Err(NativeError::new(
                     ErrorCode::Internal,
                     ErrorPhase::Preflight,
                     false,
-                    "injected partial belief rollback failure",
+                    "injected belief preparation failure",
                 ));
             }
-            self.acquire("belief+", "belief-")
+            Ok(Some(NativeEvidence::default()))
         }
     }
 
@@ -920,6 +859,7 @@ mod tests {
             owner_name: "Fixture".to_owned(),
             layer: 0,
             bounds: window.geometry.bounds,
+            activation_point: Some(cua_driver_core::api::contracts::Point { x: 10.0, y: 16.0 }),
             scale_factor: Some(2.0),
             state: WindowStateKind::Visible,
             is_on_screen: true,
@@ -942,7 +882,7 @@ mod tests {
                 recipe: MacScopeRecipe {
                     accessibility: AccessibilityRecipe::ChromiumPriorStatePreserving,
                     menu: MenuSuppressionRecipe::NotApplicable,
-                    target_belief: TargetBeliefRecipe::ChromiumPointClickSlpsMakeKeyHost26_5_1Arm64,
+                    target_belief: TargetBeliefRecipe::SwiftCoordinateClick,
                 },
                 menu: MenuSuppressionPlan::NotApplicable,
             },
@@ -961,7 +901,6 @@ mod tests {
             log: Arc::clone(&log),
             containment_deadlines: Arc::new(Mutex::new(Vec::new())),
             fail_at: None,
-            poison_belief: false,
         };
         let poison = Arc::new(AtomicBool::new(false));
         let plan = scope_plan();
@@ -969,7 +908,7 @@ mod tests {
             &hooks,
             &plan,
             poison,
-            Arc::new(Mutex::new(MacFocusState::default())),
+            Arc::new(Mutex::new(MacFocusState::new(44, 99))),
         )
         .unwrap();
         assert_eq!(
@@ -986,7 +925,6 @@ mod tests {
                 "containment+",
                 "menu+",
                 "belief+",
-                "belief-",
                 "menu-",
                 "containment-",
                 "ax-",
@@ -1035,49 +973,18 @@ mod tests {
                 log: Arc::clone(&log),
                 containment_deadlines: Arc::new(Mutex::new(Vec::new())),
                 fail_at: Some(fail_at),
-                poison_belief: false,
             };
             let error = acquire_resources(
                 &hooks,
                 &scope_plan(),
                 Arc::new(AtomicBool::new(false)),
-                Arc::new(Mutex::new(MacFocusState::default())),
+                Arc::new(Mutex::new(MacFocusState::new(44, 99))),
             )
             .err()
             .unwrap();
             assert_eq!(error.phase, ErrorPhase::Preflight);
             assert_eq!(*log.lock().unwrap(), expected, "failure at {fail_at}");
         }
-    }
-
-    #[test]
-    fn partial_target_belief_rollback_emits_typed_core_invalidation_signal() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let hooks = LoggingHooks {
-            log,
-            containment_deadlines: Arc::new(Mutex::new(Vec::new())),
-            fail_at: None,
-            poison_belief: true,
-        };
-        let poison = Arc::new(AtomicBool::new(false));
-        let focus_state = Arc::new(Mutex::new(MacFocusState::default()));
-        let error = acquire_resources(
-            &hooks,
-            &scope_plan(),
-            Arc::clone(&poison),
-            Arc::clone(&focus_state),
-        )
-        .err()
-        .expect("partial belief rollback must refuse acquisition");
-
-        assert!(error.target_invalidated());
-        assert_eq!(error.details["target_poisoned"], true);
-        assert!(poison.load(Ordering::Acquire));
-        assert!(focus_state
-            .lock()
-            .expect("macOS focus coordinator poisoned")
-            .active_belief
-            .is_some());
     }
 
     #[test]
@@ -1101,12 +1008,11 @@ mod tests {
         cleanup.accessibility = Some(logged(&log, "ax-"));
         cleanup.containment = Some(logged(&log, "containment-"));
         cleanup.menu = Some(logged(&log, "menu-"));
-        cleanup.target_belief = Some(logged(&log, "belief-"));
 
         let outcome = cleanup.cleanup(test_deadline().teardown);
         assert_eq!(
             *log.lock().unwrap(),
-            vec!["belief-", "menu-", "containment-", "ax-", "posture-"]
+            vec!["menu-", "containment-", "ax-", "posture-"]
         );
         assert!(outcome.posture.restored_after_violation);
         assert_eq!(outcome.failures[0].code, ErrorCode::PostureViolated);
@@ -1125,9 +1031,9 @@ mod tests {
             }),
             test_deadline().teardown,
         );
-        cleanup.target_belief = Some(Box::new(LoggedLease {
+        cleanup.menu = Some(Box::new(LoggedLease {
             log: Arc::clone(&log),
-            release: "belief-",
+            release: "menu-",
             fail: true,
         }));
         cleanup.containment = Some(logged(&log, "containment-"));
@@ -1136,11 +1042,15 @@ mod tests {
         let outcome = cleanup.cleanup(test_deadline().teardown);
         assert_eq!(
             *log.lock().unwrap(),
-            vec!["belief-", "containment-", "ax-", "posture-"]
+            vec!["menu-", "containment-", "ax-", "posture-"]
         );
-        assert_eq!(outcome.leases.target_belief, LeaseTeardownStatus::Failed);
+        assert_eq!(outcome.leases.menu_dismissal, LeaseTeardownStatus::Failed);
+        assert_eq!(
+            outcome.leases.target_belief,
+            LeaseTeardownStatus::NotApplicable
+        );
         assert_eq!(outcome.leases.containment, LeaseTeardownStatus::Released);
-        assert_eq!(outcome.native_evidence.fields["belief-_attempted"], true);
+        assert_eq!(outcome.native_evidence.fields["menu-_attempted"], true);
         assert!(poison.load(Ordering::Acquire));
     }
 

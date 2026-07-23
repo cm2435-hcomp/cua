@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 use cua_driver_core::api::{
     capabilities::{Framework, WindowStateKind},
-    contracts::{AppId, AppRef, GeometryRevision, Rect, WindowGeneration, WindowId, WindowRef},
+    contracts::{
+        AppId, AppRef, GeometryRevision, Point, Rect, WindowGeneration, WindowId, WindowRef,
+    },
     errors::{ErrorCode, ErrorPhase, NativeError},
     observation::{
         NativeProcessHandle, NativeWindowHandle, ResolvedWindow, ResolvedWindowStamp,
@@ -111,6 +113,7 @@ pub struct MacWindowFacts {
     pub owner_name: String,
     pub layer: i32,
     pub bounds: Rect,
+    pub activation_point: Option<Point>,
     pub scale_factor: Option<f64>,
     pub state: WindowStateKind,
     pub is_on_screen: bool,
@@ -137,14 +140,14 @@ pub struct MacRelatedWindowFacts {
 }
 
 trait WindowSnapshotSource: Send + Sync {
-    fn snapshot(&self) -> Result<Vec<NativeWindowSnapshot>, NativeError>;
+    fn snapshot(&self, pid_scope: Option<i32>) -> Result<Vec<NativeWindowSnapshot>, NativeError>;
 }
 
 #[derive(Default)]
 struct SystemWindowSnapshotSource;
 
 impl WindowSnapshotSource for SystemWindowSnapshotSource {
-    fn snapshot(&self) -> Result<Vec<NativeWindowSnapshot>, NativeError> {
+    fn snapshot(&self, pid_scope: Option<i32>) -> Result<Vec<NativeWindowSnapshot>, NativeError> {
         if !permissions::status::accessibility_granted() {
             return Err(NativeError::new(
                 ErrorCode::PermissionDenied,
@@ -154,9 +157,9 @@ impl WindowSnapshotSource for SystemWindowSnapshotSource {
             ));
         }
 
-        match self.snapshot_once() {
+        match self.snapshot_once(pid_scope) {
             Ok(snapshots) => Ok(snapshots),
-            Err(_) => self.snapshot_once().map_err(|racing_pids| {
+            Err(_) => self.snapshot_once(pid_scope).map_err(|racing_pids| {
                 NativeError::new(
                     ErrorCode::WindowIdentityChanged,
                     ErrorPhase::Preflight,
@@ -173,13 +176,16 @@ impl WindowSnapshotSource for SystemWindowSnapshotSource {
 }
 
 impl SystemWindowSnapshotSource {
-    fn snapshot_once(&self) -> Result<Vec<NativeWindowSnapshot>, Vec<i32>> {
+    fn snapshot_once(&self, pid_scope: Option<i32>) -> Result<Vec<NativeWindowSnapshot>, Vec<i32>> {
         let applications_before: HashMap<i32, RunningApplicationInfo> =
             nsworkspace::running_applications()
                 .into_iter()
                 .map(|application| (application.pid, application))
                 .collect();
-        let server_windows = windows::all_windows();
+        let server_windows: Vec<_> = windows::all_windows()
+            .into_iter()
+            .filter(|window| pid_scope.is_none_or(|pid| window.pid == pid))
+            .collect();
         let mut ax_by_pid: HashMap<i32, AxWindowMatches> = HashMap::new();
         let mut snapshots = Vec::new();
 
@@ -408,8 +414,8 @@ impl MacWindowRegistry {
         }
     }
 
-    fn refresh(&self) -> Result<(), NativeError> {
-        let snapshots = self.source.snapshot()?;
+    fn refresh(&self, pid_scope: Option<i32>) -> Result<(), NativeError> {
+        let snapshots = self.source.snapshot(pid_scope)?;
         let mut state = self
             .state
             .lock()
@@ -422,7 +428,9 @@ impl MacWindowRegistry {
         let missing: Vec<_> = state
             .by_native
             .keys()
-            .filter(|key| !current_keys.contains(*key))
+            .filter(|key| {
+                pid_scope.is_none_or(|pid| key.pid == pid) && !current_keys.contains(*key)
+            })
             .cloned()
             .collect();
         for key in missing {
@@ -512,7 +520,22 @@ impl MacWindowRegistry {
     }
 
     fn list(&self, app: Option<&AppRef>) -> Result<Vec<WindowRef>, NativeError> {
-        self.refresh()?;
+        let pid_scope = match app {
+            None => None,
+            Some(app) if !app.running => return Ok(Vec::new()),
+            Some(app) => Some(app.pid.and_then(|pid| i32::try_from(pid).ok()).ok_or_else(
+                || {
+                    NativeError::new(
+                        ErrorCode::WindowIdentityChanged,
+                        ErrorPhase::Preflight,
+                        false,
+                        "running app reference has no valid process id",
+                    )
+                    .with_detail("app_id", app.id.to_string())
+                },
+            )?),
+        };
+        self.refresh(pid_scope)?;
         let state = self
             .state
             .lock()
@@ -533,31 +556,24 @@ impl MacWindowRegistry {
     }
 
     fn entry(&self, id: &WindowId, app: Option<&AppRef>) -> Result<RegistryEntry, NativeError> {
-        self.refresh()?;
+        let pid_scope = {
+            let state = self
+                .state
+                .lock()
+                .expect("macOS window registry lock poisoned");
+            match state.by_id.get(id) {
+                Some(entry) => entry.key.pid,
+                None => return Err(unknown_window_error(&state, id)),
+            }
+        };
+        self.refresh(Some(pid_scope))?;
         let state = self
             .state
             .lock()
             .expect("macOS window registry lock poisoned");
         let entry = match state.by_id.get(id) {
             Some(entry) => entry,
-            None => {
-                let (code, message) = match state.tombstones.get(id) {
-                    Some(WindowTombstone::IdentityChanged) => (
-                        ErrorCode::WindowIdentityChanged,
-                        "native window identity changed",
-                    ),
-                    Some(WindowTombstone::Missing) => (
-                        ErrorCode::WindowNotFound,
-                        "window closed or disappeared from WindowServer",
-                    ),
-                    None => (
-                        ErrorCode::WindowNotFound,
-                        "window id is not known to the macOS registry",
-                    ),
-                };
-                return Err(NativeError::new(code, ErrorPhase::Preflight, true, message)
-                    .with_detail("window_id", id.to_string()));
-            }
+            None => return Err(unknown_window_error(&state, id)),
         };
         if let Some(app) = app {
             if entry.public.app.id != app.id {
@@ -809,6 +825,25 @@ impl MacWindowRegistry {
         result.sort_by_key(|facts| facts.cg_window_id);
         Ok(result)
     }
+}
+
+fn unknown_window_error(state: &RegistryState, id: &WindowId) -> NativeError {
+    let (code, message) = match state.tombstones.get(id) {
+        Some(WindowTombstone::IdentityChanged) => (
+            ErrorCode::WindowIdentityChanged,
+            "native window identity changed",
+        ),
+        Some(WindowTombstone::Missing) => (
+            ErrorCode::WindowNotFound,
+            "window closed or disappeared from WindowServer",
+        ),
+        None => (
+            ErrorCode::WindowNotFound,
+            "window id is not known to the macOS registry",
+        ),
+    };
+    NativeError::new(code, ErrorPhase::Preflight, true, message)
+        .with_detail("window_id", id.to_string())
 }
 
 struct RelatedNativeSnapshot {
@@ -1073,6 +1108,12 @@ fn facts_for_entry(entry: &RegistryEntry) -> MacWindowFacts {
         owner_name: entry.snapshot.owner_name.clone(),
         layer: entry.snapshot.layer,
         bounds: entry.snapshot.bounds,
+        activation_point: unsafe {
+            bindings::copy_point_attr(entry.snapshot.ax_identity.as_ptr(), "AXActivationPoint")
+                .ok()
+                .flatten()
+                .map(|(x, y)| Point { x, y })
+        },
         scale_factor: entry.snapshot.scale_factor,
         state: window_state(&entry.snapshot),
         is_on_screen: entry.snapshot.is_on_screen,
@@ -1129,12 +1170,18 @@ mod tests {
     }
 
     impl WindowSnapshotSource for FakeSnapshotSource {
-        fn snapshot(&self) -> Result<Vec<NativeWindowSnapshot>, NativeError> {
+        fn snapshot(
+            &self,
+            pid_scope: Option<i32>,
+        ) -> Result<Vec<NativeWindowSnapshot>, NativeError> {
             Ok(self
                 .snapshots
                 .lock()
                 .expect("fake source lock poisoned")
-                .clone())
+                .iter()
+                .filter(|snapshot| pid_scope.is_none_or(|pid| snapshot.key.pid == pid))
+                .cloned()
+                .collect())
         }
     }
 
@@ -1152,14 +1199,32 @@ mod tests {
         title: Option<&str>,
         ax_label: &str,
     ) -> NativeWindowSnapshot {
+        snapshot_for_pid(
+            101,
+            bundle_id,
+            process_generation,
+            cg_window_id,
+            title,
+            ax_label,
+        )
+    }
+
+    fn snapshot_for_pid(
+        pid: i32,
+        bundle_id: &str,
+        process_generation: u64,
+        cg_window_id: u32,
+        title: Option<&str>,
+        ax_label: &str,
+    ) -> NativeWindowSnapshot {
         NativeWindowSnapshot {
             key: NativeWindowKey {
-                pid: 101,
+                pid,
                 process_generation,
                 cg_window_id,
             },
             process: ProcessSnapshot {
-                pid: 101,
+                pid,
                 generation: process_generation,
                 name: Some("Fixture".to_owned()),
                 bundle_id: Some(bundle_id.to_owned()),
@@ -1332,6 +1397,49 @@ mod tests {
         let windows = registry.list_windows(None).await.unwrap();
         assert_eq!(windows.len(), 2);
         assert_ne!(windows[0].app.id, windows[1].app.id);
+    }
+
+    #[tokio::test]
+    async fn scoped_refresh_never_tombstones_an_unrelated_process() {
+        let (registry, source, _) = registry();
+        let first = snapshot_for_pid(101, "com.example.first", 10, 44, None, "ax-1");
+        let second = snapshot_for_pid(202, "com.example.second", 20, 45, None, "ax-2");
+        source.replace(vec![first.clone(), second.clone()]);
+        let initial = registry.list_windows(None).await.unwrap();
+        let first_window = initial
+            .iter()
+            .find(|window| window.app.pid == Some(101))
+            .unwrap()
+            .clone();
+        let second_window = initial
+            .iter()
+            .find(|window| window.app.pid == Some(202))
+            .unwrap()
+            .clone();
+
+        source.replace(vec![first]);
+        assert_eq!(
+            registry
+                .list_windows(Some(&first_window.app))
+                .await
+                .unwrap(),
+            vec![first_window]
+        );
+        assert!(registry
+            .state
+            .lock()
+            .expect("macOS window registry lock poisoned")
+            .by_id
+            .contains_key(&second_window.id));
+
+        source.replace(vec![second]);
+        assert_eq!(
+            registry
+                .rehydrate(&second_window.id, Some(&second_window.app))
+                .await
+                .unwrap(),
+            second_window
+        );
     }
 
     #[tokio::test]

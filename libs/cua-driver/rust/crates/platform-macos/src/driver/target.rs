@@ -204,25 +204,46 @@ impl Drop for MacTargetState {
     }
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct MacActiveBelief {
-    pub action_id: cua_driver_core::api::contracts::ActionId,
-    pub pid: i32,
-    pub cg_window_id: u32,
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct MacFocusState {
     pub shutdown: bool,
-    pub active_belief: Option<MacActiveBelief>,
+    pub pid: i32,
+    pub cg_window_id: u32,
+    pub application_is_active: bool,
+    pub application_believes_it_is_active: bool,
+    pub application_believes_it_has_focus: bool,
 }
 
-#[derive(Default)]
+impl MacFocusState {
+    pub(crate) fn new(pid: i32, cg_window_id: u32) -> Self {
+        let application_is_active = crate::apps::frontmost_pid() == Some(pid);
+        Self {
+            shutdown: false,
+            pid,
+            cg_window_id,
+            application_is_active,
+            application_believes_it_is_active: application_is_active,
+            application_believes_it_has_focus: application_is_active,
+        }
+    }
+}
+
 pub struct MacTargetFocusCoordinator {
     state: Arc<Mutex<MacFocusState>>,
+    focus_taps: Option<crate::focus_steal::TargetFocusTapRegistration>,
 }
 
 impl MacTargetFocusCoordinator {
+    pub(crate) fn new(pid: i32, cg_window_id: u32) -> Result<Self, NativeError> {
+        let state = Arc::new(Mutex::new(MacFocusState::new(pid, cg_window_id)));
+        let focus_taps =
+            crate::focus_steal::TargetFocusTapRegistration::start(pid, Arc::downgrade(&state))?;
+        Ok(Self {
+            state,
+            focus_taps: Some(focus_taps),
+        })
+    }
+
     pub(crate) fn state_handle(&self) -> Arc<Mutex<MacFocusState>> {
         Arc::clone(&self.state)
     }
@@ -238,53 +259,28 @@ impl MacTargetFocusCoordinator {
 #[async_trait]
 impl TargetFocusCoordinator for MacTargetFocusCoordinator {
     async fn shutdown(&mut self) -> Result<(), NativeError> {
+        if let Some(mut focus_taps) = self.focus_taps.take() {
+            focus_taps.close();
+        }
         let mut state = self.state.lock().expect("macOS focus coordinator poisoned");
         state.shutdown = true;
-        if let Some(active) = &state.active_belief {
-            crate::input::slps_make_key::post_target_only(
-                active.pid,
-                active.cg_window_id,
-                &[crate::input::slps_make_key::SlpsMakeKeyState::RemoveKey],
-            )
-            .map_err(|error| {
-                NativeError::new(
-                    cua_driver_core::api::errors::ErrorCode::Internal,
-                    cua_driver_core::api::errors::ErrorPhase::Verify,
-                    false,
-                    format!("SLPS remove-key retry failed during target teardown: {error}"),
-                )
-                .with_detail("action_id", active.action_id.to_string())
-                .with_detail("pid", active.pid)
-                .with_detail("cg_window_id", active.cg_window_id)
-            })?;
-            state.active_belief = None;
-        }
+        state.application_believes_it_is_active = false;
+        state.application_believes_it_has_focus = false;
         Ok(())
     }
 }
 
 impl Drop for MacTargetFocusCoordinator {
     fn drop(&mut self) {
+        if let Some(mut focus_taps) = self.focus_taps.take() {
+            focus_taps.close();
+        }
         let Ok(mut state) = self.state.lock() else {
             tracing::error!("macOS focus coordinator lock was poisoned during final drop");
             return;
         };
-        let Some(active) = &state.active_belief else {
-            return;
-        };
-        match crate::input::slps_make_key::post_target_only(
-            active.pid,
-            active.cg_window_id,
-            &[crate::input::slps_make_key::SlpsMakeKeyState::RemoveKey],
-        ) {
-            Ok(()) => state.active_belief = None,
-            Err(error) => tracing::error!(
-                error = %error,
-                action_id = %active.action_id,
-                pid = active.pid,
-                cg_window_id = active.cg_window_id,
-                "final target-only SLPS remove-key record failed during coordinator drop"
-            ),
-        }
+        state.shutdown = true;
+        state.application_believes_it_is_active = false;
+        state.application_believes_it_has_focus = false;
     }
 }
