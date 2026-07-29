@@ -119,7 +119,7 @@ fn synthesized_action_is_recent(pid: i32) -> bool {
 /// Controller-lifetime event-tap inputs corresponding to the helper's
 /// process-notification, keyboard, and per-target mouse observation.
 pub(crate) struct TargetFocusTapRegistration {
-    close: mpsc::Sender<()>,
+    close: Option<mpsc::Sender<()>>,
     run_loop: Arc<AtomicUsize>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -128,7 +128,7 @@ impl TargetFocusTapRegistration {
     pub(crate) fn start(
         pid: i32,
         state: Weak<Mutex<crate::driver::target::MacFocusState>>,
-    ) -> Result<Self, NativeError> {
+    ) -> Self {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (close_tx, close_rx) = mpsc::channel();
         let run_loop = Arc::new(AtomicUsize::new(0));
@@ -145,19 +145,33 @@ impl TargetFocusTapRegistration {
                     &started_tx,
                     &close_rx,
                 )
-            })
-            .map_err(|error| {
-                focus_tap_error(format!("failed to spawn focus-tap thread: {error}"))
-            })?;
+            });
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(error) => {
+                tracing::warn!(
+                    pid,
+                    %error,
+                    "macOS target focus-tap thread was unavailable; current state will reconcile during action preparation"
+                );
+                return Self::inactive();
+            }
+        };
         match started_rx.recv_timeout(FOCUS_TAP_HANDSHAKE_TIMEOUT) {
-            Ok(Ok(())) => Ok(Self {
-                close: close_tx,
+            Ok(Ok(())) => Self {
+                close: Some(close_tx),
                 run_loop,
                 thread: Some(thread),
-            }),
+            },
             Ok(Err(error)) => {
                 let _ = thread.join();
-                Err(error)
+                tracing::warn!(
+                    pid,
+                    code = ?error.code,
+                    message = %error.message,
+                    "macOS target focus taps were unavailable; current state will reconcile during action preparation"
+                );
+                Self::inactive()
             }
             Err(_) => {
                 let _ = close_tx.send(());
@@ -166,10 +180,20 @@ impl TargetFocusTapRegistration {
                     unsafe { CFRunLoopStop(run_loop as *mut c_void) };
                 }
                 let _ = thread.join();
-                Err(focus_tap_error(
-                    "focus event-tap registration exceeded its bounded handshake",
-                ))
+                tracing::warn!(
+                    pid,
+                    "macOS target focus-tap registration exceeded its bounded handshake; current state will reconcile during action preparation"
+                );
+                Self::inactive()
             }
+        }
+    }
+
+    fn inactive() -> Self {
+        Self {
+            close: None,
+            run_loop: Arc::new(AtomicUsize::new(0)),
+            thread: None,
         }
     }
 
@@ -177,7 +201,9 @@ impl TargetFocusTapRegistration {
         if self.thread.is_none() {
             return;
         }
-        let _ = self.close.send(());
+        if let Some(close) = self.close.take() {
+            let _ = close.send(());
+        }
         let run_loop = self.run_loop.load(Ordering::Acquire);
         if run_loop != 0 {
             unsafe { CFRunLoopStop(run_loop as *mut c_void) };

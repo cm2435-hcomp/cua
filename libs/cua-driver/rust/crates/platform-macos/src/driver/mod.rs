@@ -13,7 +13,6 @@ pub mod interaction;
 pub mod lifecycle;
 pub mod menu;
 pub mod observation;
-pub mod posture;
 pub mod settlement;
 pub mod target;
 pub mod windows;

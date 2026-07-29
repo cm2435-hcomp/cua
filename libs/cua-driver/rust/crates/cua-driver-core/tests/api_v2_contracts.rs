@@ -11,8 +11,7 @@ use async_trait::async_trait;
 use cua_driver_core::{
     api::*,
     protocol::{
-        V2Command, V2Failure, V2RequestEnvelope, V2ResponseBody, V2ResponseEnvelope,
-        V2_PROTOCOL_VERSION,
+        V2Command, V2RequestEnvelope, V2ResponseBody, V2ResponseEnvelope, V2_PROTOCOL_VERSION,
     },
 };
 use tokio::sync::Notify;
@@ -129,72 +128,11 @@ fn v2_protocol_rejects_schema_drift_and_version_mismatch() {
         windows: vec![window_ref()],
         reused_running_app: false,
         verification: EffectVerification::EffectVerified,
-        posture: PostureResult::default(),
         settlement: SettlementEvidence::initial(),
     };
     let mut invalid_launch = serde_json::to_value(launch).unwrap();
     invalid_launch["verification"] = serde_json::json!("dispatch_verified");
     assert!(serde_json::from_value::<LaunchResult>(invalid_launch).is_err());
-}
-
-#[test]
-fn posture_unverifiable_has_a_distinct_wire_code_and_safety_precedence() {
-    let unverifiable = NativeError::new(
-        ErrorCode::PostureUnverifiable,
-        ErrorPhase::Verify,
-        false,
-        "required posture witness was incomplete without an observed disturbance",
-    );
-    let response = V2ResponseEnvelope::<serde_json::Value> {
-        request_id: "posture-request".to_owned(),
-        protocol_version: V2_PROTOCOL_VERSION,
-        body: V2ResponseBody::Error(V2Failure {
-            error: unverifiable.clone(),
-        }),
-    };
-    let encoded = serde_json::to_value(&response).unwrap();
-    assert_eq!(
-        encoded["error"]["code"],
-        serde_json::json!("posture_unverifiable")
-    );
-    let decoded: NativeError = serde_json::from_value(encoded["error"].clone()).unwrap();
-    assert_eq!(decoded, unverifiable);
-
-    let dispatch = NativeError::new(
-        ErrorCode::DispatchFailed,
-        ErrorPhase::Dispatch,
-        false,
-        "dispatch failed",
-    );
-    let primary = NativeError::primary(vec![unverifiable.clone(), dispatch]).unwrap();
-    assert_eq!(primary.code, ErrorCode::PostureUnverifiable);
-    let violation = NativeError::new(
-        ErrorCode::PostureViolated,
-        ErrorPhase::Verify,
-        false,
-        "posture changed",
-    );
-    let primary = NativeError::primary(vec![violation, unverifiable]).unwrap();
-    assert_eq!(primary.code, ErrorCode::PostureViolated);
-
-    let incomplete = PostureResult {
-        held: false,
-        ..PostureResult::default()
-    };
-    assert_eq!(
-        NativeError::from_posture(&incomplete).unwrap().code,
-        ErrorCode::PostureUnverifiable
-    );
-    let observed = PostureResult {
-        held: false,
-        physical_cursor_moved: true,
-        ..PostureResult::default()
-    };
-    assert_eq!(
-        NativeError::from_posture(&observed).unwrap().code,
-        ErrorCode::PostureViolated
-    );
-    assert!(NativeError::from_posture(&PostureResult::default()).is_none());
 }
 
 #[test]
@@ -401,11 +339,8 @@ struct FakePlatform {
     semantic_verification_fail: std::sync::atomic::AtomicBool,
     observation_role: Mutex<Option<String>>,
     cleanup_failure_count: AtomicUsize,
-    cleanup_posture_violated: std::sync::atomic::AtomicBool,
     settle_pending: std::sync::atomic::AtomicBool,
     launch_fail: std::sync::atomic::AtomicBool,
-    launch_posture_unverifiable: std::sync::atomic::AtomicBool,
-    launch_posture_violation: std::sync::atomic::AtomicBool,
     refresh_geometry_during_observe: std::sync::atomic::AtomicBool,
     dispatch_entered: Notify,
 }
@@ -420,7 +355,6 @@ struct FakeScopeCleanup {
     ordering: Arc<Mutex<Vec<&'static str>>>,
     cleanup_count: Arc<AtomicUsize>,
     failure_count: usize,
-    posture_violated: bool,
     leases: ScopeLeaseTeardown,
 }
 
@@ -428,12 +362,6 @@ impl ScopeCleanup for FakeScopeCleanup {
     fn cleanup(&mut self, _deadline: Instant) -> ScopeTeardownOutcome {
         self.cleanup_count.fetch_add(1, Ordering::SeqCst);
         self.ordering.lock().unwrap().push("scope_released");
-        let mut posture = PostureResult::default();
-        if self.posture_violated {
-            posture.held = false;
-            posture.frontmost_changed = true;
-            posture.restored_after_violation = true;
-        }
         let failures = (0..self.failure_count)
             .map(|index| {
                 NativeError::new(
@@ -449,7 +377,6 @@ impl ScopeCleanup for FakeScopeCleanup {
             })
             .collect();
         ScopeTeardownOutcome {
-            posture,
             native_evidence: NativeEvidence {
                 fields: BTreeMap::from([(
                     "fake_cleanup".to_owned(),
@@ -499,16 +426,13 @@ impl LifecycleProvider for FakePlatform {
     async fn launch_background(
         &self,
         _app: AppSelector,
-        posture: &mut LaunchPostureScope,
+        launch_scope: &mut LaunchScope,
     ) -> Result<NativeLaunch, NativeError> {
-        posture.begin_launch();
-        posture.record_partial_result(app_ref(), vec![window_ref()]);
-        posture.posture.held = !self.launch_posture_unverifiable.load(Ordering::SeqCst)
-            && !self.launch_posture_violation.load(Ordering::SeqCst);
-        posture.posture.frontmost_changed = self.launch_posture_violation.load(Ordering::SeqCst);
-        posture.pending_settlement = Some(PendingSettlementEvidence {
+        launch_scope.begin_launch();
+        launch_scope.record_partial_result(app_ref(), vec![window_ref()]);
+        launch_scope.pending_settlement = Some(PendingSettlementEvidence {
             state: PendingSettlementState::Pending,
-            trigger_action_id: posture
+            trigger_action_id: launch_scope
                 .action_id()
                 .cloned()
                 .expect("controller launch scopes carry their action id"),
@@ -529,7 +453,6 @@ impl LifecycleProvider for FakePlatform {
             app: app_ref(),
             windows: vec![window_ref()],
             reused_running_app: false,
-            posture: posture.posture.clone(),
             settlement: SettlementEvidence::initial(),
         })
     }
@@ -553,7 +476,6 @@ async fn post_dispatch_launch_failure_keeps_exact_partial_and_pending_evidence()
         action_id,
         app,
         windows,
-        posture,
         pending_settlement: Some(pending),
         ..
     }) = error.partial_evidence.as_deref()
@@ -562,39 +484,7 @@ async fn post_dispatch_launch_failure_keeps_exact_partial_and_pending_evidence()
     };
     assert_eq!(app.as_ref(), Some(&app_ref()));
     assert_eq!(windows, &vec![window_ref()]);
-    assert!(posture.held);
     assert_eq!(pending.trigger_action_id, *action_id);
-}
-
-#[tokio::test]
-async fn launch_posture_distinguishes_unverifiable_from_observed_violation() {
-    for (unverifiable, violation, expected) in [
-        (true, false, ErrorCode::PostureUnverifiable),
-        (false, true, ErrorCode::PostureViolated),
-    ] {
-        let platform = Arc::new(FakePlatform::default());
-        platform
-            .launch_posture_unverifiable
-            .store(unverifiable, Ordering::SeqCst);
-        platform
-            .launch_posture_violation
-            .store(violation, Ordering::SeqCst);
-        let controller = DriverController::new(platform, PlatformName::Macos, "test-os");
-        let error = controller
-            .launch_app(LaunchAppRequest {
-                app: AppSelector::BundleId {
-                    bundle_id: "com.example.fixture".to_owned(),
-                },
-            })
-            .await
-            .expect_err("non-held launch posture must fail");
-        assert_eq!(error.code, expected);
-        assert_eq!(error.phase, ErrorPhase::Verify);
-        assert!(matches!(
-            error.partial_evidence.as_deref(),
-            Some(PartialEvidence::Launch { posture, .. }) if !posture.held
-        ));
-    }
 }
 
 #[async_trait]
@@ -972,9 +862,7 @@ impl InteractionProvider<FakeTargetState, FakeFocus> for FakePlatform {
             }
         };
         let acquisition = ScopeLeaseAcquisition {
-            posture_witness: LeaseDecision::Acquired,
             accessibility: decision(plan.requirements.accessibility),
-            containment: decision(plan.requirements.containment),
             menu_dismissal: decision(plan.requirements.menu_dismissal),
             target_belief: decision(plan.requirements.target_belief),
         };
@@ -983,9 +871,7 @@ impl InteractionProvider<FakeTargetState, FakeFocus> for FakePlatform {
             LeaseDecision::NotApplicable => LeaseTeardownStatus::NotApplicable,
         };
         let mut teardown_leases = ScopeLeaseTeardown {
-            posture_witness: teardown(acquisition.posture_witness),
             accessibility: teardown(acquisition.accessibility),
-            containment: teardown(acquisition.containment),
             menu_dismissal: teardown(acquisition.menu_dismissal),
             target_belief: teardown(acquisition.target_belief),
         };
@@ -1001,7 +887,6 @@ impl InteractionProvider<FakeTargetState, FakeFocus> for FakePlatform {
                 ordering: Arc::clone(&self.ordering),
                 cleanup_count: Arc::clone(&self.cleanup_count),
                 failure_count,
-                posture_violated: self.cleanup_posture_violated.load(Ordering::SeqCst),
                 leases: teardown_leases,
             }),
         ))
@@ -1268,7 +1153,7 @@ async fn controller_preserves_target_state_and_consumes_at_dispatch_boundary() {
         .as_ref()
         .expect("receipt carries typed scope evidence");
     assert_eq!(
-        scope_evidence.acquisition.posture_witness,
+        scope_evidence.acquisition.target_belief,
         LeaseDecision::Acquired
     );
     assert_eq!(
@@ -1828,9 +1713,7 @@ fn interaction_scope_release_is_idempotent_and_accumulates_teardown_evidence() {
     let cleanup_count = Arc::new(AtomicUsize::new(0));
     let ordering = Arc::new(Mutex::new(Vec::new()));
     let acquisition = ScopeLeaseAcquisition {
-        posture_witness: LeaseDecision::Acquired,
         accessibility: LeaseDecision::Acquired,
-        containment: LeaseDecision::Acquired,
         menu_dismissal: LeaseDecision::NotApplicable,
         target_belief: LeaseDecision::Acquired,
     };
@@ -1850,11 +1733,8 @@ fn interaction_scope_release_is_idempotent_and_accumulates_teardown_evidence() {
             ordering,
             cleanup_count: Arc::clone(&cleanup_count),
             failure_count: 2,
-            posture_violated: true,
             leases: ScopeLeaseTeardown {
-                posture_witness: LeaseTeardownStatus::Released,
                 accessibility: LeaseTeardownStatus::Released,
-                containment: LeaseTeardownStatus::Released,
                 menu_dismissal: LeaseTeardownStatus::NotApplicable,
                 target_belief: LeaseTeardownStatus::Failed,
             },
@@ -1867,8 +1747,6 @@ fn interaction_scope_release_is_idempotent_and_accumulates_teardown_evidence() {
     assert_eq!(first, second);
     assert_eq!(first.failures.len(), 2);
     assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
-    assert!(!scope.posture.held);
-    assert!(scope.posture.restored_after_violation);
     assert_eq!(
         scope.native_evidence.fields.get("fake_cleanup"),
         Some(&serde_json::json!("complete"))
@@ -1887,14 +1765,11 @@ fn interaction_scope_release_is_idempotent_and_accumulates_teardown_evidence() {
 }
 
 #[tokio::test]
-async fn posture_violation_remains_primary_and_keeps_every_cleanup_failure() {
+async fn dispatch_failure_remains_primary_and_keeps_every_cleanup_failure() {
     let platform = Arc::new(FakePlatform::default());
     platform.dispatch_fail.store(true, Ordering::SeqCst);
     platform.settle_pending.store(true, Ordering::SeqCst);
     platform.cleanup_failure_count.store(2, Ordering::SeqCst);
-    platform
-        .cleanup_posture_violated
-        .store(true, Ordering::SeqCst);
     let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
     let client = id("failure-client", ClientId::parse);
     let observed = controller
@@ -1929,10 +1804,9 @@ async fn posture_violation_remains_primary_and_keeps_every_cleanup_failure() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.code, ErrorCode::PostureViolated);
-    assert_eq!(error.related_failures.len(), 4);
+    assert_eq!(error.code, ErrorCode::DispatchFailed);
+    assert_eq!(error.related_failures.len(), 3);
     for expected in [
-        ErrorCode::DispatchFailed,
         ErrorCode::UiNotSettled,
         ErrorCode::VerificationFailed,
         ErrorCode::Internal,
@@ -1944,7 +1818,6 @@ async fn posture_violation_remains_primary_and_keeps_every_cleanup_failure() {
     }
     let Some(PartialEvidence::Action {
         dispatch: None,
-        posture,
         native_evidence,
         pending_settlement: Some(_),
         ..
@@ -1952,8 +1825,6 @@ async fn posture_violation_remains_primary_and_keeps_every_cleanup_failure() {
     else {
         panic!("post-dispatch failure must keep scope and settlement evidence");
     };
-    assert!(!posture.held);
-    assert!(posture.restored_after_violation);
     assert_eq!(
         native_evidence
             .interaction_scope

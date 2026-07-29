@@ -14,8 +14,7 @@ use cua_driver_core::{
             WindowRef,
         },
         errors::{ErrorCode, ErrorPhase, NativeError},
-        interaction::PostureResult,
-        platform::{LaunchPostureScope, LifecycleProvider, NativeLaunch, WindowProvider},
+        platform::{LaunchScope, LifecycleProvider, NativeLaunch, WindowProvider},
         settlement::{
             PendingSettlementEvidence, PendingSettlementState, SettledState, SettlementEvidence,
             SettlementSignal,
@@ -33,7 +32,7 @@ use crate::{
     permissions, windows,
 };
 
-use super::{posture::MacLaunchPostureWitness, windows::MacWindowRegistry};
+use super::windows::MacWindowRegistry;
 
 const LAUNCH_DEADLINE: Duration = Duration::from_secs(12);
 const WINDOW_QUIET_WINDOW: Duration = Duration::from_millis(100);
@@ -88,7 +87,7 @@ impl LifecycleProvider for MacLifecycle {
     async fn launch_background(
         &self,
         selector: AppSelector,
-        posture_scope: &mut LaunchPostureScope,
+        launch_scope: &mut LaunchScope,
     ) -> Result<NativeLaunch, NativeError> {
         if !permissions::status::accessibility_granted() {
             return Err(NativeError::new(
@@ -110,18 +109,16 @@ impl LifecycleProvider for MacLifecycle {
                 let started = Instant::now();
                 let deadline = started + LAUNCH_DEADLINE;
                 let mut events = self.workspace_events.subscribe();
-                let mut witness = MacLaunchPostureWitness::begin(deadline)?;
-                witness.set_target(application.pid)?;
                 let app = app_ref_for_running(application);
                 let generation = application
                     .process_generation
                     .expect("reusable_existing_launch requires an exact process generation");
-                let settlement_action_id = posture_scope
+                let settlement_action_id = launch_scope
                     .action_id()
                     .cloned()
                     .unwrap_or_else(ActionId::new);
-                posture_scope.record_partial_result(app.clone(), Vec::new());
-                posture_scope.pending_settlement = Some(pending_launch_evidence(
+                launch_scope.record_partial_result(app.clone(), Vec::new());
+                launch_scope.pending_settlement = Some(pending_launch_evidence(
                     &settlement_action_id,
                     "macos_launch_reuse",
                     started,
@@ -130,7 +127,7 @@ impl LifecycleProvider for MacLifecycle {
                 ));
                 let result = match self.windows.list_windows(Some(&app)).await {
                     Ok(baseline_windows) => {
-                        posture_scope.record_partial_result(app.clone(), baseline_windows.clone());
+                        launch_scope.record_partial_result(app.clone(), baseline_windows.clone());
                         wait_for_stable_windows(
                             &self.windows,
                             LaunchWait {
@@ -145,47 +142,33 @@ impl LifecycleProvider for MacLifecycle {
                                 deadline,
                             },
                             &mut events,
-                            &mut witness,
-                            posture_scope,
+                            launch_scope,
                         )
                         .await
                     }
                     Err(error) => Err(error),
                 };
-                let (posture, native_evidence) = witness.finish();
-                posture_scope.posture = posture.clone();
-                posture_scope.native_evidence = native_evidence;
                 if result.is_ok() {
-                    posture_scope.pending_settlement = None;
+                    launch_scope.pending_settlement = None;
                 }
-                let posture_failure = posture_failure(&posture, Some(&app), posture_scope);
-                return match (result, posture_failure) {
-                    (Ok(stable), None) => Ok(NativeLaunch {
-                        app,
-                        windows: stable.windows,
-                        reused_running_app: true,
-                        posture,
-                        settlement: launch_settlement(
-                            "macos_launch_reuse",
-                            started,
-                            false,
-                            stable.window_list_changed,
-                            stable.windows_empty,
-                        ),
-                    }),
-                    (Ok(_), Some(posture_error)) => Err(posture_error),
-                    (Err(error), None) => Err(error),
-                    (Err(error), Some(posture_error)) => {
-                        Err(NativeError::primary(vec![error, posture_error])
-                            .expect("launch failures are nonempty"))
-                    }
-                };
+                return result.map(|stable| NativeLaunch {
+                    app,
+                    windows: stable.windows,
+                    reused_running_app: true,
+                    settlement: launch_settlement(
+                        "macos_launch_reuse",
+                        started,
+                        false,
+                        stable.window_list_changed,
+                        stable.windows_empty,
+                    ),
+                });
             }
         }
 
         let started = Instant::now();
         let deadline = started + LAUNCH_DEADLINE;
-        let settlement_action_id = posture_scope
+        let settlement_action_id = launch_scope
             .action_id()
             .cloned()
             .unwrap_or_else(ActionId::new);
@@ -196,11 +179,7 @@ impl LifecycleProvider for MacLifecycle {
             Vec::new()
         };
         let mut events = self.workspace_events.subscribe();
-        // All posture streams, exact baselines and containment must be live
-        // before this call records or performs any launch side effect.
-        let mut witness =
-            begin_launch_after_witness(posture_scope, MacLaunchPostureWitness::begin(deadline))?;
-        posture_scope.pending_settlement = Some(pending_launch_evidence(
+        launch_scope.pending_settlement = Some(pending_launch_evidence(
             &settlement_action_id,
             "macos_background_launch",
             started,
@@ -215,16 +194,13 @@ impl LifecycleProvider for MacLifecycle {
             ..Default::default()
         };
         let completion_timeout = deadline.saturating_duration_since(Instant::now());
-        let completion_containment = witness.completion_containment();
+        launch_scope.begin_launch();
         let dispatch = tokio::task::spawn_blocking(move || {
             nsworkspace::open_application_pid_with_timeout(
                 &launch_ref,
                 &config,
                 completion_timeout,
-                move |pid| {
-                    let _ =
-                        completion_containment.narrow_to_target(pid, Duration::from_millis(250));
-                },
+                |_| {},
             )
         })
         .await
@@ -233,99 +209,80 @@ impl LifecycleProvider for MacLifecycle {
 
         let attempt = match dispatch {
             Err(error) => Err(error),
-            Ok(pid) => match witness.set_target(pid) {
-                Err(error) => Err(error),
-                Ok(()) => {
-                    posture_scope.pending_settlement = Some(pending_launch_evidence(
-                        &settlement_action_id,
-                        "macos_background_launch",
-                        started,
-                        vec![
-                            SettlementSignal::DispatchStarted,
-                            SettlementSignal::DispatchComplete,
-                        ],
-                        Vec::new(),
-                    ));
-                    match nsworkspace::process_generation(pid) {
-                        None => Err(launch_error(
-                            "NSWorkspace returned a pid without an exact live process generation",
-                        )
-                        .with_detail("pid", pid)),
-                        Some(generation) => match wait_for_registered_application(
-                            pid,
-                            generation,
-                            &resolved,
-                            deadline,
-                            &mut events,
-                            nsworkspace::running_application,
-                        )
-                        .await
-                        {
-                            Err(error) => Err(error),
-                            Ok(application) => {
-                                witness.drain_events();
-                                let app = app_ref_for_running(&application);
-                                posture_scope.record_partial_result(app.clone(), Vec::new());
-                                wait_for_stable_windows(
-                                    &self.windows,
-                                    LaunchWait {
-                                        app: &app,
-                                        pid,
-                                        expected_generation: generation,
-                                        baseline_windows: &baseline_windows,
-                                        dispatched: true,
-                                        settlement_action_id: &settlement_action_id,
-                                        profile: "macos_background_launch",
-                                        started,
-                                        deadline,
-                                    },
-                                    &mut events,
-                                    &mut witness,
-                                    posture_scope,
-                                )
-                                .await
-                                .map(|stable| LaunchAttempt {
-                                    reused_running_app: preexisting.as_ref().is_some_and(|prior| {
-                                        same_process_identity(prior, &application)
-                                    }),
-                                    app,
-                                    stable,
-                                })
-                            }
-                        },
-                    }
-                }
-            },
-        };
-        let (posture, native_evidence) = witness.finish();
-        posture_scope.posture = posture.clone();
-        posture_scope.native_evidence = native_evidence;
-        if attempt.is_ok() {
-            posture_scope.pending_settlement = None;
-        }
-        let posture_failure =
-            posture_failure(&posture, posture_scope.partial_app.as_ref(), posture_scope);
-        match (attempt, posture_failure) {
-            (Ok(attempt), None) => Ok(NativeLaunch {
-                app: attempt.app,
-                windows: attempt.stable.windows,
-                reused_running_app: attempt.reused_running_app,
-                posture,
-                settlement: launch_settlement(
+            Ok(pid) => {
+                launch_scope.pending_settlement = Some(pending_launch_evidence(
+                    &settlement_action_id,
                     "macos_background_launch",
                     started,
-                    true,
-                    attempt.stable.window_list_changed,
-                    attempt.stable.windows_empty,
-                ),
-            }),
-            (Ok(_), Some(posture_error)) => Err(posture_error),
-            (Err(error), None) => Err(error),
-            (Err(error), Some(posture_error)) => {
-                Err(NativeError::primary(vec![error, posture_error])
-                    .expect("launch failures are nonempty"))
+                    vec![
+                        SettlementSignal::DispatchStarted,
+                        SettlementSignal::DispatchComplete,
+                    ],
+                    Vec::new(),
+                ));
+                match nsworkspace::process_generation(pid) {
+                    None => Err(launch_error(
+                        "NSWorkspace returned a pid without an exact live process generation",
+                    )
+                    .with_detail("pid", pid)),
+                    Some(generation) => match wait_for_registered_application(
+                        pid,
+                        generation,
+                        &resolved,
+                        deadline,
+                        &mut events,
+                        nsworkspace::running_application,
+                    )
+                    .await
+                    {
+                        Err(error) => Err(error),
+                        Ok(application) => {
+                            let app = app_ref_for_running(&application);
+                            launch_scope.record_partial_result(app.clone(), Vec::new());
+                            wait_for_stable_windows(
+                                &self.windows,
+                                LaunchWait {
+                                    app: &app,
+                                    pid,
+                                    expected_generation: generation,
+                                    baseline_windows: &baseline_windows,
+                                    dispatched: true,
+                                    settlement_action_id: &settlement_action_id,
+                                    profile: "macos_background_launch",
+                                    started,
+                                    deadline,
+                                },
+                                &mut events,
+                                launch_scope,
+                            )
+                            .await
+                            .map(|stable| LaunchAttempt {
+                                reused_running_app: preexisting.as_ref().is_some_and(|prior| {
+                                    same_process_identity(prior, &application)
+                                }),
+                                app,
+                                stable,
+                            })
+                        }
+                    },
+                }
             }
+        };
+        if attempt.is_ok() {
+            launch_scope.pending_settlement = None;
         }
+        attempt.map(|attempt| NativeLaunch {
+            app: attempt.app,
+            windows: attempt.stable.windows,
+            reused_running_app: attempt.reused_running_app,
+            settlement: launch_settlement(
+                "macos_background_launch",
+                started,
+                true,
+                attempt.stable.window_list_changed,
+                attempt.stable.windows_empty,
+            ),
+        })
     }
 }
 
@@ -333,15 +290,6 @@ struct LaunchAttempt {
     app: AppRef,
     stable: StableLaunchWindows,
     reused_running_app: bool,
-}
-
-fn begin_launch_after_witness<T>(
-    posture_scope: &mut LaunchPostureScope,
-    witness: Result<T, NativeError>,
-) -> Result<T, NativeError> {
-    let witness = witness?;
-    posture_scope.begin_launch();
-    Ok(witness)
 }
 
 struct StableLaunchWindows {
@@ -442,8 +390,7 @@ async fn wait_for_stable_windows(
     registry: &MacWindowRegistry,
     wait: LaunchWait<'_>,
     events: &mut tokio::sync::broadcast::Receiver<nsworkspace::WorkspaceEvent>,
-    witness: &mut MacLaunchPostureWitness,
-    posture_scope: &mut LaunchPostureScope,
+    launch_scope: &mut LaunchScope,
 ) -> Result<StableLaunchWindows, NativeError> {
     let mut poll = tokio::time::interval(Duration::from_millis(25));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -478,7 +425,6 @@ async fn wait_for_stable_windows(
                     .with_detail("pid", wait.pid));
             }
         }
-        witness.drain_events();
         let application = nsworkspace::running_application(wait.pid).ok_or_else(|| {
             launch_settle_error("app disappeared before launch settlement completed")
                 .with_detail("pid", wait.pid)
@@ -495,13 +441,13 @@ async fn wait_for_stable_windows(
             ));
         }
         let windows = registry.list_windows(Some(wait.app)).await?;
-        posture_scope.record_partial_result(wait.app.clone(), windows.clone());
+        launch_scope.record_partial_result(wait.app.clone(), windows.clone());
         let observed_signals = wait
             .dispatched
             .then_some(SettlementSignal::DispatchComplete)
             .into_iter()
             .collect();
-        posture_scope.pending_settlement = Some(pending_launch_evidence(
+        launch_scope.pending_settlement = Some(pending_launch_evidence(
             wait.settlement_action_id,
             wait.profile,
             wait.started,
@@ -576,39 +522,6 @@ fn launch_settlement(
         quiet_window_ms: WINDOW_QUIET_WINDOW.as_millis() as u64,
         resumed_from_prior_call: false,
     }
-}
-
-fn posture_failure(
-    posture: &PostureResult,
-    app: Option<&AppRef>,
-    posture_scope: &LaunchPostureScope,
-) -> Option<NativeError> {
-    (!posture.held).then(|| {
-        let observed_excursion = posture.frontmost_changed
-            || posture.key_window_changed
-            || posture.physical_cursor_moved
-            || posture.restored_after_violation;
-        let (code, retryable, message) = if observed_excursion {
-            (
-                ErrorCode::PostureViolated,
-                false,
-                "app launched but foreground, exact focused-window, or cursor posture changed",
-            )
-        } else {
-            (
-                ErrorCode::PostureUnverifiable,
-                true,
-                "app launch posture witness was incomplete, unreadable, or lagged",
-            )
-        };
-        NativeError::new(code, ErrorPhase::Verify, retryable, message)
-            .with_detail("app", serde_json::to_value(app).unwrap_or_default())
-            .with_detail(
-                "windows",
-                serde_json::to_value(&posture_scope.partial_windows).unwrap_or_default(),
-            )
-            .with_detail("posture", serde_json::to_value(posture).unwrap_or_default())
-    })
 }
 
 #[derive(Debug)]
@@ -1310,50 +1223,5 @@ mod tests {
         let error = launch_event_failure(120, &target).unwrap();
         assert_eq!(error.code, ErrorCode::AppLaunchFailed);
         assert_eq!(error.phase, ErrorPhase::Settle);
-    }
-
-    #[test]
-    fn launch_posture_distinguishes_unverifiable_witness_from_observed_excursion() {
-        let scope = LaunchPostureScope::default();
-        let unverifiable = posture_failure(
-            &PostureResult {
-                held: false,
-                ..PostureResult::default()
-            },
-            None,
-            &scope,
-        )
-        .unwrap();
-        assert_eq!(unverifiable.code, ErrorCode::PostureUnverifiable);
-
-        let violated = posture_failure(
-            &PostureResult {
-                held: false,
-                frontmost_changed: true,
-                restored_after_violation: true,
-                ..PostureResult::default()
-            },
-            None,
-            &scope,
-        )
-        .unwrap();
-        assert_eq!(violated.code, ErrorCode::PostureViolated);
-    }
-
-    #[test]
-    fn failed_witness_acquisition_refuses_before_launch_side_effect_is_marked() {
-        let mut scope = LaunchPostureScope::for_action(ActionId::new());
-        let error = begin_launch_after_witness::<()>(
-            &mut scope,
-            Err(NativeError::new(
-                ErrorCode::PostureUnverifiable,
-                ErrorPhase::Preflight,
-                true,
-                "injected witness acquisition failure",
-            )),
-        )
-        .unwrap_err();
-        assert_eq!(error.code, ErrorCode::PostureUnverifiable);
-        assert!(!scope.side_effect_started());
     }
 }

@@ -237,7 +237,7 @@ impl MacTargetFocusCoordinator {
     pub(crate) fn new(pid: i32, cg_window_id: u32) -> Result<Self, NativeError> {
         let state = Arc::new(Mutex::new(MacFocusState::new(pid, cg_window_id)));
         let focus_taps =
-            crate::focus_steal::TargetFocusTapRegistration::start(pid, Arc::downgrade(&state))?;
+            crate::focus_steal::TargetFocusTapRegistration::start(pid, Arc::downgrade(&state));
         Ok(Self {
             state,
             focus_taps: Some(focus_taps),

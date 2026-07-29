@@ -6,11 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{
-    interaction::{NativeEvidence, PostureResult},
-    menu::MenuState,
-    settlement::SettlementEvidence,
-};
+use super::{interaction::NativeEvidence, menu::MenuState, settlement::SettlementEvidence};
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -607,7 +603,6 @@ pub struct ActionReceipt {
     pub consumed_observation_id: ObservationId,
     pub route: Route,
     pub verification: VerificationLevel,
-    pub posture: PostureResult,
     pub settlement: SettlementEvidence,
     #[serde(default)]
     pub native_evidence: NativeEvidence,
@@ -623,7 +618,6 @@ pub struct LaunchResult {
     pub windows: Vec<WindowRef>,
     pub reused_running_app: bool,
     pub verification: EffectVerification,
-    pub posture: PostureResult,
     pub settlement: SettlementEvidence,
 }
 

@@ -598,7 +598,6 @@ fn require_scope(
     if scope.route != route
         || scope.owner != target.window
         || scope.window.stamp() != target.window
-        || scope.leases.posture_witness != LeaseDecision::Acquired
         || !belief_ok
     {
         return Err(NativeError::new(

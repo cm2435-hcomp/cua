@@ -5,28 +5,23 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use async_trait::async_trait;
 use cua_driver_core::api::{
     contracts::{ActionId, Route},
-    errors::{ErrorCode, ErrorPhase, NativeError},
+    errors::{ErrorCode, NativeError},
     interaction::{
         InteractionScope, LeaseDecision, LeaseTeardownStatus, MutationDeadline, NativeEvidence,
-        PostureResult, ScopeCleanup, ScopeLeaseAcquisition, ScopeLeaseTeardown, ScopePlan,
-        ScopeRequirements, ScopeTeardownOutcome, TargetCursorHandle,
+        ScopeCleanup, ScopeLeaseAcquisition, ScopeLeaseTeardown, ScopePlan, ScopeRequirements,
+        ScopeTeardownOutcome, TargetCursorHandle,
     },
     observation::ResolvedWindow,
     platform::{InteractionProvider, ResolvedAction},
 };
 
-use crate::{
-    apps::nsworkspace::WorkspaceEventHub,
-    ax::enablement::AxEnablementLease,
-    focus_steal::{SuppressionLease, SuppressionOutcome},
-    input::keyboard::normalize_chord,
-};
+use crate::{ax::enablement::AxEnablementLease, input::keyboard::normalize_chord};
 
 use super::{
     focus::{
@@ -34,12 +29,9 @@ use super::{
         MacScopeRecipe, MenuSuppressionRecipe, TargetBeliefRecipe,
     },
     menu::{self, MenuSuppressionPlan},
-    posture::MacInteractionPostureWitness,
     target::{MacFocusState, MacTargetFocusCoordinator, MacTargetState},
     windows::{MacWindowFacts, MacWindowRegistry},
 };
-
-const CONTAINMENT_BARRIER_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub struct MacNativeScopePlan {
@@ -59,31 +51,11 @@ struct LeaseRelease {
     failure: Option<NativeError>,
 }
 
-trait PostureResource: Send {
-    fn finish(&mut self, deadline: Instant)
-        -> Result<(PostureResult, NativeEvidence), NativeError>;
-}
-
-struct PostureAcquisition {
-    prior_frontmost_pid: i32,
-    resource: Box<dyn PostureResource>,
-}
-
 trait MacInteractionHooks: Send + Sync {
-    fn acquire_posture(&self) -> Result<PostureAcquisition, NativeError>;
-
     fn acquire_accessibility(
         &self,
         recipe: AccessibilityRecipe,
         pid: i32,
-    ) -> Result<Option<Box<dyn LeaseResource>>, NativeError>;
-
-    fn acquire_containment(
-        &self,
-        required: bool,
-        target_pid: i32,
-        prior_frontmost_pid: i32,
-        deadline: Instant,
     ) -> Result<Option<Box<dyn LeaseResource>>, NativeError>;
 
     fn acquire_menu(
@@ -105,15 +77,6 @@ trait MacInteractionHooks: Send + Sync {
 struct SystemInteractionHooks;
 
 impl MacInteractionHooks for SystemInteractionHooks {
-    fn acquire_posture(&self) -> Result<PostureAcquisition, NativeError> {
-        let witness = MacInteractionPostureWitness::begin()?;
-        let prior_frontmost_pid = witness.prior_frontmost_pid();
-        Ok(PostureAcquisition {
-            prior_frontmost_pid,
-            resource: Box::new(SystemPostureResource(witness)),
-        })
-    }
-
     fn acquire_accessibility(
         &self,
         recipe: AccessibilityRecipe,
@@ -126,26 +89,6 @@ impl MacInteractionHooks for SystemInteractionHooks {
                 Ok(Some(Box::new(AxLeaseResource(lease))))
             }
         }
-    }
-
-    fn acquire_containment(
-        &self,
-        required: bool,
-        target_pid: i32,
-        prior_frontmost_pid: i32,
-        deadline: Instant,
-    ) -> Result<Option<Box<dyn LeaseResource>>, NativeError> {
-        if !required || target_pid == prior_frontmost_pid {
-            return Ok(None);
-        }
-        Ok(Some(Box::new(ContainmentLeaseResource(Some(
-            crate::focus_steal::begin_suppression_until(
-                Some(target_pid),
-                prior_frontmost_pid,
-                "driver.v2.interaction",
-                deadline,
-            ),
-        )))))
     }
 
     fn acquire_menu(
@@ -167,17 +110,6 @@ impl MacInteractionHooks for SystemInteractionHooks {
         deadline: Instant,
     ) -> Result<Option<NativeEvidence>, NativeError> {
         prepare_target_focus(recipe, facts, focus_state, deadline)
-    }
-}
-
-struct SystemPostureResource(MacInteractionPostureWitness);
-
-impl PostureResource for SystemPostureResource {
-    fn finish(
-        &mut self,
-        deadline: Instant,
-    ) -> Result<(PostureResult, NativeEvidence), NativeError> {
-        Ok(self.0.finish(deadline))
     }
 }
 
@@ -203,81 +135,6 @@ impl LeaseResource for AxLeaseResource {
     }
 }
 
-struct ContainmentLeaseResource(Option<SuppressionLease>);
-
-impl LeaseResource for ContainmentLeaseResource {
-    fn release(&mut self, deadline: Instant) -> LeaseRelease {
-        let close = self
-            .0
-            .take()
-            .map(|lease| lease.close_with_evidence(remaining(deadline)))
-            .unwrap_or_default();
-        let workspace_drained = WorkspaceEventHub::shared().barrier(remaining(deadline));
-        containment_evidence(
-            close.evidence,
-            close.callback_queue_drained,
-            workspace_drained,
-        )
-    }
-}
-
-fn containment_evidence(
-    outcome: SuppressionOutcome,
-    containment_drained: bool,
-    workspace_drained: bool,
-) -> LeaseRelease {
-    let mut evidence = NativeEvidence::default();
-    evidence.fields.insert(
-        "containment_activations".to_owned(),
-        outcome.activations.into(),
-    );
-    evidence.fields.insert(
-        "containment_restore_attempts".to_owned(),
-        outcome.restore_attempts.into(),
-    );
-    evidence.fields.insert(
-        "containment_restore_failures".to_owned(),
-        outcome.restore_failures.into(),
-    );
-    evidence.fields.insert(
-        "containment_callback_queue_drained".to_owned(),
-        containment_drained.into(),
-    );
-    evidence.fields.insert(
-        "workspace_callback_queue_drained".to_owned(),
-        workspace_drained.into(),
-    );
-    let mut failures = Vec::new();
-    if !workspace_drained || !containment_drained {
-        failures.push(
-            NativeError::new(
-                ErrorCode::PostureUnverifiable,
-                ErrorPhase::Verify,
-                true,
-                "focus-containment callback queues did not drain before release",
-            )
-            .with_detail("workspace_queue_drained", workspace_drained)
-            .with_detail("containment_queue_drained", containment_drained),
-        );
-    }
-    if outcome.activations > 0 || outcome.restore_failures > 0 {
-        failures.push(
-            NativeError::new(
-                ErrorCode::PostureViolated,
-                ErrorPhase::Verify,
-                false,
-                "focus containment observed a foreground activation excursion",
-            )
-            .with_detail("activations", outcome.activations)
-            .with_detail("restore_failures", outcome.restore_failures),
-        );
-    }
-    LeaseRelease {
-        evidence,
-        failure: NativeError::primary(failures),
-    }
-}
-
 struct MenuResourceAdapter(Box<dyn menu::MenuSuppressionResource>);
 
 impl LeaseResource for MenuResourceAdapter {
@@ -293,12 +150,6 @@ impl LeaseResource for MenuResourceAdapter {
             },
         }
     }
-}
-
-fn remaining(deadline: Instant) -> Duration {
-    deadline
-        .saturating_duration_since(Instant::now())
-        .min(CONTAINMENT_BARRIER_TIMEOUT)
 }
 
 #[derive(Clone)]
@@ -337,8 +188,8 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
         let facts = self.windows.facts_for_stamp(&window.stamp()).await?;
         ensure_native_facts_match(&facts, target, window)?;
         if let ResolvedAction::PressKey { stroke, .. } = action {
-            // Platform key vocabulary is validated before any posture,
-            // accessibility, containment, or target-belief lease is acquired.
+            // Platform key vocabulary is validated before any accessibility
+            // lease or target-focus preparation is acquired.
             normalize_chord(stroke)?;
         }
         let recipe =
@@ -438,19 +289,12 @@ fn acquire_resources(
     poison: Arc<AtomicBool>,
     focus_state: Arc<Mutex<MacFocusState>>,
 ) -> Result<AcquiredResources, NativeError> {
-    let posture = hooks.acquire_posture()?;
-    let mut cleanup = MacScopeCleanup::new(poison, posture.resource, plan.deadline.teardown);
+    let mut cleanup = MacScopeCleanup::new(poison, plan.deadline.teardown);
     let mut target_belief_evidence = None;
 
     let result = (|| {
         cleanup.accessibility =
             hooks.acquire_accessibility(plan.native.recipe.accessibility, plan.native.facts.pid)?;
-        cleanup.containment = hooks.acquire_containment(
-            plan.requirements.containment,
-            plan.native.facts.pid,
-            posture.prior_frontmost_pid,
-            plan.deadline.teardown,
-        )?;
         cleanup.menu = hooks.acquire_menu(plan.native.recipe.menu, &plan.native.menu)?;
         target_belief_evidence = hooks.prepare_target_belief(
             plan.native.recipe.target_belief,
@@ -470,9 +314,7 @@ fn acquire_resources(
     }
 
     let acquisition = ScopeLeaseAcquisition {
-        posture_witness: LeaseDecision::Acquired,
         accessibility: decision(&cleanup.accessibility),
-        containment: decision(&cleanup.containment),
         menu_dismissal: decision(&cleanup.menu),
         target_belief: if target_belief_evidence.is_some() {
             LeaseDecision::Acquired
@@ -521,25 +363,17 @@ fn decision(resource: &Option<Box<dyn LeaseResource>>) -> LeaseDecision {
 struct MacScopeCleanup {
     poison: Arc<AtomicBool>,
     teardown_deadline: Instant,
-    posture: Option<Box<dyn PostureResource>>,
     accessibility: Option<Box<dyn LeaseResource>>,
-    containment: Option<Box<dyn LeaseResource>>,
     menu: Option<Box<dyn LeaseResource>>,
     outcome: Option<ScopeTeardownOutcome>,
 }
 
 impl MacScopeCleanup {
-    fn new(
-        poison: Arc<AtomicBool>,
-        posture: Box<dyn PostureResource>,
-        teardown_deadline: Instant,
-    ) -> Self {
+    fn new(poison: Arc<AtomicBool>, teardown_deadline: Instant) -> Self {
         Self {
             poison,
             teardown_deadline,
-            posture: Some(posture),
             accessibility: None,
-            containment: None,
             menu: None,
             outcome: None,
         }
@@ -555,42 +389,12 @@ impl ScopeCleanup for MacScopeCleanup {
         let mut evidence = NativeEvidence::default();
         let mut failures = Vec::new();
         let menu_dismissal = release_lease(&mut self.menu, deadline, &mut evidence, &mut failures);
-        let containment = release_lease(
-            &mut self.containment,
-            deadline,
-            &mut evidence,
-            &mut failures,
-        );
         let accessibility = release_lease(
             &mut self.accessibility,
             deadline,
             &mut evidence,
             &mut failures,
         );
-        let (posture_witness, posture) = match self.posture.as_mut() {
-            None => (LeaseTeardownStatus::NotApplicable, PostureResult::default()),
-            Some(resource) => match resource.finish(deadline) {
-                Ok((posture, posture_evidence)) => {
-                    evidence.merge(posture_evidence);
-                    let status = LeaseTeardownStatus::Released;
-                    if let Some(error) = posture_failure(&posture) {
-                        failures.push(error);
-                    }
-                    (status, posture)
-                }
-                Err(error) => {
-                    failures.push(error);
-                    (
-                        LeaseTeardownStatus::Failed,
-                        PostureResult {
-                            held: false,
-                            ..PostureResult::default()
-                        },
-                    )
-                }
-            },
-        };
-        self.posture = None;
 
         if !failures.is_empty() {
             self.poison.store(true, Ordering::Release);
@@ -599,12 +403,9 @@ impl ScopeCleanup for MacScopeCleanup {
                 .insert("target_poisoned".to_owned(), true.into());
         }
         let outcome = ScopeTeardownOutcome {
-            posture,
             native_evidence: evidence,
             leases: ScopeLeaseTeardown {
-                posture_witness,
                 accessibility,
-                containment,
                 menu_dismissal,
                 target_belief: LeaseTeardownStatus::NotApplicable,
             },
@@ -613,33 +414,6 @@ impl ScopeCleanup for MacScopeCleanup {
         self.outcome = Some(outcome.clone());
         outcome
     }
-}
-
-fn posture_failure(posture: &PostureResult) -> Option<NativeError> {
-    if posture.held {
-        return None;
-    }
-    let observed_excursion = posture.frontmost_changed
-        || posture.key_window_changed
-        || posture.physical_cursor_moved
-        || posture.restored_after_violation;
-    let (code, retryable, message) = if observed_excursion {
-        (
-            ErrorCode::PostureViolated,
-            false,
-            "interaction changed foreground, focused window, or physical cursor posture",
-        )
-    } else {
-        (
-            ErrorCode::PostureUnverifiable,
-            true,
-            "interaction posture witness was incomplete or lagged",
-        )
-    };
-    Some(
-        NativeError::new(code, ErrorPhase::Verify, retryable, message)
-            .with_detail("posture", serde_json::to_value(posture).unwrap_or_default()),
-    )
 }
 
 impl Drop for MacScopeCleanup {
@@ -675,11 +449,12 @@ fn release_lease(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{sync::Mutex, time::Duration};
 
     use cua_driver_core::api::{
         capabilities::{Framework, WindowStateKind},
         contracts::{AppId, AppRef, GeometryRevision, Rect, WindowGeneration, WindowId, WindowRef},
+        errors::ErrorPhase,
         observation::{NativeProcessHandle, NativeWindowHandle, WindowGeometry},
     };
 
@@ -710,21 +485,6 @@ mod tests {
         }
     }
 
-    struct LoggedPosture {
-        log: Arc<Mutex<Vec<&'static str>>>,
-        posture: PostureResult,
-    }
-
-    impl PostureResource for LoggedPosture {
-        fn finish(
-            &mut self,
-            _deadline: Instant,
-        ) -> Result<(PostureResult, NativeEvidence), NativeError> {
-            self.log.lock().unwrap().push("posture-");
-            Ok((self.posture.clone(), NativeEvidence::default()))
-        }
-    }
-
     fn logged(
         log: &Arc<Mutex<Vec<&'static str>>>,
         release: &'static str,
@@ -738,7 +498,6 @@ mod tests {
 
     struct LoggingHooks {
         log: Arc<Mutex<Vec<&'static str>>>,
-        containment_deadlines: Arc<Mutex<Vec<Instant>>>,
         fail_at: Option<&'static str>,
     }
 
@@ -763,34 +522,12 @@ mod tests {
     }
 
     impl MacInteractionHooks for LoggingHooks {
-        fn acquire_posture(&self) -> Result<PostureAcquisition, NativeError> {
-            self.log.lock().unwrap().push("posture+");
-            Ok(PostureAcquisition {
-                prior_frontmost_pid: 7,
-                resource: Box::new(LoggedPosture {
-                    log: Arc::clone(&self.log),
-                    posture: PostureResult::default(),
-                }),
-            })
-        }
-
         fn acquire_accessibility(
             &self,
             _recipe: AccessibilityRecipe,
             _pid: i32,
         ) -> Result<Option<Box<dyn LeaseResource>>, NativeError> {
             self.acquire("ax+", "ax-")
-        }
-
-        fn acquire_containment(
-            &self,
-            _required: bool,
-            _target_pid: i32,
-            _prior_frontmost_pid: i32,
-            deadline: Instant,
-        ) -> Result<Option<Box<dyn LeaseResource>>, NativeError> {
-            self.containment_deadlines.lock().unwrap().push(deadline);
-            self.acquire("containment+", "containment-")
         }
 
         fn acquire_menu(
@@ -899,7 +636,6 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let hooks = LoggingHooks {
             log: Arc::clone(&log),
-            containment_deadlines: Arc::new(Mutex::new(Vec::new())),
             fail_at: None,
         };
         let poison = Arc::new(AtomicBool::new(false));
@@ -911,67 +647,24 @@ mod tests {
             Arc::new(Mutex::new(MacFocusState::new(44, 99))),
         )
         .unwrap();
-        assert_eq!(
-            hooks.containment_deadlines.lock().unwrap().as_slice(),
-            [plan.deadline.teardown]
-        );
         let outcome = acquired.cleanup.cleanup(plan.deadline.teardown);
         assert!(outcome.failures.is_empty());
         assert_eq!(
             *log.lock().unwrap(),
-            vec![
-                "posture+",
-                "ax+",
-                "containment+",
-                "menu+",
-                "belief+",
-                "menu-",
-                "containment-",
-                "ax-",
-                "posture-",
-            ]
+            vec!["ax+", "menu+", "belief+", "menu-", "ax-"]
         );
     }
 
     #[test]
     fn acquisition_failure_unwinds_every_earlier_lease_in_reverse_order() {
         for (fail_at, expected) in [
-            ("ax+", vec!["posture+", "ax+", "posture-"]),
-            (
-                "containment+",
-                vec!["posture+", "ax+", "containment+", "ax-", "posture-"],
-            ),
-            (
-                "menu+",
-                vec![
-                    "posture+",
-                    "ax+",
-                    "containment+",
-                    "menu+",
-                    "containment-",
-                    "ax-",
-                    "posture-",
-                ],
-            ),
-            (
-                "belief+",
-                vec![
-                    "posture+",
-                    "ax+",
-                    "containment+",
-                    "menu+",
-                    "belief+",
-                    "menu-",
-                    "containment-",
-                    "ax-",
-                    "posture-",
-                ],
-            ),
+            ("ax+", vec!["ax+"]),
+            ("menu+", vec!["ax+", "menu+", "ax-"]),
+            ("belief+", vec!["ax+", "menu+", "belief+", "menu-", "ax-"]),
         ] {
             let log = Arc::new(Mutex::new(Vec::new()));
             let hooks = LoggingHooks {
                 log: Arc::clone(&log),
-                containment_deadlines: Arc::new(Mutex::new(Vec::new())),
                 fail_at: Some(fail_at),
             };
             let error = acquire_resources(
@@ -988,105 +681,25 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_is_reverse_order_and_restored_violation_poison_is_sticky() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let poison = Arc::new(AtomicBool::new(false));
-        let mut cleanup = MacScopeCleanup::new(
-            Arc::clone(&poison),
-            Box::new(LoggedPosture {
-                log: Arc::clone(&log),
-                posture: PostureResult {
-                    held: false,
-                    frontmost_changed: true,
-                    key_window_changed: false,
-                    physical_cursor_moved: false,
-                    restored_after_violation: true,
-                },
-            }),
-            test_deadline().teardown,
-        );
-        cleanup.accessibility = Some(logged(&log, "ax-"));
-        cleanup.containment = Some(logged(&log, "containment-"));
-        cleanup.menu = Some(logged(&log, "menu-"));
-
-        let outcome = cleanup.cleanup(test_deadline().teardown);
-        assert_eq!(
-            *log.lock().unwrap(),
-            vec!["menu-", "containment-", "ax-", "posture-"]
-        );
-        assert!(outcome.posture.restored_after_violation);
-        assert_eq!(outcome.failures[0].code, ErrorCode::PostureViolated);
-        assert!(poison.load(Ordering::Acquire));
-    }
-
-    #[test]
     fn every_release_is_attempted_after_an_earlier_cleanup_failure() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let poison = Arc::new(AtomicBool::new(false));
-        let mut cleanup = MacScopeCleanup::new(
-            Arc::clone(&poison),
-            Box::new(LoggedPosture {
-                log: Arc::clone(&log),
-                posture: PostureResult::default(),
-            }),
-            test_deadline().teardown,
-        );
+        let mut cleanup = MacScopeCleanup::new(Arc::clone(&poison), test_deadline().teardown);
         cleanup.menu = Some(Box::new(LoggedLease {
             log: Arc::clone(&log),
             release: "menu-",
             fail: true,
         }));
-        cleanup.containment = Some(logged(&log, "containment-"));
         cleanup.accessibility = Some(logged(&log, "ax-"));
 
         let outcome = cleanup.cleanup(test_deadline().teardown);
-        assert_eq!(
-            *log.lock().unwrap(),
-            vec!["menu-", "containment-", "ax-", "posture-"]
-        );
+        assert_eq!(*log.lock().unwrap(), vec!["menu-", "ax-"]);
         assert_eq!(outcome.leases.menu_dismissal, LeaseTeardownStatus::Failed);
         assert_eq!(
             outcome.leases.target_belief,
             LeaseTeardownStatus::NotApplicable
         );
-        assert_eq!(outcome.leases.containment, LeaseTeardownStatus::Released);
         assert_eq!(outcome.native_evidence.fields["menu-_attempted"], true);
         assert!(poison.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn containment_barrier_timeout_preserves_evidence_and_is_unverifiable() {
-        let release = containment_evidence(
-            SuppressionOutcome {
-                activations: 0,
-                restore_attempts: 2,
-                restore_failures: 0,
-            },
-            false,
-            true,
-        );
-        assert_eq!(release.evidence.fields["containment_restore_attempts"], 2);
-        assert_eq!(
-            release.failure.as_ref().unwrap().code,
-            ErrorCode::PostureUnverifiable
-        );
-    }
-
-    #[test]
-    fn containment_excursion_preserves_evidence_and_is_a_violation() {
-        let release = containment_evidence(
-            SuppressionOutcome {
-                activations: 1,
-                restore_attempts: 1,
-                restore_failures: 0,
-            },
-            true,
-            true,
-        );
-        assert_eq!(release.evidence.fields["containment_activations"], 1);
-        assert_eq!(
-            release.failure.as_ref().unwrap().code,
-            ErrorCode::PostureViolated
-        );
     }
 }

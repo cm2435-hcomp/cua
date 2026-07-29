@@ -26,10 +26,10 @@ use super::{
         revision_accessibility, ObservationRecord, ResolvedDrag, ResolvedScroll, ResolvedWindow,
     },
     platform::{
-        ClickSpec, ElementScrollSpec, InteractionProvider, KeyboardActionProvider,
-        LaunchPostureScope, LifecycleProvider, NativeDispatch, ObservationProvider, ObserveRequest,
-        PlatformDriver, PointerActionProvider, ResolvedAction, SelectionSpec,
-        SemanticActionProvider, WindowProvider,
+        ClickSpec, ElementScrollSpec, InteractionProvider, KeyboardActionProvider, LaunchScope,
+        LifecycleProvider, NativeDispatch, ObservationProvider, ObserveRequest, PlatformDriver,
+        PointerActionProvider, ResolvedAction, SelectionSpec, SemanticActionProvider,
+        WindowProvider,
     },
     settlement::{
         PendingSettlementEvidence, SettlementAttempt, SettlementEvidence, SettlementProfile,
@@ -90,7 +90,7 @@ impl<P: PlatformDriver> DriverController<P> {
     ///
     /// `work_timeout` covers preflight, scope acquisition, native dispatch,
     /// and settlement. `teardown_timeout` is an additional reserve used only
-    /// to release acquired leases while containment remains active.
+    /// to release acquired platform resources.
     pub fn with_mutation_timeouts(
         mut self,
         work_timeout: Duration,
@@ -133,49 +133,33 @@ impl<P: PlatformDriver> DriverController<P> {
     pub async fn launch_app(&self, request: LaunchAppRequest) -> Result<LaunchResult, NativeError> {
         request.validate().map_err(NativeError::invalid)?;
         let action_id = ActionId::new();
-        let mut posture_scope = LaunchPostureScope::for_action(action_id.clone());
+        let mut launch_scope = LaunchScope::for_action(action_id.clone());
         let launch = match self
             .platform
             .lifecycle()
-            .launch_background(request.app, &mut posture_scope)
+            .launch_background(request.app, &mut launch_scope)
             .await
         {
             Ok(launch) => launch,
             Err(mut error) => {
-                if posture_scope.side_effect_started() {
+                if launch_scope.side_effect_started() {
                     error.partial_evidence = Some(Box::new(PartialEvidence::Launch {
                         action_id,
-                        app: posture_scope.partial_app,
-                        windows: posture_scope.partial_windows,
-                        posture: posture_scope.posture,
-                        native_evidence: posture_scope.native_evidence,
-                        pending_settlement: posture_scope.pending_settlement.map(Box::new),
+                        app: launch_scope.partial_app,
+                        windows: launch_scope.partial_windows,
+                        native_evidence: launch_scope.native_evidence,
+                        pending_settlement: launch_scope.pending_settlement.map(Box::new),
                     }));
                 }
                 return Err(error);
             }
         };
-        if !launch.posture.held {
-            let mut error = NativeError::from_posture(&launch.posture)
-                .expect("a non-held launch posture must be unverifiable or violated")
-                .with_detail("action_id", action_id.to_string());
-            error.partial_evidence = Some(Box::new(PartialEvidence::Launch {
-                action_id,
-                app: Some(launch.app),
-                windows: launch.windows,
-                posture: launch.posture,
-                native_evidence: posture_scope.native_evidence,
-                pending_settlement: None,
-            }));
-            return Err(error);
-        }
         Ok(LaunchResult {
             action_id,
             app: launch.app,
             windows: launch.windows,
             reused_running_app: launch.reused_running_app,
             verification: EffectVerification::EffectVerified,
-            posture: launch.posture,
             settlement: launch.settlement,
         })
     }
@@ -931,9 +915,6 @@ impl<P: PlatformDriver> DriverController<P> {
                 }
                 let mut failures = vec![error];
                 failures.extend(teardown.failures);
-                if let Some(error) = NativeError::from_posture(&scope.posture) {
-                    failures.push(error);
-                }
                 let scope_evidence = serde_json::to_value(&scope.native_evidence)
                     .expect("typed scope evidence must serialize");
                 if teardown_failed {
@@ -972,9 +953,6 @@ impl<P: PlatformDriver> DriverController<P> {
                     target.invalidate();
                 }
                 failures.extend(teardown.failures);
-                if let Some(error) = NativeError::from_posture(&scope.posture) {
-                    failures.push(error);
-                }
                 if teardown_failed {
                     drop(state);
                     match tokio::time::timeout_at(
@@ -1006,9 +984,6 @@ impl<P: PlatformDriver> DriverController<P> {
                     }
                     let mut failures = vec![error];
                     failures.extend(teardown.failures);
-                    if let Some(error) = NativeError::from_posture(&scope.posture) {
-                        failures.push(error);
-                    }
                     let scope_evidence = serde_json::to_value(&scope.native_evidence)
                         .expect("typed scope evidence must serialize");
                     if teardown_failed {
@@ -1097,9 +1072,6 @@ impl<P: PlatformDriver> DriverController<P> {
             }
             let mut failures = vec![provider_failure];
             failures.extend(teardown.failures);
-            if let Some(error) = NativeError::from_posture(&scope.posture) {
-                failures.push(error);
-            }
             let scope_evidence = serde_json::to_value(&scope.native_evidence)
                 .expect("typed scope evidence must serialize");
             if provider_invalidated || teardown_failed {
@@ -1212,9 +1184,6 @@ impl<P: PlatformDriver> DriverController<P> {
             target.invalidate();
         }
         failures.extend(teardown.failures);
-        if let Some(error) = NativeError::from_posture(&scope.posture) {
-            failures.push(error);
-        }
         if requires_effect_verification
             && dispatch
                 .as_ref()
@@ -1244,7 +1213,6 @@ impl<P: PlatformDriver> DriverController<P> {
                 native_evidence: dispatch.evidence.clone(),
                 warnings: dispatch.warnings.clone(),
             }),
-            posture: scope.posture.clone(),
             native_evidence: scope.native_evidence.clone(),
             pending_settlement,
         };
@@ -1272,7 +1240,6 @@ impl<P: PlatformDriver> DriverController<P> {
                 action_kind = ?action,
                 route = ?route,
                 verification = ?dispatch.as_ref().map(|dispatch| dispatch.verification),
-                posture_held = scope.posture.held,
                 settlement_outcome = settlement.as_ref().map_or("pending_or_failed", |_| "settled"),
                 error_code = ?error.code,
                 "v2 mutation completed with typed failure"
@@ -1288,7 +1255,6 @@ impl<P: PlatformDriver> DriverController<P> {
                 consumed_observation_id: observation_id,
                 route,
                 verification: dispatch.verification,
-                posture: scope.posture.clone(),
                 settlement,
                 native_evidence,
                 warnings: dispatch.warnings,
@@ -1303,7 +1269,6 @@ impl<P: PlatformDriver> DriverController<P> {
                 action_kind = ?action,
                 route = ?receipt.route,
                 verification = ?receipt.verification,
-                posture_held = receipt.posture.held,
                 settlement_profile = %receipt.settlement.profile,
                 settlement_outcome = "settled",
                 "v2 mutation completed"

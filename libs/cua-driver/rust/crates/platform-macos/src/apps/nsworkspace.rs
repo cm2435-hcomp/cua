@@ -11,6 +11,7 @@
 //! Both share an `OpenConfig` builder that mirrors the subset of
 //! `NSWorkspaceOpenConfiguration` properties Swift sets:
 //!   * `activates = false`         (background launch — no focus steal)
+//!   * `allowsRunningApplicationSubstitution = false`
 //!   * `addsToRecentItems = false` (don't pollute the Apple menu)
 //!   * `createsNewApplicationInstance = …`
 //!   * `arguments = …` / `environment = …`
@@ -87,10 +88,8 @@ impl WorkspaceEventHub {
         static HUB: OnceLock<Arc<WorkspaceEventHub>> = OnceLock::new();
         HUB.get_or_init(|| {
             let (sender, _) = tokio::sync::broadcast::channel(256);
-            // All four lifecycle notifications share one serial queue. Besides
-            // preserving native order, this gives bounded witnesses a real
-            // barrier: an operation enqueued after native teardown runs only
-            // after every previously delivered workspace callback.
+            // All four lifecycle notifications share one serial queue so
+            // target lifecycle updates preserve native delivery order.
             let observer_queue = unsafe { NSOperationQueue::new() };
             unsafe { observer_queue.setMaxConcurrentOperationCount(1) };
             let hub = Arc::new(Self {
@@ -105,17 +104,6 @@ impl WorkspaceEventHub {
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<WorkspaceEvent> {
         self.sender.subscribe()
-    }
-
-    /// Wait until every workspace callback queued before this call has run.
-    /// A timeout is not treated as success by posture witnesses.
-    pub fn barrier(&self, timeout: Duration) -> bool {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let block = RcBlock::new(move || {
-            let _ = sender.send(());
-        });
-        unsafe { self.observer_queue.addBarrierBlock(&block) };
-        receiver.recv_timeout(timeout).is_ok()
     }
 }
 
@@ -283,12 +271,14 @@ pub fn open_urls_with_application(
 
 /// Build an `NSWorkspaceOpenConfiguration` from `cfg`.
 ///
-/// Always sets `activates = false` and `addsToRecentItems = false` to match
-/// Swift's background-launch invariant.
+/// Always sets `activates = false`,
+/// `allowsRunningApplicationSubstitution = false`, and
+/// `addsToRecentItems = false` to match Swift's background-launch invariant.
 fn build_configuration(cfg: &OpenConfig) -> Retained<NSWorkspaceOpenConfiguration> {
     let config = unsafe { NSWorkspaceOpenConfiguration::configuration() };
     unsafe {
         config.setActivates(false);
+        config.setAllowsRunningApplicationSubstitution(false);
         config.setAddsToRecentItems(false);
         config.setCreatesNewApplicationInstance(cfg.creates_new_instance);
 
@@ -407,10 +397,8 @@ fn make_pid_completion_block<F: Fn(i32) + Send + Sync + 'static>(
                 }
             };
             if let Ok(pid) = result.as_ref() {
-                // Narrow detached wildcard containment before waking the
-                // awaiting task. The callback can outlive timeout/cancellation;
-                // its deadline-owned registry entry does not depend on this
-                // stack frame remaining alive.
+                // Give the caller the exact completion pid before waking the
+                // awaiting task.
                 on_completion_pid(*pid);
             }
             let sender = tx.lock().ok().and_then(|mut guard| guard.take());
@@ -653,7 +641,17 @@ mod apple_event {
 
 #[cfg(test)]
 mod tests {
-    use super::process_generation;
+    use super::{build_configuration, process_generation, OpenConfig};
+
+    #[test]
+    fn launch_configuration_forbids_activation_and_running_app_substitution() {
+        let configuration = build_configuration(&OpenConfig::default());
+        unsafe {
+            assert!(!configuration.activates());
+            assert!(!configuration.allowsRunningApplicationSubstitution());
+            assert!(!configuration.addsToRecentItems());
+        }
+    }
 
     #[test]
     fn live_process_generation_is_kernel_backed_and_stable() {

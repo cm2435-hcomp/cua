@@ -174,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn targeted_pointer_cells_publish_the_exact_click_posture_without_framework_guessing() {
+    fn targeted_pointer_cells_publish_the_exact_click_matrix_without_framework_guessing() {
         let cells = pointer_capability_cells("26.5.1");
         assert_eq!(cells.len(), 90);
         let supported: Vec<_> = cells

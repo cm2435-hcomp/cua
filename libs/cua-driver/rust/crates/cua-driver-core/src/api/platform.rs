@@ -12,8 +12,8 @@ use super::{
     },
     errors::NativeError,
     interaction::{
-        InteractionScope, MutationDeadline, NativeEvidence, NativeSideEffectBoundary,
-        PostureResult, ScopePlan, ScopeRequirements, TargetCursorHandle,
+        InteractionScope, MutationDeadline, NativeEvidence, NativeSideEffectBoundary, ScopePlan,
+        ScopeRequirements, TargetCursorHandle,
     },
     menu::NativeMenuEvidence,
     observation::{
@@ -29,13 +29,11 @@ pub struct NativeLaunch {
     pub app: AppRef,
     pub windows: Vec<WindowRef>,
     pub reused_running_app: bool,
-    pub posture: PostureResult,
     pub settlement: SettlementEvidence,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct LaunchPostureScope {
-    pub posture: PostureResult,
+pub struct LaunchScope {
     pub native_evidence: NativeEvidence,
     pub partial_app: Option<AppRef>,
     pub partial_windows: Vec<WindowRef>,
@@ -44,7 +42,7 @@ pub struct LaunchPostureScope {
     side_effect_started: bool,
 }
 
-impl LaunchPostureScope {
+impl LaunchScope {
     pub fn for_action(action_id: super::contracts::ActionId) -> Self {
         Self {
             action_id: Some(action_id),
@@ -199,7 +197,7 @@ pub trait LifecycleProvider: Send + Sync {
     async fn launch_background(
         &self,
         app: AppSelector,
-        posture: &mut LaunchPostureScope,
+        scope: &mut LaunchScope,
     ) -> Result<NativeLaunch, NativeError>;
 }
 

@@ -369,10 +369,9 @@ where
         }
     }
 
-    // EOF ends intake, not deadline-owned native work. In particular, a
-    // launch posture witness deliberately keeps containment alive until its
-    // own deadline. Drain every bounded request before connection teardown so
-    // dropping the transport cannot release target state underneath it.
+    // EOF ends intake, not in-flight native work. Drain every bounded request
+    // before connection teardown so dropping the transport cannot release
+    // target state underneath it.
     while let Some(completed) = dispatch_tasks.join_next().await {
         if let Err(error) = flatten_dispatch_result(completed) {
             if serve_result.is_ok() {

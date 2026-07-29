@@ -17,28 +17,6 @@ use super::{
     target::TargetValidityHandle,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PostureResult {
-    pub held: bool,
-    pub frontmost_changed: bool,
-    pub key_window_changed: bool,
-    pub physical_cursor_moved: bool,
-    pub restored_after_violation: bool,
-}
-
-impl Default for PostureResult {
-    fn default() -> Self {
-        Self {
-            held: true,
-            frontmost_changed: false,
-            key_window_changed: false,
-            physical_cursor_moved: false,
-            restored_after_violation: false,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeEvidence {
@@ -75,9 +53,7 @@ pub enum LeaseTeardownStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeLeaseAcquisition {
-    pub posture_witness: LeaseDecision,
     pub accessibility: LeaseDecision,
-    pub containment: LeaseDecision,
     pub menu_dismissal: LeaseDecision,
     pub target_belief: LeaseDecision,
 }
@@ -85,9 +61,7 @@ pub struct ScopeLeaseAcquisition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeLeaseTeardown {
-    pub posture_witness: LeaseTeardownStatus,
     pub accessibility: LeaseTeardownStatus,
-    pub containment: LeaseTeardownStatus,
     pub menu_dismissal: LeaseTeardownStatus,
     pub target_belief: LeaseTeardownStatus,
 }
@@ -103,7 +77,6 @@ pub struct InteractionScopeEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeRequirements {
     pub target_belief: bool,
-    pub containment: bool,
     pub accessibility: bool,
     pub menu_dismissal: bool,
 }
@@ -111,7 +84,7 @@ pub struct ScopeRequirements {
 /// Controller-owned time boundaries for one mutation.
 ///
 /// Native work must stop by `work`; the later `teardown` boundary is reserved
-/// for releasing every acquired lease while containment is still active.
+/// for releasing every acquired action-bounded resource.
 /// Providers must carry this exact value through preflight and acquisition --
 /// they do not get to create an independent native timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,7 +167,6 @@ impl ScopeRequirements {
     pub fn for_route(route: Route) -> Self {
         Self {
             target_belief: !matches!(route, Route::Semantic),
-            containment: true,
             accessibility: true,
             menu_dismissal: false,
         }
@@ -289,7 +261,6 @@ pub struct InteractionScope {
     pub owner: ResolvedWindowStamp,
     pub opening_menu_id: Option<MenuId>,
     pub logical_cursor: TargetCursorHandle,
-    pub posture: PostureResult,
     pub native_evidence: NativeEvidence,
     cleanup: Option<Box<dyn ScopeCleanup>>,
     teardown: Option<ScopeTeardownOutcome>,
@@ -307,7 +278,6 @@ impl std::fmt::Debug for InteractionScope {
             .field("action_id", &self.action_id)
             .field("owner", &self.owner)
             .field("opening_menu_id", &self.opening_menu_id)
-            .field("posture", &self.posture)
             .field("native_evidence", &self.native_evidence)
             .field("teardown", &self.teardown)
             .field("target_validity_bound", &self.target_validity.is_some())
@@ -317,7 +287,6 @@ impl std::fmt::Debug for InteractionScope {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScopeTeardownOutcome {
-    pub posture: PostureResult,
     pub native_evidence: NativeEvidence,
     pub leases: ScopeLeaseTeardown,
     pub failures: Vec<NativeError>,
@@ -327,9 +296,9 @@ pub trait ScopeCleanup: Send {
     /// Attempts every bounded native release and returns the complete result.
     /// Implementations must not stop after the first failure. Core invokes the
     /// native cleanup at most once and caches this outcome for repeat release.
-    /// `deadline` is the controller's absolute teardown cutoff: callback
-    /// barriers and joins must be bounded by it, and already-expired cleanup
-    /// must still perform every immediate best-effort release without waiting.
+    /// `deadline` is the controller's absolute teardown cutoff. Bounded joins
+    /// and releases must respect it, and already-expired cleanup must still
+    /// perform every immediate best-effort release without waiting.
     fn cleanup(&mut self, deadline: Instant) -> ScopeTeardownOutcome;
 }
 
@@ -360,7 +329,6 @@ impl InteractionScope {
             owner,
             opening_menu_id,
             logical_cursor,
-            posture: PostureResult::default(),
             native_evidence,
             cleanup: Some(cleanup),
             teardown: None,
@@ -372,9 +340,8 @@ impl InteractionScope {
         self.target_validity = Some(target_validity);
     }
 
-    /// Fail closed when a native provider cannot prove that partially posted
-    /// state was released. Core removes the poisoned controller after scope
-    /// teardown so the next observation constructs fresh native state.
+    /// Invalidate native target state after a concrete identity or
+    /// action-resource failure.
     pub fn invalidate_target(&self) {
         if let Some(target_validity) = &self.target_validity {
             target_validity.invalidate();
@@ -406,7 +373,6 @@ impl InteractionScope {
                 target_validity.invalidate();
             }
         }
-        self.posture = outcome.posture.clone();
         self.native_evidence.merge(outcome.native_evidence.clone());
         self.native_evidence.interaction_scope = Some(InteractionScopeEvidence {
             acquisition: self.leases.clone(),

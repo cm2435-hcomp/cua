@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::{
     contracts::{ActionId, AppRef, ObservationId, Route, VerificationLevel, WindowRef},
-    interaction::{NativeEvidence, PostureResult},
+    interaction::NativeEvidence,
     settlement::PendingSettlementEvidence,
 };
 
@@ -42,11 +42,6 @@ pub enum ErrorCode {
     TargetBusy,
     DispatchFailed,
     VerificationFailed,
-    /// A required posture witness was unavailable, incomplete, or lagged,
-    /// and no foreground, key-window, or physical-cursor disturbance was
-    /// observed. This is distinct from an observed posture violation.
-    PostureUnverifiable,
-    PostureViolated,
     Internal,
 }
 
@@ -65,10 +60,10 @@ pub struct NativeError {
     pub pending_settlement: Option<Box<PendingSettlementEvidence>>,
     #[serde(default)]
     pub related_failures: Vec<NativeErrorSummary>,
-    /// Internal platform-to-core containment signal. This is deliberately not
-    /// serialized: callers need the durable failure evidence above, while the
-    /// in-process controller needs a typed instruction never to reuse native
-    /// state whose cleanup could not be proved.
+    /// Internal platform-to-core invalidation signal. This is deliberately
+    /// not serialized: callers need the durable failure evidence above, while
+    /// the in-process controller needs a typed instruction never to reuse
+    /// native state whose cleanup could not be proved.
     #[serde(skip)]
     target_invalidated: bool,
 }
@@ -92,8 +87,6 @@ pub enum PartialEvidence {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dispatch: Option<PartialNativeDispatch>,
         #[serde(default)]
-        posture: PostureResult,
-        #[serde(default)]
         native_evidence: NativeEvidence,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_settlement: Option<Box<PendingSettlementEvidence>>,
@@ -104,8 +97,6 @@ pub enum PartialEvidence {
         app: Option<AppRef>,
         #[serde(default)]
         windows: Vec<WindowRef>,
-        #[serde(default)]
-        posture: PostureResult,
         #[serde(default)]
         native_evidence: NativeEvidence,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,30 +156,6 @@ impl NativeError {
         )
     }
 
-    pub fn from_posture(posture: &PostureResult) -> Option<Self> {
-        let observed_disturbance = posture.frontmost_changed
-            || posture.key_window_changed
-            || posture.physical_cursor_moved
-            || posture.restored_after_violation;
-        if observed_disturbance {
-            return Some(Self::new(
-                ErrorCode::PostureViolated,
-                ErrorPhase::Verify,
-                false,
-                "interaction changed the user's foreground, key window, or physical cursor posture",
-            ));
-        }
-        if !posture.held {
-            return Some(Self::new(
-                ErrorCode::PostureUnverifiable,
-                ErrorPhase::Verify,
-                false,
-                "required posture witness was unavailable, incomplete, or lagged without an observed disturbance",
-            ));
-        }
-        None
-    }
-
     pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
         self.details.insert(key.into(), value.into());
         self
@@ -214,8 +181,6 @@ impl NativeError {
 
     pub fn precedence(&self) -> u8 {
         match self.code {
-            ErrorCode::PostureViolated => 5,
-            ErrorCode::PostureUnverifiable => 4,
             ErrorCode::DispatchFailed => 3,
             ErrorCode::UiNotSettled => 2,
             ErrorCode::VerificationFailed => 1,

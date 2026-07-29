@@ -5,7 +5,7 @@ use core_foundation::base::{CFRelease, CFTypeRef};
 use cua_driver_core::api::{
     contracts::{MouseButton, Route, ScrollDirection, SelectionType, VerificationLevel},
     errors::{ErrorCode, ErrorPhase, NativeError},
-    interaction::{InteractionScope, LeaseDecision, NativeEvidence, NativeSideEffectBoundary},
+    interaction::{InteractionScope, NativeEvidence, NativeSideEffectBoundary},
     observation::ResolvedElement,
     platform::{ClickSpec, ElementScrollSpec, NativeDispatch, ResolvedAction, SelectionSpec},
     settlement::SettlementSignal,
@@ -639,7 +639,6 @@ fn preflight_scope(
         || scope.owner != target.window
         || scope.window.stamp() != target.window
         || element.window.stamp() != target.window
-        || scope.leases.posture_witness != LeaseDecision::Acquired
     {
         return Err(NativeError::new(
             ErrorCode::Internal,

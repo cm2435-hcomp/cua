@@ -342,7 +342,7 @@ fn prepare_target_focus_with(
     }
     if !ax_frontmost_acknowledged {
         return Err(NativeError::new(
-            ErrorCode::PostureUnverifiable,
+            ErrorCode::DispatchFailed,
             ErrorPhase::Preflight,
             true,
             "target did not acknowledge the synthetic focus belief through AXFrontmost",

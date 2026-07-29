@@ -16,9 +16,9 @@ use cua_driver_core::{
         AccessibilityElement, AccessibilityState, ActionId, ActionReceipt, AppId, AppRef,
         AxRevision, AxTreeUpdate, CapturedSurface, ElementId, ElementRef, ErrorCode, ErrorPhase,
         MenuRevision, MenuState, NativeError, NativeEvidence, ObservationId, PartialEvidence,
-        PartialNativeDispatch, PendingSettlementEvidence, PendingSettlementState, PostureResult,
-        Rect, ReplaceAxLines, Route, SettledState, SettlementEvidence, SettlementSignal, Size,
-        SurfaceId, SurfaceKind, VerificationLevel, WindowId, WindowRef, WindowState,
+        PartialNativeDispatch, PendingSettlementEvidence, PendingSettlementState, Rect,
+        ReplaceAxLines, Route, SettledState, SettlementEvidence, SettlementSignal, Size, SurfaceId,
+        SurfaceKind, VerificationLevel, WindowId, WindowRef, WindowState,
     },
     protocol::{
         V2Command, V2Failure, V2HandshakeRequest, V2HandshakeResponse, V2RequestEnvelope,
@@ -180,7 +180,6 @@ fn fixture_receipt() -> anyhow::Result<ActionReceipt> {
         consumed_observation_id: parse_id(ObservationId::parse("observation-2"))?,
         route: Route::TargetedPointer,
         verification: VerificationLevel::DispatchVerified,
-        posture: PostureResult::default(),
         settlement: settled_after(action_id),
         native_evidence: NativeEvidence {
             fields,
@@ -224,7 +223,6 @@ fn fixture_partial_error() -> anyhow::Result<NativeError> {
             native_evidence: evidence.clone(),
             warnings: vec!["fixture forced a typed partial dispatch".to_owned()],
         }),
-        posture: PostureResult::default(),
         native_evidence: evidence,
         pending_settlement: Some(Box::new(pending.clone())),
     }));
