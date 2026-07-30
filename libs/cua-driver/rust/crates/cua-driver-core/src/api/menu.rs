@@ -58,6 +58,31 @@ pub enum NativeMenuObservation {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuMutationIntent {
+    Opening {
+        menu_id: MenuId,
+    },
+    Targeting {
+        menu_id: MenuId,
+        identity: NativeMenuIdentity,
+    },
+    Dismissing {
+        menu_id: MenuId,
+        identity: NativeMenuIdentity,
+    },
+}
+
+impl MenuMutationIntent {
+    pub fn menu_id(&self) -> &MenuId {
+        match self {
+            Self::Opening { menu_id }
+            | Self::Targeting { menu_id, .. }
+            | Self::Dismissing { menu_id, .. } => menu_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)] // Wire shape intentionally matches the public tagged union.
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -107,7 +132,11 @@ pub enum MenuLifecycle {
     },
     Dismissing {
         id: MenuId,
+        opened_by_action_id: ActionId,
+        owner: WindowRef,
         action_id: ActionId,
+        surface_ids: Vec<SurfaceId>,
+        focused_item: Option<ElementRef>,
         native_identity: NativeMenuIdentity,
         owner_native: ResolvedWindowStamp,
     },
@@ -290,27 +319,108 @@ impl MenuControllerState {
     }
 
     pub fn begin_dismiss(&mut self, action_id: ActionId) -> Result<(), NativeError> {
-        let (id, native_identity, owner_native) = match &self.lifecycle {
+        let (
+            id,
+            opened_by_action_id,
+            owner,
+            surface_ids,
+            focused_item,
+            native_identity,
+            owner_native,
+        ) = match &self.lifecycle {
             MenuLifecycle::Open {
                 id,
+                opened_by_action_id,
+                owner,
+                surface_ids,
+                focused_item,
                 native_identity,
                 owner_native,
                 ..
             }
             | MenuLifecycle::Targeting {
                 id,
+                opened_by_action_id,
+                owner,
+                surface_ids,
+                focused_item,
                 native_identity,
                 owner_native,
                 ..
-            } => (id.clone(), native_identity.clone(), owner_native.clone()),
+            } => (
+                id.clone(),
+                opened_by_action_id.clone(),
+                owner.clone(),
+                surface_ids.clone(),
+                focused_item.clone(),
+                native_identity.clone(),
+                owner_native.clone(),
+            ),
             _ => return Err(menu_stale("no active menu is available for dismissal")),
         };
         self.lifecycle = MenuLifecycle::Dismissing {
             id,
+            opened_by_action_id,
+            owner,
             action_id,
+            surface_ids,
+            focused_item,
             native_identity,
             owner_native,
         };
+        Ok(())
+    }
+
+    pub fn abort_transition(&mut self, action_id: &ActionId) -> Result<(), NativeError> {
+        let replacement = match &self.lifecycle {
+            MenuLifecycle::Opening {
+                action_id: current, ..
+            } if current == action_id => Some(MenuLifecycle::Closed),
+            MenuLifecycle::Targeting {
+                id,
+                opened_by_action_id,
+                owner,
+                action_id: current,
+                surface_ids,
+                focused_item,
+                native_identity,
+                owner_native,
+            } if current == action_id => Some(MenuLifecycle::Open {
+                id: id.clone(),
+                opened_by_action_id: opened_by_action_id.clone(),
+                owner: owner.clone(),
+                surface_ids: surface_ids.clone(),
+                focused_item: focused_item.clone(),
+                native_identity: native_identity.clone(),
+                owner_native: owner_native.clone(),
+            }),
+            MenuLifecycle::Dismissing {
+                id,
+                opened_by_action_id,
+                owner,
+                action_id: current,
+                surface_ids,
+                focused_item,
+                native_identity,
+                owner_native,
+            } if current == action_id => Some(MenuLifecycle::Open {
+                id: id.clone(),
+                opened_by_action_id: opened_by_action_id.clone(),
+                owner: owner.clone(),
+                surface_ids: surface_ids.clone(),
+                focused_item: focused_item.clone(),
+                native_identity: native_identity.clone(),
+                owner_native: owner_native.clone(),
+            }),
+            _ => None,
+        };
+        let Some(replacement) = replacement else {
+            return Err(menu_stale(
+                "menu transition does not belong to the action being aborted",
+            ));
+        };
+        self.revision = MenuRevision::new();
+        self.lifecycle = replacement;
         Ok(())
     }
 
@@ -418,6 +528,7 @@ impl MenuControllerState {
                 action_id,
                 owner_native,
                 native_identity,
+                ..
             } => (id, action_id, owner_native, native_identity),
             _ => {
                 return Err(menu_stale(

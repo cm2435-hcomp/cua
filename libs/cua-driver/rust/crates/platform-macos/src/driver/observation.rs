@@ -47,6 +47,7 @@ use super::{
 
 const MAX_AX_ELEMENTS: usize = 2_000;
 const MAX_AX_DEPTH: usize = 25;
+const MAX_NOTIFICATION_ELEMENTS: usize = 32;
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 const SCK_CAPTURE_TEARDOWN_RESERVE: Duration = Duration::from_millis(100);
 static SCK_CAPTURE_SLOTS: Semaphore = Semaphore::const_new(2);
@@ -152,9 +153,6 @@ impl MacObservationProvider {
         .await
         .map_err(|error| AttemptError::Fatal(join_error("AX capture", error)))?
         .map_err(AttemptError::Fatal)?;
-        target
-            .replace_observed_elements(ax_snapshot.retained_elements())
-            .map_err(AttemptError::Fatal)?;
 
         let related = related_surfaces(&self.windows, &facts_a, &ax_snapshot.related_windows)
             .await
@@ -186,13 +184,15 @@ impl MacObservationProvider {
         .map_err(|error| AttemptError::Fatal(join_error("related AX revalidation", error)))?
         .map_err(AttemptError::Fatal)?;
         target
-            .replace_observed_elements(related_b_snapshot.retained_elements())
+            .replace_observed_elements(related_b_snapshot.notification_elements())
             .map_err(AttemptError::Fatal)?;
         if !same_related_identities(
             &ax_snapshot.related_windows,
             &related_b_snapshot.related_windows,
         ) {
-            return Err(AttemptError::Raced);
+            return Err(AttemptError::Raced {
+                stage: "related_ax_identity_revalidation",
+            });
         }
         let related_b = self
             .windows
@@ -203,7 +203,9 @@ impl MacObservationProvider {
             .await
             .map_err(classify_stamp_error)?;
         if related_a != related_b {
-            return Err(AttemptError::Raced);
+            return Err(AttemptError::Raced {
+                stage: "related_window_registry_revalidation",
+            });
         }
 
         let facts_b = self
@@ -211,22 +213,40 @@ impl MacObservationProvider {
             .facts_for_identity(&facts_a.stamp)
             .await
             .map_err(classify_stamp_error)?;
-        if !coherent_window_bracket(
-            &target.window,
-            &facts_a,
-            &facts_b,
-            epoch,
-            target.signals.epoch(),
-        ) {
-            return Err(AttemptError::Raced);
+        if facts_a != facts_b {
+            return Err(AttemptError::Raced {
+                stage: "window_facts_bracket",
+            });
         }
+        if !same_stable_identity(&target.window, &facts_b.stamp) {
+            return Err(AttemptError::Raced {
+                stage: "target_window_identity_bracket",
+            });
+        }
+        let current_epoch = target.signals.epoch();
+        let publish_epoch = if current_epoch == epoch {
+            epoch
+        } else if ax_snapshot_contract_difference(&ax_snapshot, &related_b_snapshot).is_none() {
+            // Some apps (notably Finder) emit AXValueChanged while their AX
+            // tree is queried or descendant notifications are installed. A
+            // notification alone is not evidence that the published state is
+            // stale: accept the later epoch only when two complete snapshots
+            // prove the exact same identities and public AX contract. The
+            // publication commit still catches any event after this point.
+            current_epoch
+        } else {
+            return Err(AttemptError::Raced {
+                stage: ax_snapshot_contract_difference(&ax_snapshot, &related_b_snapshot)
+                    .expect("non-equivalent AX snapshots have a named difference"),
+            });
+        };
 
         Ok(AttemptResult {
             facts: facts_b,
             related: related_a,
             ax_snapshot: related_b_snapshot,
             captures,
-            epoch,
+            epoch: publish_epoch,
         })
     }
 
@@ -241,7 +261,9 @@ impl MacObservationProvider {
         journal
             .commit_if_epoch(epoch, || self.publish_unbracketed(target, window, attempt))
             .map_err(AttemptError::Fatal)?
-            .ok_or(AttemptError::Raced)
+            .ok_or(AttemptError::Raced {
+                stage: "publish_signal_epoch_commit",
+            })
     }
 
     fn publish_unbracketed(
@@ -314,6 +336,7 @@ impl MacObservationProvider {
                 freshness,
                 owner,
                 approximate_bytes: capture.sample.png_bytes.len(),
+                menu_id: None,
             });
         }
 
@@ -389,14 +412,19 @@ impl ObservationProvider<MacTargetState> for MacObservationProvider {
             };
             match result {
                 Ok(update) => return Ok(update),
-                Err(AttemptError::Raced) if attempt_index == 0 => continue,
-                Err(AttemptError::Raced) => {
-                    return Err(NativeError::new(
+                Err(AttemptError::Raced { .. }) if attempt_index == 0 => continue,
+                Err(AttemptError::Raced { stage }) => {
+                    let mut error = NativeError::new(
                         ErrorCode::ObservationRaced,
                         ErrorPhase::Verify,
                         true,
                         "window identity or geometry changed twice during coherent observation",
-                    ))
+                    )
+                    .with_detail("raced_stage", stage);
+                    if let Some(signal) = target.signals.latest_signal() {
+                        error = error.with_detail("latest_signal", format!("{signal:?}"));
+                    }
+                    return Err(error);
                 }
                 Err(AttemptError::Fatal(error)) => return Err(error),
             }
@@ -406,7 +434,7 @@ impl ObservationProvider<MacTargetState> for MacObservationProvider {
 }
 
 enum AttemptError {
-    Raced,
+    Raced { stage: &'static str },
     Fatal(NativeError),
 }
 
@@ -418,7 +446,9 @@ fn classify_stamp_error(error: NativeError) -> AttemptError {
             | ErrorCode::WindowIdentityChanged
             | ErrorCode::WindowNotFound
     ) {
-        AttemptError::Raced
+        AttemptError::Raced {
+            stage: "window_registry_identity_revalidation",
+        }
     } else {
         AttemptError::Fatal(error)
     }
@@ -440,6 +470,7 @@ fn same_stable_identity(left: &ResolvedWindowStamp, right: &ResolvedWindowStamp)
         && left.process == right.process
 }
 
+#[cfg(test)]
 fn coherent_window_bracket(
     target: &ResolvedWindowStamp,
     facts_a: &MacWindowFacts,
@@ -973,8 +1004,47 @@ struct RawAxSnapshot {
 }
 
 impl RawAxSnapshot {
-    fn retained_elements(&self) -> Vec<RetainedAxElement> {
-        self.nodes.iter().map(|node| node.element.clone()).collect()
+    fn notification_elements(&self) -> Vec<RetainedAxElement> {
+        let mut elements = Vec::with_capacity(MAX_NOTIFICATION_ELEMENTS);
+        let mut push_unique = |element: &RetainedAxElement| {
+            if elements.len() < MAX_NOTIFICATION_ELEMENTS
+                && !elements
+                    .iter()
+                    .any(|candidate: &RetainedAxElement| candidate.same_identity(element))
+            {
+                elements.push(element.clone());
+            }
+        };
+
+        if let Some(focused) = &self.focused {
+            push_unique(focused);
+        }
+        for node in &self.nodes {
+            if node.selected
+                || node.value_settable == Some(true)
+                || node.selected_text_settable == Some(true)
+                || node.selected_text_range_settable == Some(true)
+            {
+                push_unique(&node.element);
+            }
+        }
+        for node in &self.nodes {
+            if matches!(
+                node.role.as_str(),
+                "AXWindow"
+                    | "AXMenu"
+                    | "AXScrollArea"
+                    | "AXScrollBar"
+                    | "AXTextArea"
+                    | "AXTextField"
+            ) {
+                push_unique(&node.element);
+            }
+        }
+        for node in &self.nodes {
+            push_unique(&node.element);
+        }
+        elements
     }
 }
 
@@ -1000,6 +1070,80 @@ fn same_related_identities(left: &[RawRelatedWindow], right: &[RawRelatedWindow]
                     && candidate.element.same_identity(&current.element)
             })
         })
+}
+
+fn ax_snapshot_contract_difference(
+    left: &RawAxSnapshot,
+    right: &RawAxSnapshot,
+) -> Option<&'static str> {
+    if left.truncated != right.truncated {
+        return Some("ax_snapshot_truncation_changed");
+    }
+    if left.nodes.len() != right.nodes.len() {
+        return Some("ax_snapshot_node_count_changed");
+    }
+    for (left, right) in left.nodes.iter().zip(&right.nodes) {
+        if !left.element.same_identity(&right.element) {
+            return Some("ax_snapshot_element_identity_changed");
+        }
+        if !same_optional_ax_identity(left.parent.as_ref(), right.parent.as_ref()) {
+            return Some("ax_snapshot_parent_identity_changed");
+        }
+        if left.depth != right.depth || left.owner_window_id != right.owner_window_id {
+            return Some("ax_snapshot_ownership_changed");
+        }
+        if left.role != right.role
+            || left.role_proven != right.role_proven
+            || left.subrole != right.subrole
+            || left.orientation != right.orientation
+        {
+            return Some("ax_snapshot_role_changed");
+        }
+        if left.label != right.label {
+            return Some("ax_snapshot_label_changed");
+        }
+        if left.value != right.value
+            || left.value_query_proven != right.value_query_proven
+            || left.string_value != right.string_value
+            || left.value_settable != right.value_settable
+        {
+            return Some("ax_snapshot_value_changed");
+        }
+        if left.selected_text_range != right.selected_text_range
+            || left.selected_text_range_settable != right.selected_text_range_settable
+            || left.selected_text_settable != right.selected_text_settable
+            || left.selected != right.selected
+        {
+            return Some("ax_snapshot_selection_changed");
+        }
+        if left.bounds != right.bounds {
+            return Some("ax_snapshot_bounds_changed");
+        }
+        if left.actions != right.actions || left.actions_proven != right.actions_proven {
+            return Some("ax_snapshot_actions_changed");
+        }
+    }
+    if !same_optional_ax_identity(left.focused.as_ref(), right.focused.as_ref()) {
+        return Some("ax_snapshot_focus_changed");
+    }
+    if left.selected_text != right.selected_text {
+        return Some("ax_snapshot_selected_text_changed");
+    }
+    if left.document_text != right.document_text {
+        return Some("ax_snapshot_document_text_changed");
+    }
+    None
+}
+
+fn same_optional_ax_identity(
+    left: Option<&RetainedAxElement>,
+    right: Option<&RetainedAxElement>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.same_identity(right),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn capture_ax_snapshot(
@@ -1044,14 +1188,6 @@ fn capture_ax_snapshot(
             &mut visited,
             &mut truncated,
         );
-        if nodes.iter().any(|node| node.role == "AXMenu") {
-            CFRelease(target as CFTypeRef);
-            CFRelease(application as CFTypeRef);
-            return Err(NativeError::stale(
-                ErrorCode::MenuStateStale,
-                "AX menu detected without a canonical MenuId/action provenance; Plan003 refuses to publish point-actionable menu pixels or elements",
-            ));
-        }
         if nodes.len() == 1
             && nodes[0].role == "AXWindow"
             && nodes[0].actions.is_empty()
@@ -1093,6 +1229,38 @@ fn capture_ax_snapshot(
             truncated,
         })
     }
+}
+
+pub(crate) fn discover_native_menu(
+    pid: i32,
+    target_window_id: u32,
+) -> Result<Option<(u32, RetainedAxElement)>, NativeError> {
+    let snapshot = capture_ax_snapshot(pid, target_window_id, false)?;
+    let Some(root_menu_depth) = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.role == "AXMenu")
+        .map(|node| node.depth)
+        .min()
+    else {
+        return Ok(None);
+    };
+    let mut menus = snapshot
+        .nodes
+        .into_iter()
+        .filter(|node| node.role == "AXMenu" && node.depth == root_menu_depth);
+    let menu = menus
+        .next()
+        .expect("minimum AXMenu depth came from one menu node");
+    if menus.next().is_some() {
+        return Err(NativeError::stale(
+            ErrorCode::MenuStateStale,
+            "more than one outermost native menu element was attributable to the target action",
+        ));
+    }
+    let window_id =
+        unsafe { bindings::ax_get_window_id(menu.element.as_ptr()) }.unwrap_or(target_window_id);
+    Ok(Some((window_id, menu.element)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1249,6 +1417,7 @@ struct RegisteredElement {
     role_proven: bool,
     subrole: Option<String>,
     orientation: Option<String>,
+    label: Option<String>,
     value_proof: Option<RetainedCfValue>,
     value_query_proven: bool,
     string_value: Option<String>,
@@ -1271,6 +1440,7 @@ impl RegisteredElement {
             role_proven: self.role_proven,
             subrole: self.subrole.clone(),
             orientation: self.orientation.clone(),
+            label: self.label.clone(),
             value_proof: self.value_proof.clone(),
             value_query_proven: self.value_query_proven,
             string_value: self.string_value.clone(),
@@ -1294,6 +1464,7 @@ pub(crate) struct RegisteredElementSnapshot {
     pub role_proven: bool,
     pub subrole: Option<String>,
     pub orientation: Option<String>,
+    pub label: Option<String>,
     pub value_proof: Option<RetainedCfValue>,
     pub value_query_proven: bool,
     pub string_value: Option<String>,
@@ -1383,7 +1554,7 @@ impl MacElementRegistry {
                 owner: owner.clone(),
                 role: Some(node.role.clone()),
                 subrole: node.subrole.clone(),
-                label: node.label,
+                label: node.label.clone(),
                 value: node.value,
                 bounds,
                 actions: node.actions.clone(),
@@ -1400,6 +1571,7 @@ impl MacElementRegistry {
                 role_proven: node.role_proven,
                 subrole: node.subrole,
                 orientation: node.orientation,
+                label: node.label,
                 value_proof: node.value_proof,
                 value_query_proven: node.value_query_proven,
                 string_value: node.string_value,
@@ -1798,6 +1970,41 @@ mod tests {
         assert_ne!(
             stable.update.elements[0].id,
             replacement.update.elements[0].id
+        );
+    }
+
+    #[test]
+    fn notification_watch_set_is_bounded_and_keeps_high_signal_elements() {
+        let natives: Vec<_> = (0..40)
+            .map(|index| CFString::new(&format!("native-{index}")))
+            .collect();
+        let mut snapshot = raw_snapshot(&natives[0], "0");
+        snapshot.nodes.clear();
+        for (index, native) in natives.iter().enumerate() {
+            snapshot
+                .nodes
+                .push(raw_snapshot(native, &index.to_string()).nodes.remove(0));
+        }
+        snapshot.focused = Some(snapshot.nodes[35].element.clone());
+        snapshot.nodes[35].selected = true;
+        snapshot.nodes[36].selected = true;
+        snapshot.nodes[37].value_settable = Some(true);
+        snapshot.nodes[38].role = "AXWindow".to_owned();
+
+        let watched = snapshot.notification_elements();
+
+        assert_eq!(watched.len(), MAX_NOTIFICATION_ELEMENTS);
+        for expected in [35, 36, 37, 38] {
+            assert!(watched
+                .iter()
+                .any(|element| element.same_identity(&snapshot.nodes[expected].element)));
+        }
+        assert_eq!(
+            watched
+                .iter()
+                .filter(|element| element.same_identity(&snapshot.nodes[35].element))
+                .count(),
+            1
         );
     }
 

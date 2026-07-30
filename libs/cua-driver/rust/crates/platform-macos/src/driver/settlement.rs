@@ -117,6 +117,15 @@ impl MacSignalJournal {
             .epoch
     }
 
+    pub fn latest_signal(&self) -> Option<SettlementSignal> {
+        self.state
+            .lock()
+            .expect("macOS signal journal poisoned")
+            .signals
+            .back()
+            .map(|record| record.signal)
+    }
+
     /// Run a synchronous publication while native callbacks are excluded from
     /// advancing the epoch. `None` means evidence changed since the caller's
     /// A-side sample and no publication occurred.
@@ -329,6 +338,18 @@ unsafe fn focused_window_id(application: AXUIElementRef) -> Option<u32> {
     let window_id = bindings::ax_get_window_id(value.cast_mut().cast());
     CFRelease(value);
     window_id
+}
+
+pub(crate) fn target_is_focused_window(pid: i32, target_window_id: u32) -> Option<bool> {
+    unsafe {
+        let application = AXUIElementCreateApplication(pid);
+        if application.is_null() {
+            return None;
+        }
+        let focused = focused_window_id(application).map(|window_id| window_id == target_window_id);
+        CFRelease(application.cast());
+        focused
+    }
 }
 
 fn event_for_notification(notification: &str) -> Option<MacAxEvent> {
@@ -677,6 +698,10 @@ unsafe fn run_ax_observer(
         while let Ok(command) = commands.try_recv() {
             match command {
                 ObserverCommand::ReplaceElements { elements, reply } => {
+                    if same_observed_elements(&observed_elements, &elements) {
+                        let _ = reply.send(Ok(()));
+                        continue;
+                    }
                     remove_descendant_notifications(
                         observer,
                         &observed_elements,
@@ -717,6 +742,14 @@ unsafe fn run_ax_observer(
     CFRelease(target as CFTypeRef);
     CFRelease(application as CFTypeRef);
     Ok(())
+}
+
+fn same_observed_elements(left: &[RetainedAxElement], right: &[RetainedAxElement]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.same_identity(right))
 }
 
 unsafe fn remove_static_notifications(

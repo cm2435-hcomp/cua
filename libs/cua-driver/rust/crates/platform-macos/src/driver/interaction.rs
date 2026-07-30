@@ -17,9 +17,11 @@ use cua_driver_core::api::{
         ScopeCleanup, ScopeLeaseAcquisition, ScopeLeaseTeardown, ScopePlan, ScopeRequirements,
         ScopeTeardownOutcome, TargetCursorHandle,
     },
+    menu::MenuMutationIntent,
     observation::ResolvedWindow,
     platform::{InteractionProvider, ResolvedAction},
 };
+use serde_json::Value;
 
 use crate::{ax::enablement::AxEnablementLease, input::keyboard::normalize_chord};
 
@@ -29,6 +31,7 @@ use super::{
         MacScopeRecipe, MenuSuppressionRecipe, TargetBeliefRecipe,
     },
     menu::{self, MenuSuppressionPlan},
+    settlement::target_is_focused_window,
     target::{MacFocusState, MacTargetFocusCoordinator, MacTargetState},
     windows::{MacWindowFacts, MacWindowRegistry},
 };
@@ -62,6 +65,7 @@ trait MacInteractionHooks: Send + Sync {
         &self,
         recipe: MenuSuppressionRecipe,
         plan: &MenuSuppressionPlan,
+        focus_state: Arc<Mutex<MacFocusState>>,
     ) -> Result<Option<Box<dyn LeaseResource>>, NativeError>;
 
     fn prepare_target_belief(
@@ -95,8 +99,9 @@ impl MacInteractionHooks for SystemInteractionHooks {
         &self,
         _recipe: MenuSuppressionRecipe,
         plan: &MenuSuppressionPlan,
+        focus_state: Arc<Mutex<MacFocusState>>,
     ) -> Result<Option<Box<dyn LeaseResource>>, NativeError> {
-        menu::acquire_production(plan).map(|resource| {
+        menu::acquire_production(plan, focus_state).map(|resource| {
             resource
                 .map(|resource| Box::new(MenuResourceAdapter(resource)) as Box<dyn LeaseResource>)
         })
@@ -187,6 +192,7 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
         ensure_target_live(target, focus, window)?;
         let facts = self.windows.facts_for_stamp(&window.stamp()).await?;
         ensure_native_facts_match(&facts, target, window)?;
+        ensure_actionable_window_state(&facts)?;
         if let ResolvedAction::PressKey { stroke, .. } = action {
             // Platform key vocabulary is validated before any accessibility
             // lease or target-focus preparation is acquired.
@@ -194,14 +200,7 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
         }
         let recipe =
             select_scope_recipe(&self.host, &window.framework, route, action, &requirements)?;
-        let menu = if requirements.menu_dismissal {
-            return Err(NativeError::unsupported(
-                "recipe_unproven: required menu suppression has no exact predicate",
-            )
-            .with_detail("recipe_status", "recipe_unproven"));
-        } else {
-            MenuSuppressionPlan::NotApplicable
-        };
+        let menu = MenuSuppressionPlan::NotApplicable;
         Ok(ScopePlan::new(
             action_id.clone(),
             window.clone(),
@@ -221,7 +220,7 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
         &self,
         target: &mut MacTargetState,
         focus: &mut MacTargetFocusCoordinator,
-        plan: ScopePlan<Self::NativeScopePlan>,
+        mut plan: ScopePlan<Self::NativeScopePlan>,
         logical_cursor: TargetCursorHandle,
     ) -> Result<InteractionScope, NativeError> {
         ensure_target_live(target, focus, &plan.window)?;
@@ -233,12 +232,46 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
             ));
         }
         ensure_native_facts_match(&live_facts, target, &plan.window)?;
+        plan.native.menu = match &plan.menu_intent {
+            Some(intent) => {
+                let menu_pid = match intent {
+                    MenuMutationIntent::Opening { .. } => None,
+                    MenuMutationIntent::Targeting { identity, .. }
+                    | MenuMutationIntent::Dismissing { identity, .. } => {
+                        if identity.process != live_facts.stamp.process {
+                            return Err(NativeError::unsupported(
+                                "cross-process native menu suppression requires a second exact per-menu PID tap",
+                            )
+                            .with_detail("recipe_status", "cross_process_menu_tap_unavailable"));
+                        }
+                        Some(live_facts.pid)
+                    }
+                };
+                MenuSuppressionPlan::ExactSourcePidPredicate {
+                    target_pid: live_facts.pid,
+                    menu_pid,
+                    menu_id: intent.menu_id().clone(),
+                    action_id: plan.action_id.clone(),
+                }
+            }
+            None => MenuSuppressionPlan::NotApplicable,
+        };
+        if plan.requirements.menu_dismissal != plan.menu_intent.is_some() {
+            return Err(NativeError::new(
+                ErrorCode::Internal,
+                cua_driver_core::api::errors::ErrorPhase::Preflight,
+                false,
+                "menu suppression requirement and bound menu intent disagree",
+            ));
+        }
 
+        let focus_state = focus.state_handle();
+        target.bind_menu_focus_state(Arc::clone(&focus_state));
         let acquired = acquire_resources(
             self.hooks.as_ref(),
             &plan,
             target.poison_handle(),
-            focus.state_handle(),
+            focus_state,
         )?;
         Ok(plan.into_scope(
             acquired.acquisition,
@@ -246,6 +279,26 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
             acquired.evidence,
             Box::new(acquired.cleanup),
         ))
+    }
+}
+
+fn ensure_actionable_window_state(facts: &MacWindowFacts) -> Result<(), NativeError> {
+    use cua_driver_core::api::capabilities::WindowStateKind;
+
+    match &facts.state {
+        WindowStateKind::Visible | WindowStateKind::Occluded => Ok(()),
+        WindowStateKind::Minimized => Err(NativeError::unsupported(
+            "macOS background actions refuse an exact minimized target window",
+        )
+        .with_detail("window_state", "minimized")),
+        WindowStateKind::OffSpace => Err(NativeError::unsupported(
+            "macOS background actions refuse an exact off-Space target window",
+        )
+        .with_detail("window_state", "off_space")),
+        WindowStateKind::Unknown => Err(NativeError::unsupported(
+            "macOS background actions require an exact current window-state classification",
+        )
+        .with_detail("window_state", "unknown")),
     }
 }
 
@@ -289,13 +342,27 @@ fn acquire_resources(
     poison: Arc<AtomicBool>,
     focus_state: Arc<Mutex<MacFocusState>>,
 ) -> Result<AcquiredResources, NativeError> {
-    let mut cleanup = MacScopeCleanup::new(poison, plan.deadline.teardown);
+    let frontmost_pid_before = crate::apps::frontmost_pid();
+    let key_window_before =
+        target_is_focused_window(plan.native.facts.pid, plan.native.facts.cg_window_id);
+    let mut cleanup = MacScopeCleanup::new(
+        poison,
+        plan.deadline.teardown,
+        plan.native.facts.pid,
+        plan.native.facts.cg_window_id,
+        frontmost_pid_before,
+        key_window_before,
+    );
     let mut target_belief_evidence = None;
 
     let result = (|| {
         cleanup.accessibility =
             hooks.acquire_accessibility(plan.native.recipe.accessibility, plan.native.facts.pid)?;
-        cleanup.menu = hooks.acquire_menu(plan.native.recipe.menu, &plan.native.menu)?;
+        cleanup.menu = hooks.acquire_menu(
+            plan.native.recipe.menu,
+            &plan.native.menu,
+            Arc::clone(&focus_state),
+        )?;
         target_belief_evidence = hooks.prepare_target_belief(
             plan.native.recipe.target_belief,
             &plan.native.facts,
@@ -342,6 +409,23 @@ fn acquire_resources(
         "cg_window_id".to_owned(),
         plan.native.facts.cg_window_id.into(),
     );
+    evidence.fields.insert(
+        "frontmost_pid_before".to_owned(),
+        frontmost_pid_before.map_or(Value::Null, Value::from),
+    );
+    evidence.fields.insert(
+        "key_window_before".to_owned(),
+        key_window_before.map_or(Value::Null, Value::from),
+    );
+    evidence
+        .fields
+        .insert("activation_requested".to_owned(), false.into());
+    evidence
+        .fields
+        .insert("hardware_cursor_warp_attempted".to_owned(), false.into());
+    evidence
+        .fields
+        .insert("user_intervention_signal".to_owned(), Value::Null);
     if let Some(target_belief_evidence) = target_belief_evidence {
         evidence.merge(target_belief_evidence);
     }
@@ -363,16 +447,31 @@ fn decision(resource: &Option<Box<dyn LeaseResource>>) -> LeaseDecision {
 struct MacScopeCleanup {
     poison: Arc<AtomicBool>,
     teardown_deadline: Instant,
+    target_pid: i32,
+    target_window_id: u32,
+    frontmost_pid_before: Option<i32>,
+    key_window_before: Option<bool>,
     accessibility: Option<Box<dyn LeaseResource>>,
     menu: Option<Box<dyn LeaseResource>>,
     outcome: Option<ScopeTeardownOutcome>,
 }
 
 impl MacScopeCleanup {
-    fn new(poison: Arc<AtomicBool>, teardown_deadline: Instant) -> Self {
+    fn new(
+        poison: Arc<AtomicBool>,
+        teardown_deadline: Instant,
+        target_pid: i32,
+        target_window_id: u32,
+        frontmost_pid_before: Option<i32>,
+        key_window_before: Option<bool>,
+    ) -> Self {
         Self {
             poison,
             teardown_deadline,
+            target_pid,
+            target_window_id,
+            frontmost_pid_before,
+            key_window_before,
             accessibility: None,
             menu: None,
             outcome: None,
@@ -394,6 +493,30 @@ impl ScopeCleanup for MacScopeCleanup {
             deadline,
             &mut evidence,
             &mut failures,
+        );
+        let frontmost_pid_after = crate::apps::frontmost_pid();
+        let key_window_after = target_is_focused_window(self.target_pid, self.target_window_id);
+        evidence.fields.insert(
+            "frontmost_pid_before".to_owned(),
+            self.frontmost_pid_before.map_or(Value::Null, Value::from),
+        );
+        evidence.fields.insert(
+            "frontmost_pid_after".to_owned(),
+            frontmost_pid_after.map_or(Value::Null, Value::from),
+        );
+        evidence.fields.insert(
+            "target_became_frontmost".to_owned(),
+            (self.frontmost_pid_before != Some(self.target_pid)
+                && frontmost_pid_after == Some(self.target_pid))
+            .into(),
+        );
+        evidence.fields.insert(
+            "key_window_before".to_owned(),
+            self.key_window_before.map_or(Value::Null, Value::from),
+        );
+        evidence.fields.insert(
+            "key_window_after".to_owned(),
+            key_window_after.map_or(Value::Null, Value::from),
         );
 
         if !failures.is_empty() {
@@ -534,6 +657,7 @@ mod tests {
             &self,
             _recipe: MenuSuppressionRecipe,
             _plan: &MenuSuppressionPlan,
+            _focus_state: Arc<Mutex<MacFocusState>>,
         ) -> Result<Option<Box<dyn LeaseResource>>, NativeError> {
             self.acquire("menu+", "menu-")
         }
@@ -561,6 +685,7 @@ mod tests {
     fn scope_plan() -> ScopePlan<MacNativeScopePlan> {
         let app = AppRef {
             id: AppId::parse("app").unwrap(),
+            canonical_id: None,
             name: Some("Fixture".to_owned()),
             pid: Some(44),
             running: true,
@@ -684,7 +809,14 @@ mod tests {
     fn every_release_is_attempted_after_an_earlier_cleanup_failure() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let poison = Arc::new(AtomicBool::new(false));
-        let mut cleanup = MacScopeCleanup::new(Arc::clone(&poison), test_deadline().teardown);
+        let mut cleanup = MacScopeCleanup::new(
+            Arc::clone(&poison),
+            test_deadline().teardown,
+            44,
+            99,
+            Some(7),
+            Some(false),
+        );
         cleanup.menu = Some(Box::new(LoggedLease {
             log: Arc::clone(&log),
             release: "menu-",

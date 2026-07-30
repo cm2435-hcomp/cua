@@ -113,6 +113,8 @@ pub struct AppQuery {
 pub struct AppRef {
     pub id: AppId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -431,12 +433,12 @@ pub enum ScrollRequest {
         element: ElementRef,
         direction: ScrollDirection,
         #[serde(default = "default_pages")]
-        pages: u16,
+        pages: f64,
     },
 }
 
-fn default_pages() -> u16 {
-    1
+fn default_pages() -> f64 {
+    1.0
 }
 
 impl ScrollRequest {
@@ -464,8 +466,8 @@ impl ScrollRequest {
                 }
                 Ok(())
             }
-            Self::Element { pages, .. } if !(1..=100).contains(pages) => {
-                Err("pages must be between 1 and 100".to_owned())
+            Self::Element { pages, .. } if !pages.is_finite() || *pages <= 0.0 => {
+                Err("pages must be positive and finite".to_owned())
             }
             _ => Ok(()),
         }

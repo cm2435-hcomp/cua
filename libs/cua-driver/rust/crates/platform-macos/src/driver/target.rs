@@ -5,7 +5,8 @@ use std::sync::{
 
 use async_trait::async_trait;
 use cua_driver_core::api::{
-    errors::NativeError,
+    contracts::{ActionId, MenuId},
+    errors::{ErrorCode, ErrorPhase, NativeError},
     observation::{InvalidationReason, NativeProcessHandle, ResolvedWindowStamp},
     platform::{InvalidationSubscription, TargetFocusCoordinator, TargetInvalidation},
 };
@@ -113,6 +114,7 @@ pub struct MacTargetState {
     observer: Option<MacAxObserverRegistration>,
     display_observer: Option<MacDisplayObserverRegistration>,
     invalidated: Arc<AtomicBool>,
+    menu_focus_state: Option<Arc<Mutex<MacFocusState>>>,
 }
 
 impl MacTargetState {
@@ -165,6 +167,7 @@ impl MacTargetState {
             observer: Some(observer),
             display_observer: Some(display_observer),
             invalidated: Arc::new(AtomicBool::new(false)),
+            menu_focus_state: None,
         })
     }
 
@@ -196,6 +199,52 @@ impl MacTargetState {
     pub(crate) fn poison_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.invalidated)
     }
+
+    pub(crate) fn bind_menu_focus_state(&mut self, state: Arc<Mutex<MacFocusState>>) {
+        self.menu_focus_state = Some(state);
+    }
+
+    pub(crate) fn arm_menu_suppression(
+        &self,
+        action_id: &ActionId,
+        menu_id: &MenuId,
+    ) -> Result<(), NativeError> {
+        let state = self.menu_focus_state.as_ref().ok_or_else(|| {
+            NativeError::new(
+                ErrorCode::Internal,
+                ErrorPhase::Dispatch,
+                false,
+                "menu suppression has no target focus-state binding",
+            )
+        })?;
+        let mut state = state.lock().map_err(|_| {
+            NativeError::new(
+                ErrorCode::Internal,
+                ErrorPhase::Dispatch,
+                false,
+                "menu suppression focus-state lock was poisoned",
+            )
+        })?;
+        if state.menu_suppression_action_id.as_ref() != Some(action_id)
+            || state.menu_suppression_menu_id.as_ref() != Some(menu_id)
+        {
+            return Err(NativeError::stale(
+                ErrorCode::MenuStateStale,
+                "menu suppression reservation no longer matches the dispatched action",
+            ));
+        }
+        if state.menu_dismissal_suppression_enabled {
+            return Err(NativeError::new(
+                ErrorCode::TargetBusy,
+                ErrorPhase::Dispatch,
+                false,
+                "menu suppression was already armed for this action",
+            ));
+        }
+        state.menu_dismissal_suppression_enabled = true;
+        state.menu_suppression_was_armed = true;
+        Ok(())
+    }
 }
 
 impl Drop for MacTargetState {
@@ -212,6 +261,13 @@ pub(crate) struct MacFocusState {
     pub application_is_active: bool,
     pub application_believes_it_is_active: bool,
     pub application_believes_it_has_focus: bool,
+    pub menu_dismissal_suppression_enabled: bool,
+    pub menu_pid: Option<i32>,
+    pub menu_suppression_action_id: Option<ActionId>,
+    pub menu_suppression_menu_id: Option<MenuId>,
+    pub menu_suppression_was_armed: bool,
+    pub menu_suppressed_event_count: u64,
+    pub menu_last_suppressed_source_pid: Option<i32>,
 }
 
 impl MacFocusState {
@@ -224,6 +280,13 @@ impl MacFocusState {
             application_is_active,
             application_believes_it_is_active: application_is_active,
             application_believes_it_has_focus: application_is_active,
+            menu_dismissal_suppression_enabled: false,
+            menu_pid: None,
+            menu_suppression_action_id: None,
+            menu_suppression_menu_id: None,
+            menu_suppression_was_armed: false,
+            menu_suppressed_event_count: 0,
+            menu_last_suppressed_source_pid: None,
         }
     }
 }

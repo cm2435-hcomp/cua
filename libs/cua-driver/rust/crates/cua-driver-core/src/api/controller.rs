@@ -22,14 +22,15 @@ use super::{
     },
     errors::{ErrorCode, ErrorPhase, NativeError, PartialEvidence, PartialNativeDispatch},
     interaction::{MutationDeadline, NativeSideEffectBoundary, ScopePlan, ScopeRequirements},
+    menu::{MenuLifecycle, MenuMutationIntent},
     observation::{
         revision_accessibility, ObservationRecord, ResolvedDrag, ResolvedScroll, ResolvedWindow,
     },
     platform::{
-        ClickSpec, ElementScrollSpec, InteractionProvider, KeyboardActionProvider, LaunchScope,
-        LifecycleProvider, NativeDispatch, ObservationProvider, ObserveRequest, PlatformDriver,
-        PointerActionProvider, ResolvedAction, SelectionSpec, SemanticActionProvider,
-        WindowProvider,
+        Candidate, ClickSpec, ElementScrollSpec, InteractionProvider, KeyboardActionProvider,
+        LaunchScope, LifecycleProvider, NativeDispatch, ObservationProvider, ObserveRequest,
+        PlatformDriver, PointerActionProvider, ResolvedAction, SelectionSpec,
+        SemanticActionProvider, WindowProvider,
     },
     settlement::{
         PendingSettlementEvidence, SettlementAttempt, SettlementEvidence, SettlementProfile,
@@ -211,7 +212,7 @@ impl<P: PlatformDriver> DriverController<P> {
         let mut state = target.state.lock().await;
         ensure_target_window_matches(&state.window, &resolved)?;
         let settlement = self.settle_if_dirty(&mut state, true, None).await?;
-        let native = self
+        let mut native = self
             .platform
             .observation()
             .observe(
@@ -230,6 +231,27 @@ impl<P: PlatformDriver> DriverController<P> {
         ensure_target_window_matches(&resolved, &native.window)?;
         let observed_window = native.window.clone();
         state.window = observed_window.clone();
+        if let MenuLifecycle::Open {
+            id,
+            native_identity,
+            ..
+        } = state.menu.lifecycle()
+        {
+            for surface in &mut native.surfaces {
+                if surface.kind == super::contracts::SurfaceKind::Menu
+                    && surface.owner_window.id != observed_window.public.id
+                {
+                    surface.menu_id = Some(id.clone());
+                }
+            }
+            if let Some(accessibility) = &mut native.accessibility {
+                for element in &mut accessibility.elements {
+                    if element.owner.native_window == native_identity.window {
+                        element.menu_id = Some(id.clone());
+                    }
+                }
+            }
+        }
 
         let observation_id = ObservationId::new();
         let tree_bytes = native
@@ -451,7 +473,9 @@ impl<P: PlatformDriver> DriverController<P> {
                     direction,
                     pages,
                 } => Ok(ResolvedAction::ElementScroll {
-                    element: state.observations.resolve_element(window, &element)?,
+                    source: element.clone(),
+                    element: Box::new(state.observations.resolve_element(window, &element)?),
+                    point: None,
                     spec: ElementScrollSpec { direction, pages },
                 }),
             },
@@ -660,113 +684,107 @@ impl<P: PlatformDriver> DriverController<P> {
             error.pending_settlement = state.settlement.pending_evidence().map(Box::new);
             return Err(error);
         }
-        // Freshness and handle resolution precede capability routing so an
-        // unsupported cell cannot hide a stale/cross-window request.
+        // Freshness and handle resolution precede live route selection. The
+        // capability registry is release evidence only and cannot select or
+        // refuse a route.
         let prepared = prepare(&mut state, &resolved)?;
         validate_current_menu_target(&state, &prepared)?;
         let targeted_menu_id = resolved_action_menu_id(&prepared).cloned();
-        let (route, prepared) = if let ResolvedAction::ElementClick {
-            source,
-            element,
-            spec,
-        } = prepared
-        {
-            let semantic_usable = self
+        let (route, prepared, effective_addressing, candidate_detail) = match prepared {
+            ResolvedAction::ElementClick {
+                source,
+                element,
+                spec,
+            } => match self
                 .platform
                 .semantic()
                 .element_click_candidate(&mut state.platform, &element, &spec)
-                .await?;
-            let semantic_key = capability_key(
-                &self.platform_name,
-                &self.os_version,
-                &action,
-                AddressingMode::Element,
-                &resolved,
-            );
-            let semantic_decision = self.capabilities.read().await.decision(&semantic_key);
-            match (semantic_usable, semantic_decision) {
-                (true, RouteDecision::Supported { route: Route::Semantic }) => (
+                .await?
+            {
+                Candidate::Prepared(()) => (
                     Route::Semantic,
                     ResolvedAction::ElementClick {
                         source,
                         element,
                         spec,
                     },
+                    AddressingMode::Element,
+                    "semantic_ax_action".to_owned(),
                 ),
-                (true, RouteDecision::Supported { route }) => {
-                    return Err(NativeError::new(
-                        ErrorCode::Internal,
-                        ErrorPhase::Preflight,
-                        false,
-                        "element capability published a non-semantic route for an exact semantic click candidate",
-                    )
-                    .with_detail("published_route", format!("{route:?}")))
-                }
-                (semantic_usable, semantic_decision) => {
-                    let point = state.observations.resolve_element_point(&resolved, &source)?;
-                    let point_key = capability_key(
-                        &self.platform_name,
-                        &self.os_version,
-                        &action,
+                Candidate::NotApplicable { reason } => {
+                    let point = state
+                        .observations
+                        .resolve_element_point(&resolved, &source)?;
+                    (
+                        Route::TargetedPointer,
+                        ResolvedAction::PointClick { point, spec },
                         AddressingMode::CapturedPoint,
-                        &resolved,
-                    );
-                    match self.capabilities.read().await.decision(&point_key) {
-                        RouteDecision::Supported {
-                            route: Route::TargetedPointer,
-                        } => (
-                            Route::TargetedPointer,
-                            ResolvedAction::PointClick { point, spec },
-                        ),
-                        RouteDecision::Supported { route } => {
-                            return Err(NativeError::new(
-                                ErrorCode::Internal,
-                                ErrorPhase::Preflight,
-                                false,
-                                "captured-point capability published a non-pointer route",
-                            )
-                            .with_detail("published_route", format!("{route:?}")))
-                        }
-                        RouteDecision::Unsupported { reason } => {
-                            let semantic_reason = match semantic_decision {
-                                RouteDecision::Unsupported { reason } => reason,
-                                RouteDecision::Supported { .. } if !semantic_usable => {
-                                    "element did not retain an exact usable semantic AXPress candidate"
-                                        .to_owned()
-                                }
-                                RouteDecision::Supported { .. } => unreachable!(),
-                            };
-                            return Err(NativeError::unsupported(
-                                "no exact background element-click route is currently usable",
-                            )
-                            .with_detail("semantic_reason", semantic_reason)
-                            .with_detail("captured_point_reason", reason)
-                            .with_detail("framework", format!("{:?}", resolved.framework)));
-                        }
-                    }
+                        format!("semantic_not_applicable:{reason}"),
+                    )
                 }
+            },
+            ResolvedAction::ElementScroll {
+                source,
+                element,
+                point: _,
+                spec,
+            } => match self
+                .platform
+                .semantic()
+                .element_scroll_candidate(&mut state.platform, &element, &spec)
+                .await?
+            {
+                Candidate::Prepared(()) => (
+                    Route::Semantic,
+                    ResolvedAction::ElementScroll {
+                        source,
+                        element,
+                        point: None,
+                        spec,
+                    },
+                    AddressingMode::Element,
+                    "semantic_page_scroll".to_owned(),
+                ),
+                Candidate::NotApplicable { reason } => {
+                    let point = state
+                        .observations
+                        .resolve_element_point(&resolved, &source)?;
+                    (
+                        Route::TargetedPointer,
+                        ResolvedAction::ElementScroll {
+                            source,
+                            element,
+                            point: Some(point),
+                            spec,
+                        },
+                        AddressingMode::CapturedPoint,
+                        format!("semantic_not_applicable:{reason}"),
+                    )
+                }
+            },
+            prepared => {
+                let route = route_for_live_action(&prepared);
+                (
+                    route,
+                    adapt_action_route(&mut state, &resolved, route, prepared)?,
+                    addressing,
+                    "direct_live_provider".to_owned(),
+                )
             }
-        } else {
-            let capability_key = capability_key(
-                &self.platform_name,
-                &self.os_version,
-                &action,
-                addressing,
-                &resolved,
-            );
-            let route = match self.capabilities.read().await.decision(&capability_key) {
-                RouteDecision::Supported { route } => route,
-                RouteDecision::Unsupported { reason } => {
-                    return Err(NativeError::unsupported(reason)
-                        .with_detail("action", format!("{action:?}"))
-                        .with_detail("framework", format!("{:?}", resolved.framework)))
-                }
-            };
-            (
-                route,
-                adapt_action_route(&mut state, &resolved, route, prepared)?,
-            )
         };
+        let evidence_key = capability_key(
+            &self.platform_name,
+            &self.os_version,
+            &action,
+            effective_addressing,
+            &resolved,
+        );
+        let capability_evidence = self
+            .capabilities
+            .read()
+            .await
+            .evidence(&evidence_key)
+            .cloned();
         let action_id = ActionId::new();
         tracing::info!(
             target_instance_id = %target.instance_id,
@@ -777,8 +795,60 @@ impl<P: PlatformDriver> DriverController<P> {
         );
         let deadline =
             mutation_deadline(self.mutation_work_timeout, self.mutation_teardown_timeout)?;
+        let menu_intent = if menu_opening {
+            let menu_id =
+                state
+                    .menu
+                    .begin_open(action_id.clone(), resolved.public.clone(), resolved.stamp());
+            Some(MenuMutationIntent::Opening { menu_id })
+        } else if let Some(menu_id) = targeted_menu_id.clone() {
+            let identity = state.menu.native_identity().cloned().ok_or_else(|| {
+                NativeError::stale(
+                    ErrorCode::MenuStateStale,
+                    "targeted menu action has no current native identity",
+                )
+            })?;
+            state.menu.begin_target(&menu_id, action_id.clone())?;
+            Some(MenuMutationIntent::Targeting { menu_id, identity })
+        } else if matches!(prepared, ResolvedAction::PointClick { .. }) {
+            match state.menu.lifecycle() {
+                MenuLifecycle::Open { id, .. } => {
+                    let menu_id = id.clone();
+                    let identity = state
+                        .menu
+                        .native_identity()
+                        .cloned()
+                        .expect("open menu retains exact native identity");
+                    state.menu.begin_dismiss(action_id.clone())?;
+                    Some(MenuMutationIntent::Dismissing { menu_id, identity })
+                }
+                MenuLifecycle::Closed => None,
+                _ => {
+                    return Err(NativeError::stale(
+                        ErrorCode::MenuStateStale,
+                        "a point mutation cannot start while a prior menu transition is unresolved",
+                    ))
+                }
+            }
+        } else {
+            match state.menu.lifecycle() {
+                MenuLifecycle::Closed => None,
+                MenuLifecycle::Open { .. } => {
+                    return Err(NativeError::unsupported(
+                        "non-menu mutation is refused while an observed native menu is open",
+                    )
+                    .with_detail("recipe_status", "menu_target_required"))
+                }
+                _ => {
+                    return Err(NativeError::stale(
+                        ErrorCode::MenuStateStale,
+                        "mutation cannot start while a prior menu transition is unresolved",
+                    ))
+                }
+            }
+        };
         let mut requirements = ScopeRequirements::for_route(route);
-        requirements.menu_dismissal = menu_opening;
+        requirements.menu_dismissal = menu_intent.is_some();
         let preflight_result = {
             let TargetControllerState {
                 platform, focus, ..
@@ -799,8 +869,17 @@ impl<P: PlatformDriver> DriverController<P> {
             .await
         };
         let mut scope_plan = match preflight_result {
-            Ok(result) => result?,
+            Ok(Ok(plan)) => plan,
+            Ok(Err(error)) => {
+                if menu_intent.is_some() {
+                    state.menu.abort_transition(&action_id)?;
+                }
+                return Err(error);
+            }
             Err(_) => {
+                if menu_intent.is_some() {
+                    state.menu.abort_transition(&action_id)?;
+                }
                 return Err(mutation_deadline_error(
                     &action_id,
                     ErrorPhase::Preflight,
@@ -808,20 +887,22 @@ impl<P: PlatformDriver> DriverController<P> {
                 ));
             }
         };
-        ensure_scope_plan_matches(&scope_plan, &action_id, &resolved, route, deadline)?;
-        let pending_menu_id = menu_opening.then(|| {
+        if let Err(error) =
+            ensure_scope_plan_matches(&scope_plan, &action_id, &resolved, route, deadline)
+        {
+            if menu_intent.is_some() {
+                state.menu.abort_transition(&action_id)?;
+            }
+            return Err(error);
+        }
+        if let Some(intent) = menu_intent.clone() {
             tracing::debug!(
                 target_instance_id = %target.instance_id,
                 action_id = %action_id,
-                menu_transition = "closed_to_opening",
+                menu_transition = ?intent,
                 "v2 menu lifecycle transition"
             );
-            state
-                .menu
-                .begin_open(action_id.clone(), resolved.public.clone(), resolved.stamp())
-        });
-        if let Some(menu_id) = pending_menu_id.clone() {
-            scope_plan.bind_opening_menu(menu_id);
+            scope_plan.bind_menu_intent(intent);
         }
         let cursor = state.logical_cursor.clone();
         let scope_result = {
@@ -839,8 +920,8 @@ impl<P: PlatformDriver> DriverController<P> {
         let mut scope = match scope_result {
             Ok(Ok(scope)) => scope,
             Ok(Err(mut error)) => {
-                if menu_opening {
-                    state.menu.close();
+                if menu_intent.is_some() {
+                    state.menu.abort_transition(&action_id)?;
                 }
                 if error.target_invalidated() {
                     target.invalidate();
@@ -865,8 +946,8 @@ impl<P: PlatformDriver> DriverController<P> {
                 return Err(error);
             }
             Err(_) => {
-                if menu_opening {
-                    state.menu.close();
+                if menu_intent.is_some() {
+                    state.menu.abort_transition(&action_id)?;
                 }
                 // The timed-out acquisition future has been dropped, so all
                 // provider-local RAII guards have had their cleanup chance.
@@ -909,6 +990,9 @@ impl<P: PlatformDriver> DriverController<P> {
             Ok(Ok(plan)) => plan,
             Ok(Err(error)) => {
                 let teardown = scope.release();
+                if menu_intent.is_some() {
+                    state.menu.abort_transition(&action_id)?;
+                }
                 let teardown_failed = !teardown.failures.is_empty();
                 if teardown_failed {
                     target.invalidate();
@@ -948,6 +1032,9 @@ impl<P: PlatformDriver> DriverController<P> {
                     "native_action_prepare",
                 )];
                 let teardown = scope.release();
+                if menu_intent.is_some() {
+                    state.menu.abort_transition(&action_id)?;
+                }
                 let teardown_failed = !teardown.failures.is_empty();
                 if teardown_failed {
                     target.invalidate();
@@ -974,61 +1061,26 @@ impl<P: PlatformDriver> DriverController<P> {
                     .expect("native action prepare timeout failure is nonempty"));
             }
         };
-        if !menu_opening {
-            if let Some(menu_id) = &targeted_menu_id {
-                if let Err(error) = state.menu.begin_target(menu_id, action_id.clone()) {
-                    let teardown = scope.release();
-                    let teardown_failed = !teardown.failures.is_empty();
-                    if teardown_failed {
-                        target.invalidate();
-                    }
-                    let mut failures = vec![error];
-                    failures.extend(teardown.failures);
-                    let scope_evidence = serde_json::to_value(&scope.native_evidence)
-                        .expect("typed scope evidence must serialize");
-                    if teardown_failed {
-                        drop(state);
-                        match tokio::time::timeout_at(
-                            deadline.teardown.into(),
-                            self.targets.remove_invalid_target(&self.platform, &key),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(error)) => failures.push(error),
-                            Err(_) => failures.push(mutation_deadline_error(
-                                &action_id,
-                                ErrorPhase::Verify,
-                                "poisoned_target_teardown",
-                            )),
-                        }
-                    }
-                    let mut primary = NativeError::primary(failures).expect("non-empty failures");
-                    primary
-                        .details
-                        .insert("interaction_scope".to_owned(), scope_evidence);
-                    return Err(primary);
-                }
-                tracing::debug!(
-                    target_instance_id = %target.instance_id,
-                    action_id = %action_id,
-                    menu_transition = "open_to_targeting",
-                    "v2 menu lifecycle transition"
-                );
-            }
-        }
-
         let profile = settlement_profile(
             &action,
             route,
-            menu_opening,
+            menu_intent.as_ref(),
             requires_effect_verification,
             action_allows_target_disappearance(&prepared),
         );
         // Refresh the store's current proof immediately before handing the
         // provider its explicit first-native-side-effect boundary. The target
         // lock prevents any concurrent core mutation of this record.
-        state.observations.current(&observation_id, &resolved)?;
+        if let Err(error) = state.observations.current(&observation_id, &resolved) {
+            if menu_intent.is_some() {
+                state.menu.abort_transition(&action_id)?;
+            }
+            let teardown = scope.release();
+            let mut failures = vec![error];
+            failures.extend(teardown.failures);
+            return Err(NativeError::primary(failures)
+                .expect("observation revalidation failure is nonempty"));
+        }
         let (dispatch_result, side_effect_started) = {
             let TargetControllerState {
                 platform,
@@ -1051,8 +1103,8 @@ impl<P: PlatformDriver> DriverController<P> {
             (result, boundary.started())
         };
         if !side_effect_started {
-            if menu_opening || targeted_menu_id.is_some() {
-                state.menu.close();
+            if menu_intent.is_some() {
+                state.menu.abort_transition(&action_id)?;
             }
             let provider_failure = match dispatch_result {
                 Ok(Err(error)) => error,
@@ -1121,9 +1173,6 @@ impl<P: PlatformDriver> DriverController<P> {
                         if error.target_invalidated() {
                             target.invalidate();
                         }
-                        if menu_opening || targeted_menu_id.is_some() {
-                            state.menu.close();
-                        }
                         failures.push(error);
                         None
                     }
@@ -1131,9 +1180,6 @@ impl<P: PlatformDriver> DriverController<P> {
             }
             Err(_) => {
                 dispatch_timed_out = true;
-                if menu_opening || targeted_menu_id.is_some() {
-                    state.menu.close();
-                }
                 failures.push(mutation_deadline_error(
                     &action_id,
                     ErrorPhase::Dispatch,
@@ -1152,11 +1198,9 @@ impl<P: PlatformDriver> DriverController<P> {
                     .menu
                     .record_dispatch_evidence(&action_id, &resolved.stamp(), menu_evidence)
             {
-                state.menu.close();
                 failures.push(error);
             }
-        } else if (menu_opening || targeted_menu_id.is_some()) && dispatch.is_some() {
-            state.menu.close();
+        } else if menu_intent.is_some() && dispatch.is_some() {
             failures.push(NativeError::stale(
                 ErrorCode::MenuStateStale,
                 "menu dispatch returned no exact native menu/action/owner identity evidence",
@@ -1208,6 +1252,18 @@ impl<P: PlatformDriver> DriverController<P> {
                 .fields
                 .extend(dispatch.evidence.fields.clone());
         }
+        let route_detail = native_evidence
+            .fields
+            .get("pointer_route")
+            .cloned()
+            .unwrap_or_else(|| candidate_detail.clone().into());
+        native_evidence
+            .fields
+            .insert("route_detail".to_owned(), route_detail);
+        native_evidence.fields.insert(
+            "capability_evidence".to_owned(),
+            capability_evidence_status(capability_evidence.as_ref(), route).into(),
+        );
         let partial = PartialEvidence::Action {
             action_id: action_id.clone(),
             window: resolved.public.clone(),
@@ -1218,7 +1274,7 @@ impl<P: PlatformDriver> DriverController<P> {
                 native_evidence: dispatch.evidence.clone(),
                 warnings: dispatch.warnings.clone(),
             }),
-            native_evidence: scope.native_evidence.clone(),
+            native_evidence: native_evidence.clone(),
             pending_settlement,
         };
         if teardown_failed || target_invalidated {
@@ -1376,6 +1432,7 @@ impl<P: PlatformDriver> DriverController<P> {
                 .map(PreparedDispatch::Semantic),
             ResolvedAction::PointClick { .. }
             | ResolvedAction::Drag(_)
+            | ResolvedAction::ElementScroll { point: Some(_), .. }
             | ResolvedAction::DeltaScroll(_)
                 if scope.route == Route::TargetedPointer =>
             {
@@ -1415,6 +1472,7 @@ impl<P: PlatformDriver> DriverController<P> {
             (
                 ResolvedAction::PointClick { .. }
                 | ResolvedAction::Drag(_)
+                | ResolvedAction::ElementScroll { point: Some(_), .. }
                 | ResolvedAction::DeltaScroll(_),
                 PreparedDispatch::Pointer(plan),
             ) if scope.route == Route::TargetedPointer => {
@@ -1436,6 +1494,33 @@ impl<P: PlatformDriver> DriverController<P> {
                 "prepared native action did not match the resolved action provider and route",
             )),
         }
+    }
+}
+
+fn route_for_live_action(action: &ResolvedAction) -> Route {
+    match action {
+        ResolvedAction::PointClick { .. }
+        | ResolvedAction::Drag(_)
+        | ResolvedAction::DeltaScroll(_) => Route::TargetedPointer,
+        ResolvedAction::PressKey { .. } | ResolvedAction::TypeText { .. } => {
+            Route::TargetedKeyboard
+        }
+        ResolvedAction::ElementClick { .. }
+        | ResolvedAction::ElementScroll { .. }
+        | ResolvedAction::SetValue { .. }
+        | ResolvedAction::SelectText { .. }
+        | ResolvedAction::Secondary { .. } => Route::Semantic,
+    }
+}
+
+fn capability_evidence_status(decision: Option<&RouteDecision>, selected: Route) -> &'static str {
+    match decision {
+        None => "unmeasured",
+        Some(RouteDecision::Supported { route }) if *route == selected => {
+            "published_supported_matching"
+        }
+        Some(RouteDecision::Supported { .. }) => "published_supported_different_nonblocking",
+        Some(RouteDecision::Unsupported { .. }) => "published_unsupported_nonblocking",
     }
 }
 
@@ -1474,6 +1559,9 @@ fn adapt_action_route<P: PlatformDriver>(
         {
             Ok(action)
         }
+        ResolvedAction::ElementScroll { point: Some(_), .. } if route == Route::TargetedPointer => {
+            Ok(action)
+        }
         ResolvedAction::DeltaScroll(_)
             if matches!(route, Route::Semantic | Route::TargetedPointer) =>
         {
@@ -1497,10 +1585,11 @@ fn validate_current_menu_target<P: PlatformDriver>(
 ) -> Result<(), NativeError> {
     let menu_id = match action {
         ResolvedAction::ElementClick { element, .. }
-        | ResolvedAction::ElementScroll { element, .. }
         | ResolvedAction::SetValue { element, .. }
         | ResolvedAction::SelectText { element, .. }
         | ResolvedAction::Secondary { element, .. } => element.menu_id.as_ref(),
+        ResolvedAction::ElementScroll { element, .. } => element.menu_id.as_ref(),
+        ResolvedAction::PointClick { point, .. } => point.menu_id.as_ref(),
         _ => None,
     };
     if let Some(menu_id) = menu_id {
@@ -1512,10 +1601,11 @@ fn validate_current_menu_target<P: PlatformDriver>(
 fn resolved_action_menu_id(action: &ResolvedAction) -> Option<&super::contracts::MenuId> {
     match action {
         ResolvedAction::ElementClick { element, .. }
-        | ResolvedAction::ElementScroll { element, .. }
         | ResolvedAction::SetValue { element, .. }
         | ResolvedAction::SelectText { element, .. }
         | ResolvedAction::Secondary { element, .. } => element.menu_id.as_ref(),
+        ResolvedAction::ElementScroll { element, .. } => element.menu_id.as_ref(),
+        ResolvedAction::PointClick { point, .. } => point.menu_id.as_ref(),
         _ => None,
     }
 }
@@ -1637,7 +1727,7 @@ fn mutation_deadline_error(
 fn settlement_profile(
     action: &ActionKind,
     route: Route,
-    menu_opening: bool,
+    menu_intent: Option<&MenuMutationIntent>,
     exact_readback: bool,
     target_may_disappear: bool,
 ) -> SettlementProfile {
@@ -1660,13 +1750,24 @@ fn settlement_profile(
             SettlementSignal::VerificationReadbackComplete,
         ]);
     }
-    if menu_opening {
+    if matches!(menu_intent, Some(MenuMutationIntent::Opening { .. })) {
         return SettlementProfile::requiring(
             format!("{action:?}_menu_open").to_lowercase(),
             [SettlementSignal::MenuOpened],
         )
         .with_relevant_signals([
             SettlementSignal::MenuOpened,
+            SettlementSignal::MenuDismissed,
+            SettlementSignal::WindowListChanged,
+            SettlementSignal::FocusChanged,
+        ]);
+    }
+    if matches!(menu_intent, Some(MenuMutationIntent::Dismissing { .. })) {
+        return SettlementProfile::requiring(
+            format!("{action:?}_menu_dismiss").to_lowercase(),
+            [SettlementSignal::MenuDismissed],
+        )
+        .with_relevant_signals([
             SettlementSignal::MenuDismissed,
             SettlementSignal::WindowListChanged,
             SettlementSignal::FocusChanged,
@@ -1729,6 +1830,24 @@ fn secondary_action_allows_target_disappearance(subrole: Option<&str>, action: &
     subrole == Some("AXCloseButton") && action == "AXPress"
 }
 
+fn target_busy(window: &ResolvedWindow) -> NativeError {
+    NativeError::new(
+        ErrorCode::TargetBusy,
+        ErrorPhase::Preflight,
+        true,
+        "timed out acquiring the bounded process mutation lock",
+    )
+    .with_detail("window_id", window.public.id.to_string())
+    .with_detail("app_id", window.public.app.id.to_string())
+}
+
+fn is_menu_action(action: &str) -> bool {
+    matches!(action, "show_menu" | "AXShowMenu")
+}
+
+#[allow(dead_code)]
+fn _type_assertions(_: Framework, _: WindowStateKind, _: AxTreeMode) {}
+
 #[cfg(test)]
 mod target_disappearance_tests {
     use super::*;
@@ -1757,7 +1876,7 @@ mod target_disappearance_tests {
         let profile = settlement_profile(
             &ActionKind::PerformSecondaryAction,
             Route::Semantic,
-            false,
+            None,
             false,
             true,
         );
@@ -1768,21 +1887,3 @@ mod target_disappearance_tests {
         );
     }
 }
-
-fn target_busy(window: &ResolvedWindow) -> NativeError {
-    NativeError::new(
-        ErrorCode::TargetBusy,
-        ErrorPhase::Preflight,
-        true,
-        "timed out acquiring the bounded process mutation lock",
-    )
-    .with_detail("window_id", window.public.id.to_string())
-    .with_detail("app_id", window.public.app.id.to_string())
-}
-
-fn is_menu_action(action: &str) -> bool {
-    matches!(action, "show_menu" | "AXShowMenu")
-}
-
-#[allow(dead_code)]
-fn _type_assertions(_: Framework, _: WindowStateKind, _: AxTreeMode) {}

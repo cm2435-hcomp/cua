@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    contracts::{ActionId, MenuId, ObservationId, Point, Route},
+    contracts::{ActionId, ObservationId, Point, Route},
     errors::NativeError,
+    menu::MenuMutationIntent,
     observation::{InvalidationReason, ObservationStore, ResolvedWindow, ResolvedWindowStamp},
     settlement::{SettlementProfile, SettlementState},
     target::TargetValidityHandle,
@@ -185,7 +186,7 @@ pub struct ScopePlan<NativePlan> {
     pub route: Route,
     pub deadline: MutationDeadline,
     pub requirements: ScopeRequirements,
-    pub opening_menu_id: Option<MenuId>,
+    pub menu_intent: Option<MenuMutationIntent>,
     pub native: NativePlan,
 }
 
@@ -204,13 +205,13 @@ impl<NativePlan> ScopePlan<NativePlan> {
             route,
             deadline,
             requirements,
-            opening_menu_id: None,
+            menu_intent: None,
             native,
         }
     }
 
-    pub fn bind_opening_menu(&mut self, menu_id: MenuId) {
-        self.opening_menu_id = Some(menu_id);
+    pub fn bind_menu_intent(&mut self, intent: MenuMutationIntent) {
+        self.menu_intent = Some(intent);
     }
 
     pub fn into_scope(
@@ -225,7 +226,7 @@ impl<NativePlan> ScopePlan<NativePlan> {
             self.route,
             self.action_id,
             self.deadline,
-            self.opening_menu_id,
+            self.menu_intent,
             acquisition,
             logical_cursor,
             native_evidence,
@@ -259,7 +260,7 @@ pub struct InteractionScope {
     pub leases: ScopeLeaseAcquisition,
     pub action_id: ActionId,
     pub owner: ResolvedWindowStamp,
-    pub opening_menu_id: Option<MenuId>,
+    pub menu_intent: Option<MenuMutationIntent>,
     pub logical_cursor: TargetCursorHandle,
     pub native_evidence: NativeEvidence,
     cleanup: Option<Box<dyn ScopeCleanup>>,
@@ -277,7 +278,7 @@ impl std::fmt::Debug for InteractionScope {
             .field("leases", &self.leases)
             .field("action_id", &self.action_id)
             .field("owner", &self.owner)
-            .field("opening_menu_id", &self.opening_menu_id)
+            .field("menu_intent", &self.menu_intent)
             .field("native_evidence", &self.native_evidence)
             .field("teardown", &self.teardown)
             .field("target_validity_bound", &self.target_validity.is_some())
@@ -309,7 +310,7 @@ impl InteractionScope {
         route: Route,
         action_id: ActionId,
         deadline: MutationDeadline,
-        opening_menu_id: Option<MenuId>,
+        menu_intent: Option<MenuMutationIntent>,
         leases: ScopeLeaseAcquisition,
         logical_cursor: TargetCursorHandle,
         mut native_evidence: NativeEvidence,
@@ -327,7 +328,7 @@ impl InteractionScope {
             leases,
             action_id,
             owner,
-            opening_menu_id,
+            menu_intent,
             logical_cursor,
             native_evidence,
             cleanup: Some(cleanup),

@@ -244,6 +244,18 @@ unsafe extern "C" fn focus_tap_callback(
             state.application_believes_it_is_active = true;
             state.application_believes_it_has_focus = true;
         }
+        if matches!(event_type, 1 | 2 | 3 | 4 | 6 | 7 | 25 | 26 | 27) {
+            let mut state = state.lock().expect("macOS focus coordinator poisoned");
+            if state.menu_dismissal_suppression_enabled {
+                let source_pid = CGEventGetIntegerValueField(event, 41) as i32;
+                if source_pid != context.pid && Some(source_pid) != state.menu_pid {
+                    state.menu_suppressed_event_count =
+                        state.menu_suppressed_event_count.saturating_add(1);
+                    state.menu_last_suppressed_source_pid = Some(source_pid);
+                    return std::ptr::null_mut();
+                }
+            }
+        }
     }
     event
 }
@@ -268,14 +280,17 @@ fn run_target_focus_taps(
     let mouse_tap = unsafe {
         CGEventTapCreateForPid(
             pid,
-            1,
-            1,
+            0,
+            0,
             (1_u64 << 1)
                 | (1_u64 << 2)
+                | (1_u64 << 6)
                 | (1_u64 << 3)
                 | (1_u64 << 4)
+                | (1_u64 << 7)
                 | (1_u64 << 25)
-                | (1_u64 << 26),
+                | (1_u64 << 26)
+                | (1_u64 << 27),
             focus_tap_callback,
             context_ptr.cast(),
         )
@@ -496,6 +511,7 @@ extern "C" {
         user_info: *mut c_void,
     ) -> *mut c_void;
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
+    fn CGEventGetIntegerValueField(event: *mut c_void, field: u32) -> i64;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -1204,6 +1220,13 @@ mod tests {
             application_is_active: false,
             application_believes_it_is_active: true,
             application_believes_it_has_focus: true,
+            menu_dismissal_suppression_enabled: false,
+            menu_pid: None,
+            menu_suppression_action_id: None,
+            menu_suppression_menu_id: None,
+            menu_suppression_was_armed: false,
+            menu_suppressed_event_count: 0,
+            menu_last_suppressed_source_pid: None,
         }));
 
         reconcile_real_active(&state, false);

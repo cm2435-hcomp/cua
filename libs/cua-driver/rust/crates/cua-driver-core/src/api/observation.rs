@@ -155,6 +155,9 @@ pub struct SurfaceRecord {
     /// Exact native ownership for the pixels. Related transient surfaces are
     /// action-safe only while their recorded parent is the current target.
     pub owner: SurfaceOwner,
+    /// Internal attribution for pixels captured from the current native menu.
+    /// The public surface already resolves through the observation store.
+    pub menu_id: Option<MenuId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,6 +376,7 @@ pub struct ResolvedPoint {
     pub window_point: Point,
     pub screen_point: Point,
     pub geometry_revision: GeometryRevision,
+    pub menu_id: Option<MenuId>,
 }
 
 #[derive(Debug, Clone)]
@@ -606,6 +610,7 @@ impl ObservationStore {
             window_point,
             screen_point,
             geometry_revision: record.window.geometry_revision.clone(),
+            menu_id: surface.menu_id.clone(),
         })
     }
 
@@ -1122,6 +1127,7 @@ mod store_tests {
             id: WindowId::parse("window-1").unwrap(),
             app: AppRef {
                 id: AppId::parse("app-1").unwrap(),
+                canonical_id: None,
                 name: Some("Fixture".to_owned()),
                 pid: Some(100),
                 running: true,
@@ -1353,6 +1359,7 @@ mod store_tests {
                     parent: target.stamp(),
                 },
                 approximate_bytes: 1,
+                menu_id: None,
             },
         );
         observation.accessibility = Some(AccessibilityRecord {

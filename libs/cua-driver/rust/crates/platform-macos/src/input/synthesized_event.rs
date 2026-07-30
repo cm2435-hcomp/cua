@@ -5,10 +5,15 @@ use std::{
     sync::atomic::{AtomicIsize, Ordering},
 };
 
+use core_graphics::{
+    event::{CGEvent as OwnedCGEvent, ScrollEventUnit},
+    event_source::{CGEventSource, CGEventSourceStateID},
+};
 use cua_driver_core::api::{
     contracts::{Modifier, MouseButton, Point},
     errors::{ErrorCode, ErrorPhase, NativeError},
 };
+use foreign_types::ForeignType;
 use objc2::msg_send;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
 use objc2_foundation::NSPoint;
@@ -38,6 +43,7 @@ type CGEventRef = *mut CGEvent;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MouseEventKind {
     Down,
+    Dragged,
     Up,
 }
 
@@ -52,6 +58,18 @@ pub(crate) struct MouseEventSpec<'a> {
     pub kind: MouseEventKind,
 }
 
+pub(crate) struct PixelScrollEventSpec {
+    pub pid: i32,
+    pub cg_window_id: u32,
+    pub screen: Point,
+    pub window_local: Point,
+    /// Public logical-pixel convention: positive values reveal content to the
+    /// right and down. Conversion to the native wheel convention happens once
+    /// in this factory.
+    pub delta_x: f64,
+    pub delta_y: f64,
+}
+
 pub(crate) fn post_mouse_event(spec: &MouseEventSpec<'_>) -> Result<(), NativeError> {
     post_mouse_event_with_number(spec, next_event_number())
 }
@@ -62,10 +80,13 @@ fn post_mouse_event_with_number(
 ) -> Result<(), NativeError> {
     let event_type = match (spec.kind, spec.button) {
         (MouseEventKind::Down, MouseButton::Left) => NSEventType::LeftMouseDown,
+        (MouseEventKind::Dragged, MouseButton::Left) => NSEventType::LeftMouseDragged,
         (MouseEventKind::Up, MouseButton::Left) => NSEventType::LeftMouseUp,
         (MouseEventKind::Down, MouseButton::Right) => NSEventType::RightMouseDown,
+        (MouseEventKind::Dragged, MouseButton::Right) => NSEventType::RightMouseDragged,
         (MouseEventKind::Up, MouseButton::Right) => NSEventType::RightMouseUp,
         (MouseEventKind::Down, MouseButton::Middle) => NSEventType::OtherMouseDown,
+        (MouseEventKind::Dragged, MouseButton::Middle) => NSEventType::OtherMouseDragged,
         (MouseEventKind::Up, MouseButton::Middle) => NSEventType::OtherMouseUp,
     };
     let event = unsafe {
@@ -95,6 +116,45 @@ fn post_mouse_event_with_number(
         timestamp_and_post(spec.pid, cg_event)?;
     }
     Ok(())
+}
+
+pub(crate) fn post_pixel_scroll_event(spec: &PixelScrollEventSpec) -> Result<(), NativeError> {
+    let delta_x = native_wheel_delta(spec.delta_x, "delta_x")?;
+    let delta_y = native_wheel_delta(spec.delta_y, "delta_y")?;
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| construction_failed("CGEventSourceCreate"))?;
+    let event =
+        OwnedCGEvent::new_scroll_event(source, ScrollEventUnit::PIXEL, 2, delta_y, delta_x, 0)
+            .map_err(|_| construction_failed("CGEventCreateScrollWheelEvent"))?;
+    let event_ref = event.as_ptr().cast::<CGEvent>();
+    unsafe {
+        CGEventSetLocation(event_ref.cast(), spec.screen.x, spec.screen.y);
+        CGEventSetIntegerValueField(event_ref, 51, i64::from(spec.cg_window_id));
+        CGEventSetIntegerValueField(event_ref, 91, i64::from(spec.cg_window_id));
+        CGEventSetIntegerValueField(event_ref, 92, i64::from(spec.cg_window_id));
+        CGEventSetWindowLocation(event_ref, spec.window_local.x, spec.window_local.y);
+        timestamp_and_post(spec.pid, event_ref)?;
+    }
+    Ok(())
+}
+
+fn native_wheel_delta(value: f64, name: &'static str) -> Result<i32, NativeError> {
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || value <= f64::from(i32::MIN)
+        || value > f64::from(i32::MAX)
+    {
+        return Err(NativeError::new(
+            ErrorCode::UnsupportedInBackground,
+            ErrorPhase::Preflight,
+            false,
+            "the recovered macOS pixel-scroll route requires an integral 32-bit logical delta",
+        )
+        .with_detail("recipe_status", "native_integer_delta_required")
+        .with_detail("field", name)
+        .with_detail("value", value));
+    }
+    Ok(-(value as i32))
 }
 
 pub(crate) fn post_app_activated(
@@ -319,5 +379,13 @@ mod tests {
             unsafe { cg_event(&event) }.expect("NSEvent.CGEvent should return a CGEventRef");
 
         assert!(!cg_event.is_null());
+    }
+
+    #[test]
+    fn public_scroll_delta_is_converted_once_at_the_native_wheel_boundary() {
+        assert_eq!(native_wheel_delta(42.0, "delta_y").unwrap(), -42);
+        assert_eq!(native_wheel_delta(-7.0, "delta_x").unwrap(), 7);
+        assert!(native_wheel_delta(0.5, "delta_x").is_err());
+        assert!(native_wheel_delta(f64::from(i32::MIN), "delta_y").is_err());
     }
 }

@@ -22,7 +22,13 @@ use foreign_types::ForeignType;
 /// Window-local coordinates for backgrounded targets: if `window_local` is
 /// `Some((wx, wy))`, stamps a window-local point via `CGEventSetWindowLocation`
 /// SPI so WindowServer's hit-test uses the local point directly.
-pub fn click_at_xy(pid: i32, x: f64, y: f64, count: usize, modifiers: &[&str]) -> anyhow::Result<()> {
+pub fn click_at_xy(
+    pid: i32,
+    x: f64,
+    y: f64,
+    count: usize,
+    modifiers: &[&str],
+) -> anyhow::Result<()> {
     click_at_xy_inner(pid, x, y, None, None, count, modifiers)
 }
 
@@ -43,9 +49,21 @@ pub fn click_at_xy_desktop(x: f64, y: f64, count: usize, button: &str) -> anyhow
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let point = CGPoint::new(x, y);
     let (down_ty, up_ty, btn) = match button {
-        "right" => (CGEventType::RightMouseDown, CGEventType::RightMouseUp, CGMouseButton::Right),
-        "middle" => (CGEventType::OtherMouseDown, CGEventType::OtherMouseUp, CGMouseButton::Center),
-        _ => (CGEventType::LeftMouseDown, CGEventType::LeftMouseUp, CGMouseButton::Left),
+        "right" => (
+            CGEventType::RightMouseDown,
+            CGEventType::RightMouseUp,
+            CGMouseButton::Right,
+        ),
+        "middle" => (
+            CGEventType::OtherMouseDown,
+            CGEventType::OtherMouseUp,
+            CGMouseButton::Center,
+        ),
+        _ => (
+            CGEventType::LeftMouseDown,
+            CGEventType::LeftMouseUp,
+            CGMouseButton::Left,
+        ),
     };
     // Warp the REAL cursor to the point first (the macOS peer of Linux XTest's
     // pointer warp). A synthetic MouseMoved event does not relocate the hardware
@@ -80,8 +98,10 @@ extern "C" {
 /// (f51 / f58 / f91 / f92) for better backgrounded-target delivery.
 pub fn click_at_xy_with_window_local(
     pid: i32,
-    x: f64, y: f64,
-    wx: f64, wy: f64,
+    x: f64,
+    y: f64,
+    wx: f64,
+    wy: f64,
     wid: u32,
     count: usize,
     modifiers: &[&str],
@@ -91,7 +111,8 @@ pub fn click_at_xy_with_window_local(
 
 fn click_at_xy_inner(
     pid: i32,
-    x: f64, y: f64,
+    x: f64,
+    y: f64,
     window_local: Option<(f64, f64)>,
     wid: Option<u32>,
     count: usize,
@@ -128,12 +149,21 @@ fn click_at_xy_inner(
             CGEventType::LeftMouseDown,
             point,
             CGMouseButton::Left,
-        ).map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
+        )
+        .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
         if flags != CGEventFlags::CGEventFlagNull {
             down.set_flags(flags);
         }
 
-        post_mouse_event(pid, &down, window_local, wid, click_group_id, click_state, 0);
+        post_mouse_event(
+            pid,
+            &down,
+            window_local,
+            wid,
+            click_group_id,
+            click_state,
+            0,
+        );
         // 28 ms down→up gap: an NSButton's mouseDown enters a modal tracking
         // loop that polls for the matching mouseUp; too tight a gap can race the
         // loop's first poll and the click is dropped. 16 ms was under that
@@ -145,7 +175,8 @@ fn click_at_xy_inner(
             CGEventType::LeftMouseUp,
             point,
             CGMouseButton::Left,
-        ).map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
+        )
+        .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
         if flags != CGEventFlags::CGEventFlagNull {
             up.set_flags(flags);
         }
@@ -195,13 +226,13 @@ pub fn click_at_xy_chromium(
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    let target     = CGPoint::new(screen_x, screen_y);
+    let target = CGPoint::new(screen_x, screen_y);
     let off_screen = CGPoint::new(-1.0, -1.0);
-    let win_local  = (win_local_x, win_local_y);
-    let off_local  = (-1.0_f64, -1.0_f64);
-    let flags      = parse_modifier_flags(modifiers);
+    let win_local = (win_local_x, win_local_y);
+    let off_local = (-1.0_f64, -1.0_f64);
+    let flags = parse_modifier_flags(modifiers);
     let click_pairs = count.max(1).min(2);
-    let window_id  = wid as i64;
+    let window_id = wid as i64;
 
     // All 5 events share the same click-group ID so WindowServer / Chromium
     // treat the sequence as one gesture (Swift: field 58).
@@ -214,18 +245,20 @@ pub fn click_at_xy_chromium(
     // this closure is Fn (callable multiple times).
     let stamp = |event: &CGEvent, local: (f64, f64), click_state: i64, phase: i64| {
         let ptr = event.as_ptr() as *mut std::ffi::c_void;
-        let set = |f: u32, v: i64| { crate::input::skylight::set_integer_field(ptr, f, v); };
-        set(0,  phase);              // kCGMouseEventNumber (gesture phase)
-        set(1,  click_state);        // kCGMouseEventClickState
-        set(3,  0);                  // kCGMouseEventButtonNumber (left)
-        set(7,  3);                  // kCGMouseEventSubtype (NSEventSubtypeTouch)
-        set(40, pid as i64);         // Chromium synthetic-event filter
+        let set = |f: u32, v: i64| {
+            crate::input::skylight::set_integer_field(ptr, f, v);
+        };
+        set(0, phase); // kCGMouseEventNumber (gesture phase)
+        set(1, click_state); // kCGMouseEventClickState
+        set(3, 0); // kCGMouseEventButtonNumber (left)
+        set(7, 3); // kCGMouseEventSubtype (NSEventSubtypeTouch)
+        set(40, pid as i64); // Chromium synthetic-event filter
         if window_id != 0 {
-            set(51, window_id);      // windowNumber (NSEvent bridge equivalent)
-            set(91, window_id);      // kCGMouseEventWindowUnderMousePointer
-            set(92, window_id);      // kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent
+            set(51, window_id); // windowNumber (NSEvent bridge equivalent)
+            set(91, window_id); // kCGMouseEventWindowUnderMousePointer
+            set(92, window_id); // kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent
         }
-        set(58, click_group_id);     // click-group ID (gesture coalescing)
+        set(58, click_group_id); // click-group ID (gesture coalescing)
         crate::input::skylight::set_window_location(ptr, local.0, local.1);
         if flags != CGEventFlags::CGEventFlagNull {
             event.set_flags(flags);
@@ -241,8 +274,12 @@ pub fn click_at_xy_chromium(
 
     // Step 1: mouseMoved at target (phase=2, clickState=0).
     let move_event = CGEvent::new_mouse_event(
-        source.clone(), CGEventType::MouseMoved, target, CGMouseButton::Left,
-    ).map_err(|_| anyhow::anyhow!("mouseMoved event creation failed"))?;
+        source.clone(),
+        CGEventType::MouseMoved,
+        target,
+        CGMouseButton::Left,
+    )
+    .map_err(|_| anyhow::anyhow!("mouseMoved event creation failed"))?;
     stamp(&move_event, win_local, 0, 2);
     post(&move_event);
     std::thread::sleep(std::time::Duration::from_millis(15));
@@ -250,15 +287,23 @@ pub fn click_at_xy_chromium(
     // Step 2: off-screen primer click — opens Chromium user-activation gate
     // at an off-screen coordinate that can't hit any DOM element.
     let primer_down = CGEvent::new_mouse_event(
-        source.clone(), CGEventType::LeftMouseDown, off_screen, CGMouseButton::Left,
-    ).map_err(|_| anyhow::anyhow!("primer down event creation failed"))?;
+        source.clone(),
+        CGEventType::LeftMouseDown,
+        off_screen,
+        CGMouseButton::Left,
+    )
+    .map_err(|_| anyhow::anyhow!("primer down event creation failed"))?;
     stamp(&primer_down, off_local, 1, 1);
     post(&primer_down);
     std::thread::sleep(std::time::Duration::from_millis(1));
 
     let primer_up = CGEvent::new_mouse_event(
-        source.clone(), CGEventType::LeftMouseUp, off_screen, CGMouseButton::Left,
-    ).map_err(|_| anyhow::anyhow!("primer up event creation failed"))?;
+        source.clone(),
+        CGEventType::LeftMouseUp,
+        off_screen,
+        CGMouseButton::Left,
+    )
+    .map_err(|_| anyhow::anyhow!("primer up event creation failed"))?;
     stamp(&primer_up, off_local, 1, 2);
     post(&primer_up);
     // ≥1 frame so Chromium sees primer + target as separate gestures, not run-on.
@@ -270,15 +315,23 @@ pub fn click_at_xy_chromium(
         let click_state = pair_index as i64;
 
         let down = CGEvent::new_mouse_event(
-            source.clone(), CGEventType::LeftMouseDown, target, CGMouseButton::Left,
-        ).map_err(|_| anyhow::anyhow!("target down event creation failed"))?;
+            source.clone(),
+            CGEventType::LeftMouseDown,
+            target,
+            CGMouseButton::Left,
+        )
+        .map_err(|_| anyhow::anyhow!("target down event creation failed"))?;
         stamp(&down, win_local, click_state, 3);
         post(&down);
         std::thread::sleep(std::time::Duration::from_millis(1));
 
         let up = CGEvent::new_mouse_event(
-            source.clone(), CGEventType::LeftMouseUp, target, CGMouseButton::Left,
-        ).map_err(|_| anyhow::anyhow!("target up event creation failed"))?;
+            source.clone(),
+            CGEventType::LeftMouseUp,
+            target,
+            CGMouseButton::Left,
+        )
+        .map_err(|_| anyhow::anyhow!("target up event creation failed"))?;
         stamp(&up, win_local, click_state, 3);
         post(&up);
 
@@ -322,12 +375,24 @@ pub fn drag_at_xy(
     let flags = parse_modifier_flags(modifiers);
 
     let (cg_button, down_type, dragged_type, up_type) = match button {
-        DragButton::Left   => (CGMouseButton::Left,   CGEventType::LeftMouseDown,
-                               CGEventType::LeftMouseDragged, CGEventType::LeftMouseUp),
-        DragButton::Right  => (CGMouseButton::Right,  CGEventType::RightMouseDown,
-                               CGEventType::RightMouseDragged, CGEventType::RightMouseUp),
-        DragButton::Middle => (CGMouseButton::Center, CGEventType::OtherMouseDown,
-                               CGEventType::OtherMouseDragged, CGEventType::OtherMouseUp),
+        DragButton::Left => (
+            CGMouseButton::Left,
+            CGEventType::LeftMouseDown,
+            CGEventType::LeftMouseDragged,
+            CGEventType::LeftMouseUp,
+        ),
+        DragButton::Right => (
+            CGMouseButton::Right,
+            CGEventType::RightMouseDown,
+            CGEventType::RightMouseDragged,
+            CGEventType::RightMouseUp,
+        ),
+        DragButton::Middle => (
+            CGMouseButton::Center,
+            CGEventType::OtherMouseDown,
+            CGEventType::OtherMouseDragged,
+            CGEventType::OtherMouseUp,
+        ),
     };
     // f3 button number must match the dragged button (0=left, 1=right, 2=middle).
     let button_number: i64 = match button {
@@ -344,14 +409,28 @@ pub fn drag_at_xy(
     });
 
     let steps = steps.max(1);
-    let step_delay_ms = if steps > 1 { duration_ms / steps as u64 } else { duration_ms };
+    let step_delay_ms = if steps > 1 {
+        duration_ms / steps as u64
+    } else {
+        duration_ms
+    };
 
     // MouseDown at start.
     let from_pt = CGPoint::new(from_x, from_y);
     let down = CGEvent::new_mouse_event(source.clone(), down_type, from_pt, cg_button)
         .map_err(|_| anyhow::anyhow!("drag mouseDown failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull { down.set_flags(flags); }
-    post_mouse_event(pid, &down, from_local, wid, click_group_id, 1, button_number);
+    if flags != CGEventFlags::CGEventFlagNull {
+        down.set_flags(flags);
+    }
+    post_mouse_event(
+        pid,
+        &down,
+        from_local,
+        wid,
+        click_group_id,
+        1,
+        button_number,
+    );
     std::thread::sleep(std::time::Duration::from_millis(16));
 
     // Interpolated drag steps.
@@ -359,13 +438,15 @@ pub fn drag_at_xy(
         let t = i as f64 / steps as f64;
         let ix = from_x + (to_x - from_x) * t;
         let iy = from_y + (to_y - from_y) * t;
-        let il = from_local.zip(to_local).map(|((fx, fy), (tx, ty))| {
-            (fx + (tx - fx) * t, fy + (ty - fy) * t)
-        });
+        let il = from_local
+            .zip(to_local)
+            .map(|((fx, fy), (tx, ty))| (fx + (tx - fx) * t, fy + (ty - fy) * t));
         let drag_pt = CGPoint::new(ix, iy);
         let drag = CGEvent::new_mouse_event(source.clone(), dragged_type, drag_pt, cg_button)
             .map_err(|_| anyhow::anyhow!("drag mouseDragged failed"))?;
-        if flags != CGEventFlags::CGEventFlagNull { drag.set_flags(flags); }
+        if flags != CGEventFlags::CGEventFlagNull {
+            drag.set_flags(flags);
+        }
         post_mouse_event(pid, &drag, il, wid, click_group_id, 1, button_number);
         if step_delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
@@ -376,7 +457,9 @@ pub fn drag_at_xy(
     let to_pt = CGPoint::new(to_x, to_y);
     let up = CGEvent::new_mouse_event(source.clone(), up_type, to_pt, cg_button)
         .map_err(|_| anyhow::anyhow!("drag mouseUp failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull { up.set_flags(flags); }
+    if flags != CGEventFlags::CGEventFlagNull {
+        up.set_flags(flags);
+    }
     post_mouse_event(pid, &up, to_local, wid, click_group_id, 1, button_number);
 
     Ok(())
@@ -403,8 +486,10 @@ pub fn middle_click_at_xy(pid: i32, x: f64, y: f64, modifiers: &[&str]) -> anyho
 /// Like `middle_click_at_xy` but stamps the window-local `(wx, wy)` point.
 pub fn middle_click_at_xy_with_window_local(
     pid: i32,
-    x: f64, y: f64,
-    wx: f64, wy: f64,
+    x: f64,
+    y: f64,
+    wx: f64,
+    wy: f64,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
     middle_click_at_xy_inner(pid, x, y, Some((wx, wy)), modifiers)
@@ -412,7 +497,8 @@ pub fn middle_click_at_xy_with_window_local(
 
 fn middle_click_at_xy_inner(
     pid: i32,
-    x: f64, y: f64,
+    x: f64,
+    y: f64,
     window_local: Option<(f64, f64)>,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
@@ -426,7 +512,8 @@ fn middle_click_at_xy_inner(
         CGEventType::OtherMouseDown,
         point,
         CGMouseButton::Center,
-    ).map_err(|_| anyhow::anyhow!("middle mouse down failed"))?;
+    )
+    .map_err(|_| anyhow::anyhow!("middle mouse down failed"))?;
     if flags != CGEventFlags::CGEventFlagNull {
         down.set_flags(flags);
     }
@@ -438,7 +525,8 @@ fn middle_click_at_xy_inner(
         CGEventType::OtherMouseUp,
         point,
         CGMouseButton::Center,
-    ).map_err(|_| anyhow::anyhow!("middle mouse up failed"))?;
+    )
+    .map_err(|_| anyhow::anyhow!("middle mouse up failed"))?;
     if flags != CGEventFlags::CGEventFlagNull {
         up.set_flags(flags);
     }
@@ -463,8 +551,10 @@ pub fn right_click_at_xy(pid: i32, x: f64, y: f64, modifiers: &[&str]) -> anyhow
 /// already threaded `wid`; right-click did not, which is why it broke.
 pub fn right_click_at_xy_with_window_local(
     pid: i32,
-    x: f64, y: f64,
-    wx: f64, wy: f64,
+    x: f64,
+    y: f64,
+    wx: f64,
+    wy: f64,
     wid: u32,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
@@ -473,7 +563,8 @@ pub fn right_click_at_xy_with_window_local(
 
 fn right_click_at_xy_inner(
     pid: i32,
-    x: f64, y: f64,
+    x: f64,
+    y: f64,
     window_local: Option<(f64, f64)>,
     wid: Option<u32>,
     modifiers: &[&str],
@@ -502,7 +593,8 @@ fn right_click_at_xy_inner(
         CGEventType::RightMouseDown,
         point,
         CGMouseButton::Right,
-    ).map_err(|_| anyhow::anyhow!("right mouse down failed"))?;
+    )
+    .map_err(|_| anyhow::anyhow!("right mouse down failed"))?;
     if flags != CGEventFlags::CGEventFlagNull {
         down.set_flags(flags);
     }
@@ -516,7 +608,8 @@ fn right_click_at_xy_inner(
         CGEventType::RightMouseUp,
         point,
         CGMouseButton::Right,
-    ).map_err(|_| anyhow::anyhow!("right mouse up failed"))?;
+    )
+    .map_err(|_| anyhow::anyhow!("right mouse up failed"))?;
     if flags != CGEventFlags::CGEventFlagNull {
         up.set_flags(flags);
     }
@@ -568,14 +661,16 @@ fn post_mouse_event(
     // Chromium / AppKit window-routing fields — stamp when window_id is known.
     if let (Some(wid), Some(cgid)) = (wid, click_group_id) {
         let window_id = wid as i64;
-        let set = |f: u32, v: i64| { crate::input::skylight::set_integer_field(event_ptr, f, v); };
-        set(1,  click_state);    // kCGMouseEventClickState
-        set(3,  button_number);  // kCGMouseEventButtonNumber (0=left, 1=right, 2=middle)
-        set(7,  3);              // kCGMouseEventSubtype (NSEventSubtypeTouch)
-        set(51, window_id);      // windowNumber
-        set(58, cgid);           // click-group ID (gesture coalescing)
-        set(91, window_id);      // kCGMouseEventWindowUnderMousePointer
-        set(92, window_id);      // kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent
+        let set = |f: u32, v: i64| {
+            crate::input::skylight::set_integer_field(event_ptr, f, v);
+        };
+        set(1, click_state); // kCGMouseEventClickState
+        set(3, button_number); // kCGMouseEventButtonNumber (0=left, 1=right, 2=middle)
+        set(7, 3); // kCGMouseEventSubtype (NSEventSubtypeTouch)
+        set(51, window_id); // windowNumber
+        set(58, cgid); // click-group ID (gesture coalescing)
+        set(91, window_id); // kCGMouseEventWindowUnderMousePointer
+        set(92, window_id); // kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent
     }
 
     // Always stamp f40 = target pid (Chromium synthetic-event filter).
@@ -651,7 +746,8 @@ fn post_mouse_moved_primer(
 /// identical in spirit to `post_mouse_event`.
 pub fn scroll_wheel_at_xy(
     pid: i32,
-    screen_x: f64, screen_y: f64,
+    screen_x: f64,
+    screen_y: f64,
     window_local: Option<(f64, f64)>,
     wid: Option<u32>,
     delta_y_per_tick: i32,
@@ -674,7 +770,8 @@ pub fn scroll_wheel_at_xy(
             delta_y_per_tick,
             delta_x_per_tick,
             0,
-        ).map_err(|_| anyhow::anyhow!("CGEvent::new_scroll_event failed"))?;
+        )
+        .map_err(|_| anyhow::anyhow!("CGEvent::new_scroll_event failed"))?;
 
         let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
 
@@ -688,7 +785,9 @@ pub fn scroll_wheel_at_xy(
         }
         if let Some(wid) = wid {
             let window_id = wid as i64;
-            let set = |f: u32, v: i64| { crate::input::skylight::set_integer_field(event_ptr, f, v); };
+            let set = |f: u32, v: i64| {
+                crate::input::skylight::set_integer_field(event_ptr, f, v);
+            };
             set(51, window_id); // windowNumber
             set(91, window_id); // kCGMouseEventWindowUnderMousePointer
             set(92, window_id); // ...ThatCanHandleThisEvent

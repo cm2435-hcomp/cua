@@ -188,11 +188,7 @@ impl LifecycleProvider for MacLifecycle {
         ));
 
         let launch_ref = resolved.app_ref.clone();
-        let config = nsworkspace::OpenConfig {
-            arguments: resolved.arguments.clone(),
-            apple_event_bundle_id: resolved.bundle_id.clone(),
-            ..Default::default()
-        };
+        let config = launch_configuration(&resolved);
         let completion_timeout = deadline.saturating_duration_since(Instant::now());
         launch_scope.begin_launch();
         let dispatch = tokio::task::spawn_blocking(move || {
@@ -601,6 +597,19 @@ fn reusable_existing_launch(
         && application.is_some_and(|app| app.process_generation.is_some() && resolved.matches(app))
 }
 
+fn launch_configuration(resolved: &ResolvedLaunch) -> nsworkspace::OpenConfig {
+    nsworkspace::OpenConfig {
+        arguments: resolved.arguments.clone(),
+        // Arguments are part of the executable selector's requested effect.
+        // A single-instance substitution can return the existing process
+        // without applying them, which is not a successful launch. Force an
+        // exact new instance whenever arguments were supplied.
+        creates_new_instance: !resolved.arguments.is_empty(),
+        apple_event_bundle_id: resolved.bundle_id.clone(),
+        ..Default::default()
+    }
+}
+
 trait LaunchCatalog {
     fn bundle_exists(&self, bundle_id: &str) -> bool;
     fn locate_name(&self, name: &str) -> Option<(String, Option<String>)>;
@@ -787,6 +796,7 @@ fn list_apps_native(query: AppQuery) -> Result<Vec<AppRef>, NativeError> {
         );
         apps.push(AppRef {
             id: identity,
+            canonical_id: installed.bundle_id.clone(),
             name: Some(installed.name),
             pid: None,
             running: false,
@@ -814,6 +824,7 @@ fn app_ref_for_running(application: &RunningApplicationInfo) -> AppRef {
                 .process_generation
                 .map(|generation| (application.pid, generation)),
         ),
+        canonical_id: application.bundle_id.clone(),
         name: application.name.clone(),
         pid: u32::try_from(application.pid).ok(),
         running: true,
@@ -973,6 +984,7 @@ mod tests {
             id: WindowId::parse(id).unwrap(),
             app: AppRef {
                 id: AppId::parse("macos:bundle:com.example.fixture").unwrap(),
+                canonical_id: Some("com.example.fixture".to_owned()),
                 name: Some("Fixture".to_owned()),
                 pid: Some(120),
                 running: true,
@@ -1084,6 +1096,28 @@ mod tests {
             &resolved,
             Some(&generation_unknown)
         ));
+    }
+
+    #[test]
+    fn executable_arguments_force_a_new_instance_configuration() {
+        let resolved = ResolvedLaunch {
+            app_ref: "/Applications/Fixture.app".to_owned(),
+            bundle_id: Some("com.example.fixture".to_owned()),
+            executable_path: Some(PathBuf::from(
+                "/Applications/Fixture.app/Contents/MacOS/Fixture",
+            )),
+            name: None,
+            arguments: vec!["--fixture-profile=/tmp/fixture".to_owned()],
+        };
+        let configuration = launch_configuration(&resolved);
+        assert!(configuration.creates_new_instance);
+        assert_eq!(configuration.arguments, resolved.arguments);
+
+        let without_arguments = ResolvedLaunch {
+            arguments: Vec::new(),
+            ..resolved
+        };
+        assert!(!launch_configuration(&without_arguments).creates_new_instance);
     }
 
     #[test]

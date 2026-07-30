@@ -789,10 +789,15 @@ impl MacWindowRegistry {
             state.next_generation = state.next_generation.saturating_add(1).max(1);
             let generation = WindowGeneration(state.next_generation);
             let id = WindowId::new();
+            let canonical_id = state
+                .by_id
+                .get(&parent.stamp.window_id)
+                .and_then(|entry| entry.public.app.canonical_id.clone());
             let public = WindowRef {
                 id: id.clone(),
                 app: AppRef {
                     id: parent.stamp.app_id.clone(),
+                    canonical_id,
                     name: Some(parent.owner_name.clone()),
                     pid: u32::try_from(parent.pid).ok(),
                     running: true,
@@ -1049,6 +1054,7 @@ fn app_ref_for_process(process: &ProcessSnapshot) -> AppRef {
     let identity = format!("macos:process:{}:{:016x}", process.pid, process.generation);
     AppRef {
         id: AppId::parse(identity).expect("constructed macOS app id is nonempty"),
+        canonical_id: process.bundle_id.clone(),
         name: process.name.clone(),
         pid: u32::try_from(process.pid).ok(),
         running: true,
@@ -1449,6 +1455,7 @@ mod tests {
         let window = registry.list_windows(None).await.unwrap().remove(0);
         let other_app = AppRef {
             id: AppId::parse("macos:bundle:com.example.other").unwrap(),
+            canonical_id: Some("com.example.other".to_owned()),
             name: Some("Other".to_owned()),
             pid: Some(102),
             running: true,

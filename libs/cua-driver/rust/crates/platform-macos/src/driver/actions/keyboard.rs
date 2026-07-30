@@ -971,11 +971,21 @@ pub(crate) fn keyboard_capability_cells(os_version: &str) -> Vec<CapabilityCell>
         for state in &states {
             let type_text = match state {
                 WindowStateKind::Visible | WindowStateKind::Occluded
+                    if framework == Framework::Chromium =>
+                {
+                    // Chromium exposes AXSelectedText as writable even when the
+                    // renderer silently drops the write. Match the Swift
+                    // driver's verified AX -> pid-post fallback by selecting
+                    // the already-proven targeted Unicode route up front.
+                    RouteDecision::Supported {
+                        route: Route::TargetedKeyboard,
+                    }
+                }
+                WindowStateKind::Visible | WindowStateKind::Occluded
                     if matches!(
                         framework,
                         Framework::Unknown
                             | Framework::AppKit
-                            | Framework::Chromium
                             | Framework::WebKit
                     ) =>
                 {
@@ -1138,6 +1148,36 @@ mod tests {
             unknown.decision,
             RouteDecision::Supported {
                 route: Route::TargetedKeyboard
+            }
+        ));
+
+        let chromium_text = cells
+            .iter()
+            .find(|cell| {
+                cell.key.action == ActionKind::TypeText
+                    && cell.key.framework == Framework::Chromium
+                    && cell.key.window_state == WindowStateKind::Visible
+            })
+            .unwrap();
+        assert!(matches!(
+            chromium_text.decision,
+            RouteDecision::Supported {
+                route: Route::TargetedKeyboard
+            }
+        ));
+
+        let appkit_text = cells
+            .iter()
+            .find(|cell| {
+                cell.key.action == ActionKind::TypeText
+                    && cell.key.framework == Framework::AppKit
+                    && cell.key.window_state == WindowStateKind::Visible
+            })
+            .unwrap();
+        assert!(matches!(
+            appkit_text.decision,
+            RouteDecision::Supported {
+                route: Route::Semantic
             }
         ));
     }

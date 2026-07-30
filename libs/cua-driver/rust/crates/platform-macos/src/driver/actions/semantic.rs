@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use core_foundation::base::{CFRelease, CFTypeRef};
@@ -6,8 +9,11 @@ use cua_driver_core::api::{
     contracts::{MouseButton, Route, ScrollDirection, SelectionType, VerificationLevel},
     errors::{ErrorCode, ErrorPhase, NativeError},
     interaction::{InteractionScope, NativeEvidence, NativeSideEffectBoundary},
-    observation::ResolvedElement,
-    platform::{ClickSpec, ElementScrollSpec, NativeDispatch, ResolvedAction, SelectionSpec},
+    menu::{MenuMutationIntent, NativeMenuEvidence, NativeMenuIdentity},
+    observation::{ResolvedElement, ResolvedWindowStamp},
+    platform::{
+        Candidate, ClickSpec, ElementScrollSpec, NativeDispatch, ResolvedAction, SelectionSpec,
+    },
     settlement::SettlementSignal,
 };
 use serde_json::Value;
@@ -16,10 +22,14 @@ use crate::{
     ax::bindings::{
         self, copy_action_names_exact, copy_attr_value, copy_ax_windows, copy_children,
         copy_element_attr, copy_string_attr, copy_string_attr_exact, is_attribute_settable,
-        kAXErrorSuccess, AXUIElementCreateApplication, AXUIElementRef, AxCfRange,
+        kAXErrorAttributeUnsupported, kAXErrorSuccess, AXUIElementCreateApplication,
+        AXUIElementRef, AxCfRange,
     },
     driver::{
-        observation::{RegisteredElementSnapshot, RetainedAxElement, RetainedCfValue},
+        menu::resolve_menu_identity,
+        observation::{
+            discover_native_menu, RegisteredElementSnapshot, RetainedAxElement, RetainedCfValue,
+        },
         target::MacTargetState,
         windows::MacWindowRegistry,
     },
@@ -28,6 +38,7 @@ use crate::{
 use super::scroll::{direct_page_action, page_child_snapshot, PageRoute, AX_PRESS};
 
 const AX_SHOW_MENU: &str = "AXShowMenu";
+const AX_OPEN: &str = "AXOpen";
 const MAX_OWNER_DEPTH: usize = 64;
 
 #[derive(Clone)]
@@ -48,6 +59,8 @@ enum PreparedKind {
         element: LiveAxElement,
         action: String,
         primitive: &'static str,
+        opens_menu: bool,
+        open_verification: Option<AxOpenVerification>,
     },
     PageScroll {
         route: PageRoute,
@@ -65,6 +78,13 @@ enum PreparedKind {
     },
 }
 
+struct AxOpenVerification {
+    pid: i32,
+    owner_window_id: u32,
+    prior_title: String,
+    expected_title: String,
+}
+
 impl MacSemanticActions {
     pub fn new(windows: MacWindowRegistry) -> Self {
         Self { windows }
@@ -75,18 +95,62 @@ impl MacSemanticActions {
         target: &mut MacTargetState,
         element: &ResolvedElement,
         spec: &ClickSpec,
-    ) -> Result<bool, NativeError> {
+    ) -> Result<Candidate<()>, NativeError> {
         let live = self.refetch_exact(target, element).await?;
         let Ok(action) = click_action(&live.snapshot.role, live.snapshot.subrole.as_deref(), spec)
         else {
-            return Ok(false);
+            return Ok(Candidate::not_applicable(
+                "element click shape has no exact semantic primitive",
+            ));
         };
-        Ok(action == AX_PRESS
+        if action == AX_PRESS
             && live
                 .snapshot
                 .actions
                 .iter()
-                .any(|candidate| candidate == AX_PRESS))
+                .any(|candidate| candidate == AX_PRESS)
+        {
+            Ok(Candidate::Prepared(()))
+        } else {
+            Ok(Candidate::not_applicable(
+                "element does not retain an exact usable AXPress action",
+            ))
+        }
+    }
+
+    fn element_scroll_candidate(
+        &self,
+        target: &MacTargetState,
+        element: &ResolvedElement,
+        scroll: &ElementScrollSpec,
+    ) -> Result<Candidate<()>, NativeError> {
+        if exact_semantic_pages(scroll.pages).is_none() {
+            return Ok(Candidate::not_applicable(
+                "fractional or oversized page count requires targeted page scroll",
+            ));
+        }
+        let requested = self.registered_exact(target, element)?;
+        let snapshots = target.elements.registered_snapshots();
+        for candidate in retained_ancestor_chain(&requested, &snapshots)? {
+            if direct_page_action(
+                scroll.direction,
+                &candidate.actions,
+                candidate.orientation.as_deref(),
+            )
+            .is_some()
+            {
+                return Ok(Candidate::Prepared(()));
+            }
+            if is_scroll_container_role(&candidate.role)
+                && page_child_snapshot(&candidate, &snapshots, scroll.direction)
+                    .is_some_and(|child| child.actions.iter().any(|action| action == AX_PRESS))
+            {
+                return Ok(Candidate::Prepared(()));
+            }
+        }
+        Ok(Candidate::not_applicable(
+            "element and retained ancestors expose no exact semantic page action",
+        ))
     }
 
     async fn prepare(
@@ -98,11 +162,6 @@ impl MacSemanticActions {
         let prepared = match action {
             ResolvedAction::ElementClick { element, spec, .. } => {
                 preflight_scope(target, scope, element)?;
-                if spec.button == MouseButton::Right {
-                    return Err(menu_recipe_unproven(
-                        "explicit AXShowMenu/right-click publication is unavailable",
-                    ));
-                }
                 let live = self.refetch_exact(target, element).await?;
                 let action =
                     click_action(&live.snapshot.role, live.snapshot.subrole.as_deref(), spec)?;
@@ -110,18 +169,26 @@ impl MacSemanticActions {
                 PreparedKind::AxAction {
                     element: live,
                     action: action.to_owned(),
-                    primitive: "macos_ax_press",
+                    primitive: if action == AX_SHOW_MENU {
+                        "macos_ax_show_menu"
+                    } else {
+                        "macos_ax_press"
+                    },
+                    opens_menu: action == AX_SHOW_MENU,
+                    open_verification: None,
                 }
             }
-            ResolvedAction::ElementScroll { element, spec } => {
+            ResolvedAction::ElementScroll { element, spec, .. } => {
                 preflight_scope(target, scope, element)?;
-                if spec.pages == 0 {
-                    return Err(NativeError::invalid("scroll pages must be nonzero"));
-                }
+                let pages = exact_semantic_pages(spec.pages).ok_or_else(|| {
+                    NativeError::unsupported(
+                        "semantic page scroll requires an integral page count within u16",
+                    )
+                })?;
                 PreparedKind::PageScroll {
                     route: self.prepare_scroll_route(target, element, spec).await?,
                     direction: spec.direction,
-                    pages: spec.pages,
+                    pages,
                 }
             }
             ResolvedAction::SetValue { element, value } => {
@@ -167,22 +234,29 @@ impl MacSemanticActions {
             }
             ResolvedAction::Secondary { element, action } => {
                 preflight_scope(target, scope, element)?;
-                if action == AX_SHOW_MENU {
-                    return Err(menu_recipe_unproven(
-                        "explicit AXShowMenu secondary action publication is unavailable",
-                    ));
-                }
                 let live = self.refetch_exact(target, element).await?;
-                if menu_managed_role(&live.snapshot.role, live.snapshot.subrole.as_deref()) {
-                    return Err(menu_recipe_unproven(
-                        "secondary actions on menu-managed roles require proved menu provenance/suppression",
-                    ));
-                }
                 require_exact_action(&live.snapshot.actions, action)?;
+                let open_verification = if action == AX_OPEN {
+                    self.prepare_ax_open_verification(
+                        target.window.clone(),
+                        live.snapshot.owner.clone(),
+                        live.snapshot.owner_window_id,
+                        live.snapshot.label.clone(),
+                    )
+                    .await
+                } else {
+                    None
+                };
                 PreparedKind::AxAction {
                     element: live,
                     action: action.clone(),
-                    primitive: "macos_ax_secondary_action",
+                    primitive: if action == AX_SHOW_MENU {
+                        "macos_ax_show_menu"
+                    } else {
+                        "macos_ax_secondary_action"
+                    },
+                    opens_menu: action == AX_SHOW_MENU,
+                    open_verification,
                 }
             }
             ResolvedAction::DeltaScroll(_) => {
@@ -218,32 +292,25 @@ impl MacSemanticActions {
         element: &ResolvedElement,
         scroll: &ElementScrollSpec,
     ) -> Result<PageRoute, NativeError> {
-        let requested = self.refetch_exact(target, element).await?;
+        let requested = self.registered_exact(target, element)?;
         let snapshots = target.elements.registered_snapshots();
-        let candidates = retained_ancestor_chain(&requested.snapshot, &snapshots)?;
-        let mut requested_live = Some(requested);
+        let candidates = retained_ancestor_chain(&requested, &snapshots)?;
 
-        for (index, candidate) in candidates.into_iter().enumerate() {
-            let live = if index == 0 {
-                requested_live
-                    .take()
-                    .expect("first scroll candidate owns the requested retained element")
-            } else {
-                self.refetch_registered_exact(target, candidate).await?
-            };
+        for candidate in candidates {
             if let Some(action) = direct_page_action(
                 scroll.direction,
-                &live.snapshot.actions,
-                live.snapshot.orientation.as_deref(),
+                &candidate.actions,
+                candidate.orientation.as_deref(),
             ) {
+                let live = self.refetch_registered_exact(target, candidate).await?;
                 return Ok(PageRoute::Direct {
                     element: live,
                     action,
                 });
             }
-            if is_scroll_container_role(&live.snapshot.role) {
+            if is_scroll_container_role(&candidate.role) {
                 if let Some(page_child) =
-                    page_child_snapshot(&live.snapshot, &snapshots, scroll.direction)
+                    page_child_snapshot(&candidate, &snapshots, scroll.direction)
                 {
                     let page_child = self.refetch_registered_exact(target, page_child).await?;
                     require_exact_action(&page_child.snapshot.actions, AX_PRESS)?;
@@ -255,6 +322,44 @@ impl MacSemanticActions {
             }
         }
         Err(unsupported_scroll(scroll.direction))
+    }
+
+    fn registered_exact(
+        &self,
+        target: &MacTargetState,
+        element: &ResolvedElement,
+    ) -> Result<RegisteredElementSnapshot, NativeError> {
+        if target.invalidated() {
+            return Err(NativeError::stale(
+                ErrorCode::ElementStale,
+                "macOS target invalidated before semantic element refetch",
+            ));
+        }
+        if target.window != element.window.stamp() {
+            return Err(NativeError::stale(
+                ErrorCode::ElementStale,
+                "resolved element target stamp no longer matches the locked macOS target",
+            ));
+        }
+        let snapshot = target
+            .elements
+            .registered(&element.native, &element.element_id)
+            .ok_or_else(|| {
+                NativeError::stale(
+                    ErrorCode::ElementStale,
+                    "resolved element has no exact retained macOS AX identity",
+                )
+            })?;
+        if snapshot.owner != element.owner
+            || element.role.as_deref() != Some(snapshot.role.as_str())
+            || !same_actions(&snapshot.actions, &element.actions)
+        {
+            return Err(NativeError::stale(
+                ErrorCode::ElementStale,
+                "resolved element metadata disagrees with its retained macOS AX snapshot",
+            ));
+        }
+        Ok(snapshot)
     }
 
     async fn dispatch(
@@ -271,15 +376,118 @@ impl MacSemanticActions {
                 element,
                 action,
                 primitive,
+                opens_menu,
+                open_verification,
             } => {
                 boundary.begin()?;
-                perform_exact(element.as_ptr(), &action)?;
+                let result = unsafe { bindings::perform_action(element.as_ptr(), &action) };
+                let post_error_readback_attempts = if result == kAXErrorAttributeUnsupported {
+                    match open_verification.as_ref() {
+                        Some(proof) => {
+                            wait_for_verified_ax_open_transition(proof, scope.deadline.work).await
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let post_error_effect_verified = post_error_readback_attempts.is_some();
+                if result != kAXErrorSuccess && !post_error_effect_verified {
+                    return Err(ax_dispatch_error("exact AX action", result));
+                }
                 target.signals.record(SettlementSignal::AxAction);
-                Ok(dispatch(
-                    VerificationLevel::DispatchVerified,
+                let mut native_dispatch = dispatch(
+                    if post_error_effect_verified {
+                        VerificationLevel::EffectVerified
+                    } else {
+                        VerificationLevel::DispatchVerified
+                    },
                     primitive,
-                    [("ax_action", Value::String(action))],
-                ))
+                    [
+                        ("ax_action", Value::String(action.clone())),
+                        ("ax_return_code", Value::from(result)),
+                        (
+                            "post_error_effect_verified",
+                            Value::Bool(post_error_effect_verified),
+                        ),
+                        (
+                            "post_error_readback_attempts",
+                            Value::from(post_error_readback_attempts.unwrap_or(0)),
+                        ),
+                    ],
+                );
+                if post_error_effect_verified {
+                    target
+                        .signals
+                        .record(SettlementSignal::VerificationReadbackComplete);
+                    native_dispatch.evidence.fields.extend([
+                        (
+                            "owner_window_identity_preserved".to_owned(),
+                            Value::Bool(true),
+                        ),
+                        ("destination_title_matched".to_owned(), Value::Bool(true)),
+                    ]);
+                }
+                if let Some(intent) = &scope.menu_intent {
+                    if let Err(mut error) =
+                        target.arm_menu_suppression(&scope.action_id, intent.menu_id())
+                    {
+                        target.invalidate();
+                        scope.invalidate_target();
+                        error
+                            .details
+                            .insert("native_side_effect_started".to_owned(), true.into());
+                        return Err(error);
+                    }
+                }
+                native_dispatch.menu = match &scope.menu_intent {
+                    Some(MenuMutationIntent::Opening { menu_id }) if opens_menu => Some(
+                        self.wait_for_opened_menu(
+                            scope.owner.clone(),
+                            scope.action_id.clone(),
+                            scope.deadline.work,
+                            menu_id.clone(),
+                        )
+                        .await?,
+                    ),
+                    Some(MenuMutationIntent::Targeting { menu_id, identity }) if !opens_menu => {
+                        Some(
+                            self.menu_outcome_after_target(
+                                scope.owner.clone(),
+                                scope.action_id.clone(),
+                                menu_id.clone(),
+                                identity.clone(),
+                            )
+                            .await?,
+                        )
+                    }
+                    Some(MenuMutationIntent::Dismissing { .. }) => {
+                        return Err(NativeError::new(
+                            ErrorCode::Internal,
+                            ErrorPhase::Dispatch,
+                            false,
+                            "semantic AX action cannot satisfy a point-menu dismissal intent",
+                        ))
+                    }
+                    Some(_) => {
+                        return Err(NativeError::stale(
+                            ErrorCode::MenuStateStale,
+                            "semantic menu action and bound lifecycle intent disagree",
+                        )
+                        .with_detail("native_side_effect_started", true))
+                    }
+                    None => None,
+                };
+                match &native_dispatch.menu {
+                    Some(NativeMenuEvidence::Opened { .. }) => {
+                        target.signals.record(SettlementSignal::MenuOpened);
+                    }
+                    Some(NativeMenuEvidence::Dismissed { .. }) => {
+                        target.signals.record(SettlementSignal::MenuDismissed);
+                    }
+                    Some(NativeMenuEvidence::Targeted { .. }) | None => {}
+                }
+                Ok(native_dispatch)
             }
             PreparedKind::PageScroll {
                 route,
@@ -414,6 +622,84 @@ impl MacSemanticActions {
         }
     }
 
+    async fn wait_for_opened_menu(
+        &self,
+        owner: cua_driver_core::api::observation::ResolvedWindowStamp,
+        action_id: cua_driver_core::api::contracts::ActionId,
+        deadline: Instant,
+        menu_id: cua_driver_core::api::contracts::MenuId,
+    ) -> Result<NativeMenuEvidence, NativeError> {
+        loop {
+            if let Some(identity) = self.discover_menu_identity(owner.clone()).await? {
+                return Ok(NativeMenuEvidence::Opened {
+                    menu_id,
+                    opened_by_action_id: action_id,
+                    owner,
+                    identity,
+                    surface_ids: Vec::new(),
+                    focused_item: None,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(NativeError::stale(
+                    ErrorCode::MenuStateStale,
+                    "AXShowMenu dispatched but no exact native menu identity arrived before the action deadline",
+                )
+                .with_detail("native_side_effect_started", true));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn menu_outcome_after_target(
+        &self,
+        owner: cua_driver_core::api::observation::ResolvedWindowStamp,
+        action_id: cua_driver_core::api::contracts::ActionId,
+        menu_id: cua_driver_core::api::contracts::MenuId,
+        prior_identity: NativeMenuIdentity,
+    ) -> Result<NativeMenuEvidence, NativeError> {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(identity) = self.discover_menu_identity(owner.clone()).await? {
+            return Ok(NativeMenuEvidence::Targeted {
+                menu_id,
+                action_id,
+                owner,
+                identity,
+            });
+        }
+        Ok(NativeMenuEvidence::Dismissed {
+            menu_id,
+            action_id,
+            owner,
+            identity: prior_identity,
+        })
+    }
+
+    async fn discover_menu_identity(
+        &self,
+        owner: cua_driver_core::api::observation::ResolvedWindowStamp,
+    ) -> Result<Option<NativeMenuIdentity>, NativeError> {
+        let parent = self.windows.facts_for_stamp(&owner).await?;
+        let pid = parent.pid;
+        let window_id = parent.cg_window_id;
+        let discovered = tokio::task::spawn_blocking(move || discover_native_menu(pid, window_id))
+            .await
+            .map_err(|error| {
+                NativeError::new(
+                    ErrorCode::MenuStateStale,
+                    ErrorPhase::Dispatch,
+                    false,
+                    format!("native menu discovery task failed: {error}"),
+                )
+            })??;
+        let Some((menu_window_id, menu_element)) = discovered else {
+            return Ok(None);
+        };
+        Ok(Some(
+            resolve_menu_identity(&self.windows, &parent, menu_window_id, &menu_element).await?,
+        ))
+    }
+
     async fn revalidate_prepared(
         &self,
         target: &mut MacTargetState,
@@ -457,41 +743,47 @@ impl MacSemanticActions {
         Ok(())
     }
 
+    async fn prepare_ax_open_verification(
+        &self,
+        target_window: ResolvedWindowStamp,
+        owner: ResolvedWindowStamp,
+        observed_owner_window_id: u32,
+        expected_title: Option<String>,
+    ) -> Option<AxOpenVerification> {
+        let expected_title = expected_title
+            .as_deref()
+            .filter(|title| !title.is_empty())?
+            .to_owned();
+        let (pid, owner_window_id) = if owner == target_window {
+            let facts = self.windows.facts_for_stamp(&target_window).await.ok()?;
+            (facts.pid, facts.cg_window_id)
+        } else {
+            let facts = self
+                .windows
+                .facts_for_related_stamp(&owner, &target_window)
+                .await
+                .ok()?;
+            (facts.pid, facts.cg_window_id)
+        };
+        if owner_window_id != observed_owner_window_id {
+            return None;
+        }
+        let window = exact_ax_window(pid, owner_window_id).ok()?;
+        let prior_title = unsafe { copy_string_attr_exact(window.as_ptr(), "AXTitle") }.ok()??;
+        Some(AxOpenVerification {
+            pid,
+            owner_window_id,
+            prior_title,
+            expected_title,
+        })
+    }
+
     async fn refetch_exact(
         &self,
         target: &mut MacTargetState,
         element: &ResolvedElement,
     ) -> Result<LiveAxElement, NativeError> {
-        if target.invalidated() {
-            return Err(NativeError::stale(
-                ErrorCode::ElementStale,
-                "macOS target invalidated before semantic element refetch",
-            ));
-        }
-        if target.window != element.window.stamp() {
-            return Err(NativeError::stale(
-                ErrorCode::ElementStale,
-                "resolved element target stamp no longer matches the locked macOS target",
-            ));
-        }
-        let snapshot = target
-            .elements
-            .registered(&element.native, &element.element_id)
-            .ok_or_else(|| {
-                NativeError::stale(
-                    ErrorCode::ElementStale,
-                    "resolved element has no exact retained macOS AX identity",
-                )
-            })?;
-        if snapshot.owner != element.owner
-            || element.role.as_deref() != Some(snapshot.role.as_str())
-            || !same_actions(&snapshot.actions, &element.actions)
-        {
-            return Err(NativeError::stale(
-                ErrorCode::ElementStale,
-                "resolved element metadata disagrees with its retained macOS AX snapshot",
-            ));
-        }
+        let snapshot = self.registered_exact(target, element)?;
         self.refetch_registered_exact(target, snapshot).await
     }
 
@@ -651,8 +943,8 @@ fn preflight_scope(
 }
 
 fn click_action(
-    role: &str,
-    subrole: Option<&str>,
+    _role: &str,
+    _subrole: Option<&str>,
     click: &ClickSpec,
 ) -> Result<&'static str, NativeError> {
     if click.click_count != 1 || !click.modifiers.is_empty() {
@@ -661,34 +953,12 @@ fn click_action(
         ));
     }
     match click.button {
-        MouseButton::Left if menu_managed_role(role, subrole) => Err(menu_recipe_unproven(
-            "AXPress on this menu-managed role requires proved menu provenance/suppression",
-        )),
         MouseButton::Left => Ok(AX_PRESS),
-        MouseButton::Right => Err(menu_recipe_unproven(
-            "explicit AXShowMenu/right-click publication is unavailable",
-        )),
+        MouseButton::Right => Ok(AX_SHOW_MENU),
         MouseButton::Middle => Err(NativeError::unsupported(
             "semantic macOS click has no exact middle-button route",
         )),
     }
-}
-
-fn menu_managed_role(role: &str, subrole: Option<&str>) -> bool {
-    matches!(
-        role,
-        "AXMenu" | "AXMenuItem" | "AXMenuBar" | "AXMenuBarItem" | "AXPopUpButton" | "AXMenuButton"
-    ) || matches!(
-        subrole,
-        Some(
-            "AXMenu"
-                | "AXMenuItem"
-                | "AXMenuBar"
-                | "AXMenuBarItem"
-                | "AXPopUpButton"
-                | "AXMenuButton"
-        )
-    )
 }
 
 fn is_scroll_container_role(role: &str) -> bool {
@@ -704,9 +974,12 @@ fn is_scroll_container_role(role: &str) -> bool {
     )
 }
 
-fn menu_recipe_unproven(reason: &str) -> NativeError {
-    NativeError::unsupported(format!("recipe_unproven: {reason}"))
-        .with_detail("recipe_status", "recipe_unproven")
+fn exact_semantic_pages(pages: f64) -> Option<u16> {
+    if pages.is_finite() && pages > 0.0 && pages.fract() == 0.0 && pages <= f64::from(u16::MAX) {
+        Some(pages as u16)
+    } else {
+        None
+    }
 }
 
 fn require_exact_action(actions: &[String], action: &str) -> Result<(), NativeError> {
@@ -719,13 +992,40 @@ fn require_exact_action(actions: &[String], action: &str) -> Result<(), NativeEr
     }
 }
 
-fn perform_exact(element: AXUIElementRef, action: &str) -> Result<(), NativeError> {
-    let result = unsafe { bindings::perform_action(element, action) };
-    if result == kAXErrorSuccess {
-        Ok(())
-    } else {
-        Err(ax_dispatch_error("exact AX action", result))
+fn verified_ax_open_transition(proof: &AxOpenVerification) -> bool {
+    let Ok(window) = exact_ax_window(proof.pid, proof.owner_window_id) else {
+        return false;
+    };
+    let Ok(Some(current_title)) = (unsafe { copy_string_attr_exact(window.as_ptr(), "AXTitle") })
+    else {
+        return false;
+    };
+    ax_open_title_transition_matches(&proof.prior_title, &current_title, &proof.expected_title)
+}
+
+async fn wait_for_verified_ax_open_transition(
+    proof: &AxOpenVerification,
+    deadline: Instant,
+) -> Option<u32> {
+    let mut attempts = 0_u32;
+    loop {
+        attempts += 1;
+        if verified_ax_open_transition(proof) {
+            return Some(attempts);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+fn ax_open_title_transition_matches(
+    prior_title: &str,
+    current_title: &str,
+    expected_title: &str,
+) -> bool {
+    current_title != prior_title && current_title == expected_title
 }
 
 fn resolve_selection_range(
@@ -1017,8 +1317,17 @@ impl cua_driver_core::api::platform::SemanticActionProvider<MacTargetState> for 
         target: &mut MacTargetState,
         element: &ResolvedElement,
         spec: &ClickSpec,
-    ) -> Result<bool, NativeError> {
+    ) -> Result<Candidate<()>, NativeError> {
         MacSemanticActions::element_click_candidate(self, target, element, spec).await
+    }
+
+    async fn element_scroll_candidate(
+        &self,
+        target: &mut MacTargetState,
+        element: &ResolvedElement,
+        spec: &ElementScrollSpec,
+    ) -> Result<Candidate<()>, NativeError> {
+        MacSemanticActions::element_scroll_candidate(self, target, element, spec)
     }
 
     async fn prepare(
@@ -1061,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_click_shapes_and_menu_managed_roles_refuse_before_dispatch() {
+    fn semantic_click_maps_exact_menu_actions_and_refuses_nonsemantic_shapes() {
         assert_eq!(
             click_action(
                 "AXButton",
@@ -1075,18 +1384,19 @@ mod tests {
             .unwrap(),
             AX_PRESS
         );
-        let right = click_action(
-            "AXButton",
-            None,
-            &ClickSpec {
-                button: MouseButton::Right,
-                click_count: 1,
-                modifiers: vec![],
-            },
-        )
-        .unwrap_err();
-        assert_eq!(right.code, ErrorCode::UnsupportedInBackground);
-        assert_eq!(right.details["recipe_status"], "recipe_unproven");
+        assert_eq!(
+            click_action(
+                "AXButton",
+                None,
+                &ClickSpec {
+                    button: MouseButton::Right,
+                    click_count: 1,
+                    modifiers: vec![],
+                },
+            )
+            .unwrap(),
+            AX_SHOW_MENU
+        );
         for (role, subrole) in [
             ("AXPopUpButton", None),
             ("AXMenuButton", None),
@@ -1096,17 +1406,19 @@ mod tests {
             ("AXMenuBarItem", None),
             ("AXButton", Some("AXMenuButton")),
         ] {
-            let error = click_action(
-                role,
-                subrole,
-                &ClickSpec {
-                    button: MouseButton::Left,
-                    click_count: 1,
-                    modifiers: vec![],
-                },
-            )
-            .unwrap_err();
-            assert_eq!(error.details["recipe_status"], "recipe_unproven");
+            assert_eq!(
+                click_action(
+                    role,
+                    subrole,
+                    &ClickSpec {
+                        button: MouseButton::Left,
+                        click_count: 1,
+                        modifiers: vec![],
+                    },
+                )
+                .unwrap(),
+                AX_PRESS
+            );
         }
         for click in [
             ClickSpec {
@@ -1142,6 +1454,14 @@ mod tests {
                 .code,
             ErrorCode::UnsupportedInBackground
         );
+    }
+
+    #[test]
+    fn ax_open_post_error_proof_requires_an_exact_title_transition() {
+        assert!(ax_open_title_transition_matches("root", "alpha", "alpha"));
+        assert!(!ax_open_title_transition_matches("root", "beta", "alpha"));
+        assert!(!ax_open_title_transition_matches("alpha", "alpha", "alpha"));
+        assert!(!ax_open_title_transition_matches("root", "", "alpha"));
     }
 
     #[test]

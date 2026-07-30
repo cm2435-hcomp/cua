@@ -9,7 +9,7 @@ use std::{
 use core_foundation::base::{CFRelease, CFTypeRef};
 use cua_driver_core::api::{
     capabilities::Framework,
-    contracts::{MouseButton, Point, Rect, Route},
+    contracts::{Point, Rect, Route},
     errors::{ErrorCode, ErrorPhase, NativeError},
     interaction::{NativeEvidence, ScopeRequirements},
     platform::ResolvedAction,
@@ -66,6 +66,7 @@ pub enum AccessibilityRecipe {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuSuppressionRecipe {
     NotApplicable,
+    ExactSourcePidPredicate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,25 +104,6 @@ pub fn select_scope_recipe(
     action: &ResolvedAction,
     requirements: &ScopeRequirements,
 ) -> Result<MacScopeRecipe, NativeError> {
-    if requirements.menu_dismissal {
-        return Err(recipe_unproven(
-            host,
-            framework,
-            route,
-            action,
-            "exact per-pid and per-menu event-tap predicate is not proved",
-        ));
-    }
-    if route == Route::TargetedPointer && *framework == Framework::Catalyst {
-        return Err(recipe_unproven(
-            host,
-            framework,
-            route,
-            action,
-            "the helper's Catalyst preparation and focus reassertion branch is not ported",
-        ));
-    }
-
     let accessibility = if requirements.accessibility
         && *framework == Framework::Chromium
         && requires_action_time_chromium_enablement(route, action)
@@ -137,7 +119,7 @@ pub fn select_scope_recipe(
             if requirements.target_belief
                 && host.os_version == PROVEN_OS_VERSION
                 && host.architecture == PROVEN_ARCHITECTURE
-                && is_exact_proven_point_click(action) =>
+                && is_exact_proven_pointer_action(action) =>
         {
             TargetBeliefRecipe::SwiftCoordinateClick
         }
@@ -162,7 +144,11 @@ pub fn select_scope_recipe(
 
     Ok(MacScopeRecipe {
         accessibility,
-        menu: MenuSuppressionRecipe::NotApplicable,
+        menu: if requirements.menu_dismissal {
+            MenuSuppressionRecipe::ExactSourcePidPredicate
+        } else {
+            MenuSuppressionRecipe::NotApplicable
+        },
         target_belief,
     })
 }
@@ -188,13 +174,13 @@ fn requires_action_time_chromium_enablement(route: Route, action: &ResolvedActio
     }
 }
 
-fn is_exact_proven_point_click(action: &ResolvedAction) -> bool {
+fn is_exact_proven_pointer_action(action: &ResolvedAction) -> bool {
     matches!(
         action,
-        ResolvedAction::PointClick { spec, .. }
-            if spec.button == MouseButton::Left
-                && spec.click_count == 1
-                && spec.modifiers.is_empty()
+        ResolvedAction::PointClick { .. }
+            | ResolvedAction::Drag(_)
+            | ResolvedAction::ElementScroll { point: Some(_), .. }
+            | ResolvedAction::DeltaScroll(_)
     )
 }
 
@@ -447,8 +433,8 @@ mod tests {
 
     use cua_driver_core::api::{
         contracts::{
-            AxRevision, CaptureRevision, ElementId, GeometryRevision, KeyStroke, ObservationId,
-            Point, Rect, SurfaceId, WindowGeneration,
+            AxRevision, CaptureRevision, ElementId, GeometryRevision, KeyStroke, MouseButton,
+            ObservationId, Point, Rect, SurfaceId, WindowGeneration,
         },
         observation::{
             NativeProcessHandle, NativeWindowHandle, ResolvedFocus, ResolvedPoint, ResolvedWindow,
@@ -506,6 +492,7 @@ mod tests {
     fn point_click(framework: Framework, button: MouseButton, count: u8) -> ResolvedAction {
         let app = cua_driver_core::api::contracts::AppRef {
             id: cua_driver_core::api::contracts::AppId::parse("app").unwrap(),
+            canonical_id: None,
             name: None,
             pid: Some(1),
             running: true,
@@ -546,6 +533,7 @@ mod tests {
                 window_point: Point { x: 1.0, y: 1.0 },
                 screen_point: Point { x: 1.0, y: 1.0 },
                 geometry_revision: GeometryRevision::parse("geometry").unwrap(),
+                menu_id: None,
             },
             spec: ClickSpec {
                 button,
@@ -630,24 +618,54 @@ mod tests {
             assert_eq!(keyboard.target_belief, TargetBeliefRecipe::SwiftKeyboard);
             assert_eq!(keyboard.accessibility, AccessibilityRecipe::NotApplicable);
         }
-        let catalyst_error = select_scope_recipe(
-            &host,
-            &Framework::Catalyst,
-            Route::TargetedPointer,
-            &point_click(Framework::Catalyst, MouseButton::Left, 1),
-            &requirements,
-        )
-        .unwrap_err();
-        assert_eq!(catalyst_error.code, ErrorCode::UnsupportedInBackground);
-        let error = select_scope_recipe(
+        for (framework, button) in [
+            (Framework::Catalyst, MouseButton::Left),
+            (Framework::Unknown, MouseButton::Right),
+        ] {
+            let recipe = select_scope_recipe(
+                &host,
+                &framework,
+                Route::TargetedPointer,
+                &point_click(framework.clone(), button, 1),
+                &requirements,
+            )
+            .unwrap();
+            assert_eq!(
+                recipe.target_belief,
+                TargetBeliefRecipe::SwiftCoordinateClick
+            );
+        }
+        let mut menu_requirements = requirements.clone();
+        menu_requirements.menu_dismissal = true;
+        let menu_recipe = select_scope_recipe(
             &host,
             &Framework::Unknown,
             Route::TargetedPointer,
             &point_click(Framework::Unknown, MouseButton::Right, 1),
-            &requirements,
+            &menu_requirements,
         )
-        .unwrap_err();
-        assert_eq!(error.code, ErrorCode::UnsupportedInBackground);
+        .unwrap();
+        assert_eq!(
+            menu_recipe.menu,
+            MenuSuppressionRecipe::ExactSourcePidPredicate
+        );
+
+        let chromium_menu_recipe = select_scope_recipe(
+            &host,
+            &Framework::Chromium,
+            Route::TargetedPointer,
+            &point_click(Framework::Chromium, MouseButton::Right, 1),
+            &menu_requirements,
+        )
+        .unwrap();
+        assert_eq!(
+            chromium_menu_recipe.menu,
+            MenuSuppressionRecipe::ExactSourcePidPredicate
+        );
+        assert_eq!(
+            chromium_menu_recipe.target_belief,
+            TargetBeliefRecipe::SwiftCoordinateClick
+        );
     }
 
     #[test]

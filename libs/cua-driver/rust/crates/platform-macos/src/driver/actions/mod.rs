@@ -105,12 +105,10 @@ pub(crate) fn pointer_capability_cells(os_version: &str) -> Vec<CapabilityCell> 
     for framework in frameworks {
         for action in &actions {
             for state in &states {
-                let proven_click = os_version == "26.5.1"
+                let candidate_pointer_family = os_version == "26.5.1"
                     && architecture == "arm64"
-                    && framework != Framework::Catalyst
-                    && *action == ActionKind::Click
                     && *state == WindowStateKind::Visible;
-                let decision = if proven_click {
+                let decision = if candidate_pointer_family {
                     RouteDecision::Supported {
                         route: Route::TargetedPointer,
                     }
@@ -174,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn targeted_pointer_cells_publish_the_exact_click_matrix_without_framework_guessing() {
+    fn targeted_pointer_cells_publish_one_generic_visible_pointer_family() {
         let cells = pointer_capability_cells("26.5.1");
         assert_eq!(cells.len(), 90);
         let supported: Vec<_> = cells
@@ -182,10 +180,9 @@ mod tests {
             .filter(|cell| matches!(cell.decision, RouteDecision::Supported { .. }))
             .collect();
         if std::env::consts::ARCH == "aarch64" {
-            assert_eq!(supported.len(), 5);
+            assert_eq!(supported.len(), 18);
             assert!(supported.iter().all(|cell| {
-                cell.key.action == ActionKind::Click
-                    && cell.key.addressing == AddressingMode::CapturedPoint
+                cell.key.addressing == AddressingMode::CapturedPoint
                     && cell.key.window_state == WindowStateKind::Visible
                     && matches!(
                         cell.decision,
@@ -197,12 +194,9 @@ mod tests {
             assert!(supported
                 .iter()
                 .any(|cell| cell.key.framework == Framework::Unknown));
-            assert!(cells.iter().any(|cell| {
-                cell.key.action == ActionKind::Click
-                    && cell.key.framework == Framework::Catalyst
-                    && cell.key.window_state == WindowStateKind::Visible
-                    && matches!(cell.decision, RouteDecision::Unsupported { .. })
-            }));
+            assert!(supported
+                .iter()
+                .any(|cell| cell.key.framework == Framework::Catalyst));
             assert!(cells.iter().any(|cell| {
                 cell.key.action == ActionKind::Click
                     && cell.key.framework == Framework::Chromium
@@ -214,7 +208,10 @@ mod tests {
         }
         assert!(cells
             .iter()
-            .filter(|cell| matches!(cell.key.action, ActionKind::Drag | ActionKind::Scroll))
+            .filter(|cell| {
+                matches!(cell.key.action, ActionKind::Drag | ActionKind::Scroll)
+                    && cell.key.window_state != WindowStateKind::Visible
+            })
             .all(|cell| matches!(cell.decision, RouteDecision::Unsupported { .. })));
     }
 }

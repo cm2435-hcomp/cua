@@ -8,9 +8,11 @@ use std::{
 
 use async_trait::async_trait;
 use cua_driver_core::api::{
-    contracts::{Modifier, MouseButton, Point, VerificationLevel},
+    capabilities::Framework,
+    contracts::{Modifier, MouseButton, Point, ScrollDirection, VerificationLevel},
     errors::{ErrorCode, ErrorPhase, NativeError},
     interaction::{InteractionScope, NativeEvidence, NativeSideEffectBoundary, TargetCursorHandle},
+    menu::{MenuMutationIntent, NativeMenuEvidence, NativeMenuIdentity},
     observation::{ResolvedPoint, ResolvedWindowStamp, SurfaceOwner},
     platform::{NativeDispatch, PointerActionProvider, ResolvedAction},
     settlement::SettlementSignal,
@@ -19,13 +21,18 @@ use cua_driver_core::api::{
 use serde_json::Value;
 
 use crate::{
+    browser::{CdpClient, CdpScrollDispatch, PreparedCdpScroll},
     driver::{
+        menu::resolve_menu_identity,
+        observation::discover_native_menu,
         settlement::MacSignalJournal,
         target::MacTargetState,
         windows::{MacRelatedWindowFacts, MacWindowFacts, MacWindowRegistry},
     },
     focus_steal,
-    input::synthesized_event::{self, MouseEventKind as NativeMouseEventKind, MouseEventSpec},
+    input::synthesized_event::{
+        self, MouseEventKind as NativeMouseEventKind, MouseEventSpec, PixelScrollEventSpec,
+    },
 };
 
 const CLICK_UP_DELAY_MS: u64 = 100;
@@ -131,28 +138,138 @@ impl MacPointerActions {
                 "targeted pointer prepare requires a live targeted-pointer scope",
             ));
         }
-        let (sequence, final_cursor, route_name) = match action {
+        let (sequence, final_cursor, route_name, transport) = match action {
             ResolvedAction::PointClick { point, spec } => {
-                if spec.button != MouseButton::Left
-                    || spec.click_count != 1
-                    || !spec.modifiers.is_empty()
-                {
-                    return Err(NativeError::unsupported(
-                        "recipe_unproven: the canonical macOS pointer route currently proves only an unmodified single left click",
-                    )
-                    .with_detail("recipe_status", "recipe_unproven"));
-                }
                 let point = self
                     .prepare_point(target.window.clone(), scope.owner.clone(), point)
                     .await?;
-                let sequence = build_click(point.clone());
-                (sequence, point.logical, "macos_targeted_pointer_click")
-            }
-            ResolvedAction::Drag(_) | ResolvedAction::DeltaScroll(_) => {
-                return Err(NativeError::unsupported(
-                    "recipe_unproven: drag and scroll are not published on the canonical macOS pointer route",
+                let sequence = build_click(
+                    point.clone(),
+                    spec.button,
+                    spec.click_count,
+                    &spec.modifiers,
+                );
+                (
+                    sequence,
+                    point.logical,
+                    "macos_targeted_pointer_click",
+                    PreparedPointerTransport::Native,
                 )
-                .with_detail("recipe_status", "recipe_unproven"));
+            }
+            ResolvedAction::Drag(drag) => {
+                let start = self
+                    .prepare_point(target.window.clone(), scope.owner.clone(), &drag.start)
+                    .await?;
+                let end = self
+                    .prepare_point(target.window.clone(), scope.owner.clone(), &drag.end)
+                    .await?;
+                ensure_same_drag_surface(&start, &end)?;
+                let sequence = build_drag(
+                    start,
+                    end.clone(),
+                    drag.button,
+                    &drag.modifiers,
+                    drag.duration_ms,
+                );
+                (
+                    sequence,
+                    end.logical,
+                    "macos_targeted_pointer_drag",
+                    PreparedPointerTransport::Native,
+                )
+            }
+            ResolvedAction::ElementScroll {
+                element,
+                point: Some(point),
+                spec,
+                ..
+            } => {
+                let point = self
+                    .prepare_point(target.window.clone(), scope.owner.clone(), point)
+                    .await?;
+                let bounds = element.bounds.ok_or_else(|| {
+                    NativeError::unsupported(
+                        "signed-compatible page scroll requires exact current element bounds",
+                    )
+                    .with_detail("recipe_status", "element_bounds_required")
+                })?;
+                let (delta_x, delta_y) =
+                    signed_page_scroll_delta(bounds, spec.direction, spec.pages)?;
+                let sequence = build_delta_scroll(point.clone(), delta_x, delta_y);
+                let (route_name, transport) = if scope.window.framework == Framework::Chromium {
+                    let title = scope.window.public.title.as_deref().ok_or_else(|| {
+                        unsupported_chromium_scroll(
+                            point.pid,
+                            None,
+                            "the exact native window has no title for CDP page binding",
+                        )
+                    })?;
+                    let cdp_target = CdpClient::bind_exact_page_for_pid(point.pid, title)
+                        .await
+                        .map_err(|error| {
+                            unsupported_chromium_scroll(point.pid, Some(title), error.to_string())
+                        })?;
+                    let prepared = CdpClient::prepare_scroll_gesture(
+                        &cdp_target,
+                        point.screen.x,
+                        point.screen.y,
+                    )
+                    .await
+                    .map_err(|error| {
+                        unsupported_chromium_scroll(point.pid, Some(title), error.to_string())
+                    })?;
+                    (
+                        "macos_signed_page_scroll_chromium_cdp",
+                        PreparedPointerTransport::ChromiumCdpScroll(Box::new(prepared)),
+                    )
+                } else {
+                    (
+                        "macos_signed_page_scroll_post_to_pid",
+                        PreparedPointerTransport::Native,
+                    )
+                };
+                (sequence, point.logical, route_name, transport)
+            }
+            ResolvedAction::DeltaScroll(scroll) => {
+                let point = self
+                    .prepare_point(target.window.clone(), scope.owner.clone(), &scroll.point)
+                    .await?;
+                validate_integral_scroll_delta(scroll.delta_x, "delta_x")?;
+                validate_integral_scroll_delta(scroll.delta_y, "delta_y")?;
+                let sequence = build_delta_scroll(point.clone(), scroll.delta_x, scroll.delta_y);
+                let (route_name, transport) = if scope.window.framework == Framework::Chromium {
+                    let title = scope.window.public.title.as_deref().ok_or_else(|| {
+                        unsupported_chromium_scroll(
+                            point.pid,
+                            None,
+                            "the exact native window has no title for CDP page binding",
+                        )
+                    })?;
+                    let cdp_target = CdpClient::bind_exact_page_for_pid(point.pid, title)
+                        .await
+                        .map_err(|error| {
+                            unsupported_chromium_scroll(point.pid, Some(title), error.to_string())
+                        })?;
+                    let prepared = CdpClient::prepare_scroll_gesture(
+                        &cdp_target,
+                        point.screen.x,
+                        point.screen.y,
+                    )
+                    .await
+                    .map_err(|error| {
+                        unsupported_chromium_scroll(point.pid, Some(title), error.to_string())
+                    })?;
+                    (
+                        "macos_targeted_pointer_chromium_cdp_pixel_scroll",
+                        PreparedPointerTransport::ChromiumCdpScroll(Box::new(prepared)),
+                    )
+                } else {
+                    (
+                        "macos_targeted_pointer_pixel_scroll",
+                        PreparedPointerTransport::Native,
+                    )
+                };
+                (sequence, point.logical, route_name, transport)
             }
             _ => {
                 return Err(NativeError::new(
@@ -168,6 +285,7 @@ impl MacPointerActions {
             sequence,
             final_cursor,
             route_name,
+            transport,
         })
     }
 
@@ -184,16 +302,22 @@ impl MacPointerActions {
                 "targeted pointer dispatch target changed after prepare",
             ));
         }
+        let MacPreparedPointerAction {
+            sequence,
+            final_cursor,
+            route_name,
+            mut transport,
+        } = action;
         self.revalidate_sequence_target(
             target.window.clone(),
             scope.owner.clone(),
             scope.window.stamp(),
-            &action.sequence,
+            &sequence,
         )
         .await?;
         if target.invalidated()
             || scope.owner != target.window
-            || target.signals.epoch() != action.sequence.target.observation_epoch
+            || target.signals.epoch() != sequence.target.observation_epoch
         {
             return Err(NativeError::stale(
                 ErrorCode::ObservationRaced,
@@ -202,18 +326,62 @@ impl MacPointerActions {
         }
         let epoch_witness = PointerEpochWitness {
             journal: target.signals.clone(),
-            expected: action.sequence.target.observation_epoch,
+            expected: sequence.target.observation_epoch,
         };
-        let mut evidence = PointerDispatchEvidence::new(&action);
-        let result = dispatch_sequence(
-            self.sink.as_ref(),
-            &action.sequence,
-            scope.deadline.work,
-            &scope.logical_cursor,
-            &mut evidence,
-            boundary,
-            &epoch_witness,
-        );
+        if let PreparedPointerTransport::ChromiumCdpScroll(prepared) = &mut transport {
+            prepared
+                .revalidate(sequence.target.screen.x, sequence.target.screen.y)
+                .await
+                .map_err(|error| {
+                    NativeError::stale(
+                        ErrorCode::SurfaceStale,
+                        format!(
+                            "Chromium CDP page or viewport changed before exact scroll dispatch: {error}"
+                        ),
+                    )
+                })?;
+        }
+
+        let mut evidence = PointerDispatchEvidence::new();
+        let mut cdp_dispatch = None;
+        let result = match transport {
+            PreparedPointerTransport::Native => dispatch_sequence(
+                self.sink.as_ref(),
+                &sequence,
+                scope.deadline.work,
+                &scope.logical_cursor,
+                &mut evidence,
+                boundary,
+                &epoch_witness,
+            ),
+            PreparedPointerTransport::ChromiumCdpScroll(prepared) => {
+                let (delta_x, delta_y) = prepared_scroll_deltas(&sequence)?;
+                epoch_witness.commit_first_post(|| boundary.begin())?;
+                match prepared.dispatch(delta_x, delta_y).await {
+                    Ok(dispatch) => {
+                        evidence.completed_events = 1;
+                        evidence.cleanup_succeeded = true;
+                        evidence.modifiers_cleared = true;
+                        cdp_dispatch = Some(dispatch);
+                        scope.logical_cursor.update(sequence.target.logical);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        evidence.may_have_partially_landed = true;
+                        Err(NativeError::new(
+                            ErrorCode::DispatchFailed,
+                            ErrorPhase::Dispatch,
+                            false,
+                            format!(
+                                "Chromium CDP scroll-gesture dispatch failed after the native side-effect boundary began: {error}"
+                            ),
+                        )
+                        .with_detail("cdp_method", "Input.synthesizeScrollGesture")
+                        .with_detail("possibly_partial_delivery", true))
+                    }
+                }
+            }
+        };
         evidence.merge_into(&mut scope.native_evidence);
         if let Err(mut error) = result {
             if evidence.cleanup_attempted && !evidence.cleanup_succeeded {
@@ -227,8 +395,59 @@ impl MacPointerActions {
             );
             return Err(error);
         }
-        focus_steal::record_synthesized_action(action.sequence.target.pid);
-        scope.logical_cursor.update(action.final_cursor);
+        if let Some(intent) = &scope.menu_intent {
+            if let Err(mut error) = target.arm_menu_suppression(&scope.action_id, intent.menu_id())
+            {
+                target.invalidate();
+                scope.invalidate_target();
+                error
+                    .details
+                    .insert("native_side_effect_started".to_owned(), true.into());
+                return Err(error);
+            }
+        }
+        let menu = match &scope.menu_intent {
+            Some(MenuMutationIntent::Opening { menu_id }) => Some(
+                self.wait_for_opened_menu(
+                    scope.owner.clone(),
+                    scope.action_id.clone(),
+                    scope.deadline.work,
+                    menu_id.clone(),
+                )
+                .await?,
+            ),
+            Some(MenuMutationIntent::Targeting { menu_id, identity }) => Some(
+                self.menu_outcome_after_target(
+                    scope.owner.clone(),
+                    scope.action_id.clone(),
+                    menu_id.clone(),
+                    identity.clone(),
+                )
+                .await?,
+            ),
+            Some(MenuMutationIntent::Dismissing { menu_id, identity }) => Some(
+                self.wait_for_dismissed_menu(
+                    scope.owner.clone(),
+                    scope.action_id.clone(),
+                    scope.deadline.work,
+                    menu_id.clone(),
+                    identity.clone(),
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        match &menu {
+            Some(NativeMenuEvidence::Opened { .. }) => {
+                target.signals.record(SettlementSignal::MenuOpened);
+            }
+            Some(NativeMenuEvidence::Dismissed { .. }) => {
+                target.signals.record(SettlementSignal::MenuDismissed);
+            }
+            Some(NativeMenuEvidence::Targeted { .. }) | None => {}
+        }
+        focus_steal::record_synthesized_action(sequence.target.pid);
+        scope.logical_cursor.update(final_cursor);
         target
             .signals
             .record(SettlementSignal::PointerSequenceComplete);
@@ -236,41 +455,174 @@ impl MacPointerActions {
         // The helper's CGEventPostToPid transport is a void API. A completed
         // call proves only that the complete targeted sequence was attempted;
         // it is not a native delivery acknowledgement.
-        let verification = VerificationLevel::DispatchUnverified;
+        let verification = if cdp_dispatch.is_some() {
+            VerificationLevel::DispatchVerified
+        } else {
+            VerificationLevel::DispatchUnverified
+        };
         let mut native = NativeEvidence::default();
         native
             .fields
-            .insert("pointer_route".to_owned(), action.route_name.into());
+            .insert("pointer_route".to_owned(), route_name.into());
         native.fields.insert(
             "pointer_event_count".to_owned(),
-            Value::from(action.sequence.events.len()),
+            Value::from(sequence.events.len()),
         );
         native.fields.insert(
             "pointer_transport".to_owned(),
-            "appkit_event_core_graphics_post_to_pid_once".into(),
+            if cdp_dispatch.is_some() {
+                "chromium_cdp_input_synthesize_scroll_gesture"
+            } else {
+                "appkit_event_core_graphics_post_to_pid_once"
+            }
+            .into(),
         );
         native.fields.insert(
             "surface_id".to_owned(),
-            action.sequence.target.surface_id.clone().into(),
+            sequence.target.surface_id.clone().into(),
         );
         native.fields.insert(
             "capture_revision".to_owned(),
-            action.sequence.target.capture_revision.clone().into(),
+            sequence.target.capture_revision.clone().into(),
         );
         native.fields.insert(
             "geometry_revision".to_owned(),
-            action.sequence.target.geometry_revision.clone().into(),
+            sequence.target.geometry_revision.clone().into(),
         );
         native.fields.insert(
             "observation_epoch".to_owned(),
-            action.sequence.target.observation_epoch.into(),
+            sequence.target.observation_epoch.into(),
         );
+        append_sequence_evidence(&sequence, cdp_dispatch.as_ref(), &mut native);
         Ok(NativeDispatch {
             verification,
             evidence: native,
             warnings: Vec::new(),
-            menu: None,
+            menu,
         })
+    }
+
+    async fn wait_for_opened_menu(
+        &self,
+        owner: ResolvedWindowStamp,
+        action_id: cua_driver_core::api::contracts::ActionId,
+        deadline: Instant,
+        menu_id: cua_driver_core::api::contracts::MenuId,
+    ) -> Result<NativeMenuEvidence, NativeError> {
+        let parent = self.windows.facts_for_stamp(&owner).await?;
+        loop {
+            let pid = parent.pid;
+            let window_id = parent.cg_window_id;
+            let discovered =
+                tokio::task::spawn_blocking(move || discover_native_menu(pid, window_id))
+                    .await
+                    .map_err(|error| {
+                        NativeError::new(
+                            ErrorCode::MenuStateStale,
+                            ErrorPhase::Dispatch,
+                            false,
+                            format!("native menu discovery task failed: {error}"),
+                        )
+                    })??;
+            if let Some((menu_window_id, menu_element)) = discovered {
+                let identity =
+                    resolve_menu_identity(&self.windows, &parent, menu_window_id, &menu_element)
+                        .await?;
+                return Ok(NativeMenuEvidence::Opened {
+                    menu_id,
+                    opened_by_action_id: action_id,
+                    owner,
+                    identity,
+                    surface_ids: Vec::new(),
+                    focused_item: None,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(NativeError::stale(
+                    ErrorCode::MenuStateStale,
+                    "targeted right click posted but no exact native menu identity arrived before the action deadline",
+                )
+                .with_detail("native_side_effect_started", true));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn menu_outcome_after_target(
+        &self,
+        owner: ResolvedWindowStamp,
+        action_id: cua_driver_core::api::contracts::ActionId,
+        menu_id: cua_driver_core::api::contracts::MenuId,
+        prior_identity: NativeMenuIdentity,
+    ) -> Result<NativeMenuEvidence, NativeError> {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(identity) = self.discover_menu_identity(owner.clone()).await? {
+            return Ok(NativeMenuEvidence::Targeted {
+                menu_id,
+                action_id,
+                owner,
+                identity,
+            });
+        }
+        Ok(NativeMenuEvidence::Dismissed {
+            menu_id,
+            action_id,
+            owner,
+            identity: prior_identity,
+        })
+    }
+
+    async fn wait_for_dismissed_menu(
+        &self,
+        owner: ResolvedWindowStamp,
+        action_id: cua_driver_core::api::contracts::ActionId,
+        deadline: Instant,
+        menu_id: cua_driver_core::api::contracts::MenuId,
+        prior_identity: NativeMenuIdentity,
+    ) -> Result<NativeMenuEvidence, NativeError> {
+        loop {
+            if self.discover_menu_identity(owner.clone()).await?.is_none() {
+                return Ok(NativeMenuEvidence::Dismissed {
+                    menu_id,
+                    action_id,
+                    owner,
+                    identity: prior_identity,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(NativeError::stale(
+                    ErrorCode::MenuStateStale,
+                    "parent-surface click posted but the exact native menu remained open through the action deadline",
+                )
+                .with_detail("native_side_effect_started", true));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn discover_menu_identity(
+        &self,
+        owner: ResolvedWindowStamp,
+    ) -> Result<Option<NativeMenuIdentity>, NativeError> {
+        let parent = self.windows.facts_for_stamp(&owner).await?;
+        let pid = parent.pid;
+        let window_id = parent.cg_window_id;
+        let discovered = tokio::task::spawn_blocking(move || discover_native_menu(pid, window_id))
+            .await
+            .map_err(|error| {
+                NativeError::new(
+                    ErrorCode::MenuStateStale,
+                    ErrorPhase::Dispatch,
+                    false,
+                    format!("native menu discovery task failed: {error}"),
+                )
+            })??;
+        let Some((menu_window_id, menu_element)) = discovered else {
+            return Ok(None);
+        };
+        Ok(Some(
+            resolve_menu_identity(&self.windows, &parent, menu_window_id, &menu_element).await?,
+        ))
     }
 
     async fn revalidate_sequence_target(
@@ -316,15 +668,16 @@ impl MacPointerActions {
             ));
         }
         for event in &sequence.events {
+            let event_point = event.point();
             let expected_screen = Point {
-                x: bounds.x + event.point.window_local.x,
-                y: bounds.y + event.point.window_local.y,
+                x: bounds.x + event_point.window_local.x,
+                y: bounds.y + event_point.window_local.y,
             };
-            if event.point.pid != pid
-                || event.point.cg_window_id != cg_window_id
-                || event.point.owner != stamp
-                || event.point.owner_bounds != bounds
-                || !same_point(expected_screen, event.point.screen)
+            if event_point.pid != pid
+                || event_point.cg_window_id != cg_window_id
+                || event_point.owner != stamp
+                || event_point.owner_bounds != bounds
+                || !same_point(expected_screen, event_point.screen)
             {
                 return Err(NativeError::stale(
                     ErrorCode::SurfaceStale,
@@ -333,6 +686,139 @@ impl MacPointerActions {
             }
         }
         Ok(())
+    }
+}
+
+fn append_sequence_evidence(
+    sequence: &PreparedSequence,
+    cdp_dispatch: Option<&CdpScrollDispatch>,
+    evidence: &mut NativeEvidence,
+) {
+    let event_kinds: Vec<Value> = sequence
+        .events
+        .iter()
+        .map(|event| match event {
+            PreparedPointerEvent::Mouse(mouse) => Value::from(match mouse.kind {
+                PreparedMouseEventKind::Down => "mouse_down",
+                PreparedMouseEventKind::Dragged => "mouse_dragged",
+                PreparedMouseEventKind::Up => "mouse_up",
+            }),
+            PreparedPointerEvent::PixelScroll(_) => Value::from("pixel_scroll"),
+        })
+        .collect();
+    evidence
+        .fields
+        .insert("pointer_event_kinds".to_owned(), Value::Array(event_kinds));
+    evidence.fields.insert(
+        "pointer_native_post_count".to_owned(),
+        if cdp_dispatch.is_some() {
+            0
+        } else {
+            sequence.events.len()
+        }
+        .into(),
+    );
+    if let Some(PreparedPointerEvent::Mouse(mouse)) = sequence.events.first() {
+        evidence.fields.insert(
+            "pointer_button".to_owned(),
+            Value::from(match mouse.button {
+                MouseButton::Left => "left",
+                MouseButton::Right => "right",
+                MouseButton::Middle => "middle",
+            }),
+        );
+        let click_count = sequence
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                PreparedPointerEvent::Mouse(mouse)
+                    if mouse.kind == PreparedMouseEventKind::Down =>
+                {
+                    Some(mouse.click_state)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or_default();
+        evidence
+            .fields
+            .insert("pointer_click_count".to_owned(), click_count.into());
+    }
+    if let Some(PreparedPointerEvent::PixelScroll(scroll)) = sequence.events.first() {
+        evidence
+            .fields
+            .insert("scroll_requested_delta_x".to_owned(), scroll.delta_x.into());
+        evidence
+            .fields
+            .insert("scroll_requested_delta_y".to_owned(), scroll.delta_y.into());
+        let posted_delta_x = if cdp_dispatch.is_some() {
+            scroll.delta_x
+        } else {
+            -scroll.delta_x
+        };
+        let posted_delta_y = if cdp_dispatch.is_some() {
+            scroll.delta_y
+        } else {
+            -scroll.delta_y
+        };
+        evidence
+            .fields
+            .insert("scroll_posted_delta_x".to_owned(), posted_delta_x.into());
+        evidence
+            .fields
+            .insert("scroll_posted_delta_y".to_owned(), posted_delta_y.into());
+        evidence
+            .fields
+            .insert("scroll_units".to_owned(), "pixel".into());
+        evidence.fields.insert(
+            "scroll_native_primitive".to_owned(),
+            if cdp_dispatch.is_some() {
+                "Input.synthesizeScrollGesture"
+            } else {
+                "CGEventCreateScrollWheelEvent"
+            }
+            .into(),
+        );
+        if let Some(dispatch) = cdp_dispatch {
+            evidence
+                .fields
+                .insert("cdp_command_count".to_owned(), 1.into());
+            evidence.fields.insert(
+                "cdp_gesture_distance_x".to_owned(),
+                (-scroll.delta_x).into(),
+            );
+            evidence.fields.insert(
+                "cdp_gesture_distance_y".to_owned(),
+                (-scroll.delta_y).into(),
+            );
+            evidence
+                .fields
+                .insert("cdp_prevent_fling".to_owned(), true.into());
+            evidence
+                .fields
+                .insert("cdp_port".to_owned(), dispatch.port.into());
+            evidence
+                .fields
+                .insert("cdp_page_title".to_owned(), dispatch.title.clone().into());
+            evidence.fields.insert(
+                "cdp_target_binding".to_owned(),
+                "pid_and_exact_window_title".into(),
+            );
+            evidence
+                .fields
+                .insert("cdp_viewport_x".to_owned(), dispatch.viewport_x.into());
+            evidence
+                .fields
+                .insert("cdp_viewport_y".to_owned(), dispatch.viewport_y.into());
+            evidence.fields.insert(
+                "cdp_viewport_origin_x".to_owned(),
+                dispatch.viewport_origin_x.into(),
+            );
+            evidence.fields.insert(
+                "cdp_viewport_origin_y".to_owned(),
+                dispatch.viewport_origin_y.into(),
+            );
+        }
     }
 }
 
@@ -366,6 +852,12 @@ pub struct MacPreparedPointerAction {
     sequence: PreparedSequence,
     final_cursor: Point,
     route_name: &'static str,
+    transport: PreparedPointerTransport,
+}
+
+enum PreparedPointerTransport {
+    Native,
+    ChromiumCdpScroll(Box<PreparedCdpScroll>),
 }
 
 #[derive(Debug, Clone)]
@@ -390,14 +882,37 @@ struct NativePoint {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PointerEventKind {
+enum PreparedMouseEventKind {
     Down,
+    Dragged,
     Up,
 }
 
 #[derive(Debug, Clone)]
-struct PreparedPointerEvent {
-    kind: PointerEventKind,
+enum PreparedPointerEvent {
+    Mouse(PreparedMouseEvent),
+    PixelScroll(PreparedPixelScrollEvent),
+}
+
+impl PreparedPointerEvent {
+    fn point(&self) -> &NativePoint {
+        match self {
+            Self::Mouse(event) => &event.point,
+            Self::PixelScroll(event) => &event.point,
+        }
+    }
+
+    fn scheduled_after(&self) -> Duration {
+        match self {
+            Self::Mouse(event) => event.scheduled_after,
+            Self::PixelScroll(event) => event.scheduled_after,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreparedMouseEvent {
+    kind: PreparedMouseEventKind,
     point: NativePoint,
     button: MouseButton,
     click_state: u8,
@@ -405,47 +920,133 @@ struct PreparedPointerEvent {
     scheduled_after: Duration,
 }
 
-fn build_click(point: NativePoint) -> PreparedSequence {
-    let events = vec![
-        pointer_event(
-            PointerEventKind::Down,
+#[derive(Debug, Clone)]
+struct PreparedPixelScrollEvent {
+    point: NativePoint,
+    delta_x: f64,
+    delta_y: f64,
+    scheduled_after: Duration,
+}
+
+fn build_click(
+    point: NativePoint,
+    button: MouseButton,
+    click_count: u8,
+    modifiers: &[Modifier],
+) -> PreparedSequence {
+    let mut events = Vec::with_capacity(usize::from(click_count) * 2);
+    for pair in 1..=click_count {
+        let down_index = u64::from(pair - 1) * 2;
+        events.push(mouse_event(
+            PreparedMouseEventKind::Down,
             point.clone(),
-            MouseButton::Left,
-            1,
-            &[],
-            0,
-        ),
-        pointer_event(
-            PointerEventKind::Up,
+            button,
+            pair,
+            modifiers,
+            down_index * CLICK_UP_DELAY_MS,
+        ));
+        events.push(mouse_event(
+            PreparedMouseEventKind::Up,
             point.clone(),
-            MouseButton::Left,
-            1,
-            &[],
-            CLICK_UP_DELAY_MS,
-        ),
-    ];
+            button,
+            pair,
+            modifiers,
+            (down_index + 1) * CLICK_UP_DELAY_MS,
+        ));
+    }
     PreparedSequence {
         target: point,
         events,
     }
 }
 
-fn pointer_event(
-    kind: PointerEventKind,
+fn build_drag(
+    start: NativePoint,
+    end: NativePoint,
+    button: MouseButton,
+    modifiers: &[Modifier],
+    duration_ms: u32,
+) -> PreparedSequence {
+    let midpoint = interpolate_native_point(&start, &end, 0.5);
+    let duration_ms = u64::from(duration_ms);
+    let events = vec![
+        mouse_event(
+            PreparedMouseEventKind::Down,
+            start.clone(),
+            button,
+            1,
+            modifiers,
+            0,
+        ),
+        mouse_event(
+            PreparedMouseEventKind::Dragged,
+            start,
+            button,
+            0,
+            modifiers,
+            0,
+        ),
+        mouse_event(
+            PreparedMouseEventKind::Dragged,
+            midpoint,
+            button,
+            0,
+            modifiers,
+            duration_ms / 2,
+        ),
+        mouse_event(
+            PreparedMouseEventKind::Dragged,
+            end.clone(),
+            button,
+            0,
+            modifiers,
+            duration_ms,
+        ),
+        mouse_event(
+            PreparedMouseEventKind::Up,
+            end.clone(),
+            button,
+            1,
+            modifiers,
+            duration_ms,
+        ),
+    ];
+    PreparedSequence {
+        target: end,
+        events,
+    }
+}
+
+fn build_delta_scroll(point: NativePoint, delta_x: f64, delta_y: f64) -> PreparedSequence {
+    PreparedSequence {
+        target: point.clone(),
+        events: vec![PreparedPointerEvent::PixelScroll(
+            PreparedPixelScrollEvent {
+                point,
+                delta_x,
+                delta_y,
+                scheduled_after: Duration::ZERO,
+            },
+        )],
+    }
+}
+
+fn mouse_event(
+    kind: PreparedMouseEventKind,
     point: NativePoint,
     button: MouseButton,
     click_state: u8,
     modifiers: &[Modifier],
     scheduled_after_ms: u64,
 ) -> PreparedPointerEvent {
-    PreparedPointerEvent {
+    PreparedPointerEvent::Mouse(PreparedMouseEvent {
         kind,
         point,
         button,
         click_state,
         modifiers: modifiers.to_vec(),
         scheduled_after: Duration::from_millis(scheduled_after_ms),
-    }
+    })
 }
 
 fn ensure_sequence_fits_deadline(
@@ -455,7 +1056,7 @@ fn ensure_sequence_fits_deadline(
     let duration = sequence
         .events
         .last()
-        .map_or(Duration::ZERO, |event| event.scheduled_after);
+        .map_or(Duration::ZERO, PreparedPointerEvent::scheduled_after);
     let completes_at = Instant::now().checked_add(duration).ok_or_else(|| {
         NativeError::new(
             ErrorCode::DispatchFailed,
@@ -546,6 +1147,111 @@ fn same_point(left: Point, right: Point) -> bool {
     (left.x - right.x).abs() <= POINT_EPSILON && (left.y - right.y).abs() <= POINT_EPSILON
 }
 
+fn ensure_same_drag_surface(start: &NativePoint, end: &NativePoint) -> Result<(), NativeError> {
+    if start.pid != end.pid
+        || start.cg_window_id != end.cg_window_id
+        || start.owner != end.owner
+        || start.surface_id != end.surface_id
+        || start.capture_revision != end.capture_revision
+        || start.geometry_revision != end.geometry_revision
+        || start.observation_epoch != end.observation_epoch
+    {
+        return Err(NativeError::stale(
+            ErrorCode::SurfaceStale,
+            "drag endpoints do not belong to the same captured native surface",
+        ));
+    }
+    Ok(())
+}
+
+fn interpolate_native_point(start: &NativePoint, end: &NativePoint, amount: f64) -> NativePoint {
+    let interpolate = |left: f64, right: f64| left + (right - left) * amount;
+    let mut point = start.clone();
+    point.screen = Point {
+        x: interpolate(start.screen.x, end.screen.x),
+        y: interpolate(start.screen.y, end.screen.y),
+    };
+    point.window_local = Point {
+        x: interpolate(start.window_local.x, end.window_local.x),
+        y: interpolate(start.window_local.y, end.window_local.y),
+    };
+    point.logical = Point {
+        x: interpolate(start.logical.x, end.logical.x),
+        y: interpolate(start.logical.y, end.logical.y),
+    };
+    point
+}
+
+fn validate_integral_scroll_delta(value: f64, field: &'static str) -> Result<(), NativeError> {
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || value <= f64::from(i32::MIN)
+        || value > f64::from(i32::MAX)
+    {
+        return Err(NativeError::new(
+            ErrorCode::UnsupportedInBackground,
+            ErrorPhase::Preflight,
+            false,
+            "the recovered macOS pixel-scroll route requires an integral 32-bit logical delta",
+        )
+        .with_detail("recipe_status", "native_integer_delta_required")
+        .with_detail("field", field)
+        .with_detail("value", value));
+    }
+    Ok(())
+}
+
+fn signed_page_scroll_delta(
+    bounds: cua_driver_core::api::contracts::Rect,
+    direction: ScrollDirection,
+    pages: f64,
+) -> Result<(f64, f64), NativeError> {
+    let relevant_dimension = match direction {
+        ScrollDirection::Up | ScrollDirection::Down => bounds.height,
+        ScrollDirection::Left | ScrollDirection::Right => bounds.width,
+    };
+    let magnitude = (pages * relevant_dimension.max(100.0)).round();
+    validate_integral_scroll_delta(magnitude, "page_magnitude")?;
+    Ok(match direction {
+        ScrollDirection::Up => (0.0, -magnitude),
+        ScrollDirection::Down => (0.0, magnitude),
+        ScrollDirection::Left => (-magnitude, 0.0),
+        ScrollDirection::Right => (magnitude, 0.0),
+    })
+}
+
+fn prepared_scroll_deltas(sequence: &PreparedSequence) -> Result<(f64, f64), NativeError> {
+    match sequence.events.as_slice() {
+        [PreparedPointerEvent::PixelScroll(scroll)] => Ok((scroll.delta_x, scroll.delta_y)),
+        _ => Err(NativeError::new(
+            ErrorCode::Internal,
+            ErrorPhase::Dispatch,
+            false,
+            "Chromium CDP scroll dispatch did not receive exactly one prepared pixel-scroll event",
+        )),
+    }
+}
+
+fn unsupported_chromium_scroll(
+    pid: i32,
+    window_title: Option<&str>,
+    reason: impl Into<String>,
+) -> NativeError {
+    let reason = reason.into();
+    let mut error = NativeError::unsupported(format!(
+        "Chromium exact-delta background scroll requires an exact PID-owned CDP page binding: {reason}"
+    ))
+    .with_detail("framework", "chromium")
+    .with_detail("pid", pid)
+    .with_detail("required_route", "chromium_cdp_input_synthesize_scroll_gesture")
+    .with_detail("binding", "pid_and_exact_window_title")
+    .with_detail("cause", reason);
+    if let Some(title) = window_title {
+        error = error.with_detail("window_title", title);
+    }
+    error
+}
+
 trait TargetedPointerSink: Send + Sync {
     fn post(
         &self,
@@ -589,19 +1295,34 @@ impl TargetedPointerSink for SystemTargetedPointerSink {
     ) -> Result<(), NativeError> {
         let mut post = || {
             boundary.begin()?;
-            synthesized_event::post_mouse_event(&MouseEventSpec {
-                pid: event.point.pid,
-                cg_window_id: event.point.cg_window_id,
-                screen: event.point.screen,
-                window_local: event.point.window_local,
-                button: event.button,
-                click_count: event.click_state,
-                modifiers: &event.modifiers,
-                kind: match event.kind {
-                    PointerEventKind::Down => NativeMouseEventKind::Down,
-                    PointerEventKind::Up => NativeMouseEventKind::Up,
-                },
-            })
+            match event {
+                PreparedPointerEvent::Mouse(event) => {
+                    synthesized_event::post_mouse_event(&MouseEventSpec {
+                        pid: event.point.pid,
+                        cg_window_id: event.point.cg_window_id,
+                        screen: event.point.screen,
+                        window_local: event.point.window_local,
+                        button: event.button,
+                        click_count: event.click_state,
+                        modifiers: &event.modifiers,
+                        kind: match event.kind {
+                            PreparedMouseEventKind::Down => NativeMouseEventKind::Down,
+                            PreparedMouseEventKind::Dragged => NativeMouseEventKind::Dragged,
+                            PreparedMouseEventKind::Up => NativeMouseEventKind::Up,
+                        },
+                    })
+                }
+                PreparedPointerEvent::PixelScroll(event) => {
+                    synthesized_event::post_pixel_scroll_event(&PixelScrollEventSpec {
+                        pid: event.point.pid,
+                        cg_window_id: event.point.cg_window_id,
+                        screen: event.point.screen,
+                        window_local: event.point.window_local,
+                        delta_x: event.delta_x,
+                        delta_y: event.delta_y,
+                    })
+                }
+            }
         };
         match epoch {
             Some(epoch) => epoch.commit_first_post(post),
@@ -623,7 +1344,7 @@ fn dispatch_sequence(
     let mut pressed: Option<(MouseButton, NativePoint)> = None;
 
     for event in &sequence.events {
-        if let Err(error) = wait_until(started + event.scheduled_after, deadline) {
+        if let Err(error) = wait_until(started + event.scheduled_after(), deadline) {
             let dispatch_started = boundary.started() || evidence.completed_events > 0;
             let cleanup = if dispatch_started {
                 cleanup_pressed(sink, pressed.take(), boundary)
@@ -640,10 +1361,13 @@ fn dispatch_sequence(
                 evidence.completed_events,
             ));
         }
-        if event.kind == PointerEventKind::Down {
-            // Posting APIs are void. A returned error may still follow partial
-            // native delivery, so cleanup must conservatively assume down.
-            pressed = Some((event.button, event.point.clone()));
+        if let PreparedPointerEvent::Mouse(mouse) = event {
+            if mouse.kind == PreparedMouseEventKind::Down {
+                // Posting APIs are void. A returned error may still follow
+                // partial native delivery, so cleanup conservatively assumes
+                // the button is pressed.
+                pressed = Some((mouse.button, mouse.point.clone()));
+            }
         }
         let first_post_epoch = (evidence.completed_events == 0).then_some(epoch);
         if let Err(error) = sink.post(event, boundary, first_post_epoch) {
@@ -665,11 +1389,16 @@ fn dispatch_sequence(
         }
         evidence.completed_events += 1;
         evidence.may_have_partially_landed = true;
-        match event.kind {
-            PointerEventKind::Down => {}
-            PointerEventKind::Up => {
-                pressed = None;
-                logical_cursor.update(event.point.logical);
+        match event {
+            PreparedPointerEvent::Mouse(mouse) => match mouse.kind {
+                PreparedMouseEventKind::Down | PreparedMouseEventKind::Dragged => {}
+                PreparedMouseEventKind::Up => {
+                    pressed = None;
+                    logical_cursor.update(mouse.point.logical);
+                }
+            },
+            PreparedPointerEvent::PixelScroll(scroll) => {
+                logical_cursor.update(scroll.point.logical);
             }
         }
     }
@@ -718,7 +1447,7 @@ fn cleanup_pressed(
     let Some((button, point)) = pressed else {
         return CleanupResult::not_needed();
     };
-    let cleanup = pointer_event(PointerEventKind::Up, point, button, 1, &[], 0);
+    let cleanup = mouse_event(PreparedMouseEventKind::Up, point, button, 1, &[], 0);
     CleanupResult {
         attempted: true,
         succeeded: sink.post(&cleanup, boundary, None).is_ok(),
@@ -755,7 +1484,7 @@ struct PointerDispatchEvidence {
 }
 
 impl PointerDispatchEvidence {
-    fn new(_action: &MacPreparedPointerAction) -> Self {
+    fn new() -> Self {
         Self {
             completed_events: 0,
             cleanup_attempted: false,
@@ -800,7 +1529,7 @@ mod tests {
 
     use cua_driver_core::api::{
         contracts::{
-            AppId, AppRef, CaptureRevision, GeometryRevision, SurfaceId, WindowGeneration,
+            AppId, AppRef, CaptureRevision, GeometryRevision, Rect, SurfaceId, WindowGeneration,
             WindowId, WindowRef,
         },
         observation::{NativeProcessHandle, NativeWindowHandle},
@@ -811,6 +1540,7 @@ mod tests {
     fn point(x: f64, y: f64) -> NativePoint {
         let app = AppRef {
             id: AppId::parse("app").unwrap(),
+            canonical_id: None,
             name: None,
             pid: Some(10),
             running: true,
@@ -848,20 +1578,91 @@ mod tests {
     }
 
     #[test]
-    fn canonical_click_is_one_down_up_pair_with_the_swift_interval() {
-        let sequence = build_click(point(10.0, 20.0));
-        assert_eq!(sequence.events.len(), 2);
-        assert_eq!(sequence.events[0].kind, PointerEventKind::Down);
-        assert_eq!(sequence.events[1].kind, PointerEventKind::Up);
-        assert_eq!(sequence.events[0].scheduled_after, Duration::ZERO);
+    fn signed_page_scroll_uses_relevant_element_dimension_and_one_hundred_point_floor() {
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 80.0,
+            height: 375.0,
+        };
         assert_eq!(
-            sequence.events[1].scheduled_after,
-            Duration::from_millis(100)
+            signed_page_scroll_delta(bounds, ScrollDirection::Down, 0.5).unwrap(),
+            (0.0, 188.0)
         );
-        assert!(sequence.events.iter().all(|event| {
-            event.button == MouseButton::Left
-                && event.click_state == 1
-                && event.modifiers.is_empty()
+        assert_eq!(
+            signed_page_scroll_delta(bounds, ScrollDirection::Up, 2.0).unwrap(),
+            (0.0, -750.0)
+        );
+        assert_eq!(
+            signed_page_scroll_delta(bounds, ScrollDirection::Right, 1.0).unwrap(),
+            (100.0, 0.0)
+        );
+        assert_eq!(
+            signed_page_scroll_delta(bounds, ScrollDirection::Left, 1.5).unwrap(),
+            (-150.0, 0.0)
+        );
+    }
+
+    fn as_mouse(event: &PreparedPointerEvent) -> &PreparedMouseEvent {
+        match event {
+            PreparedPointerEvent::Mouse(event) => event,
+            PreparedPointerEvent::PixelScroll(_) => panic!("expected a prepared mouse event"),
+        }
+    }
+
+    #[test]
+    fn click_sequence_preserves_button_modifiers_and_incrementing_click_state() {
+        let sequence = build_click(
+            point(10.0, 20.0),
+            MouseButton::Middle,
+            3,
+            &[Modifier::Shift],
+        );
+        assert_eq!(sequence.events.len(), 6);
+        let events: Vec<_> = sequence.events.iter().map(as_mouse).collect();
+        assert_eq!(events[0].kind, PreparedMouseEventKind::Down);
+        assert_eq!(events[1].kind, PreparedMouseEventKind::Up);
+        assert_eq!(events[0].scheduled_after, Duration::ZERO);
+        assert_eq!(events[1].scheduled_after, Duration::from_millis(100));
+        assert!(events.iter().all(|event| {
+            event.button == MouseButton::Middle && event.modifiers == [Modifier::Shift]
+        }));
+        assert_eq!(
+            events
+                .chunks_exact(2)
+                .map(|pair| (pair[0].click_state, pair[1].click_state))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (2, 2), (3, 3)]
+        );
+    }
+
+    #[test]
+    fn drag_sequence_contains_real_start_midpoint_and_destination_motion() {
+        let sequence = build_drag(
+            point(10.0, 20.0),
+            point(30.0, 60.0),
+            MouseButton::Right,
+            &[Modifier::Alt],
+            300,
+        );
+        let events: Vec<_> = sequence.events.iter().map(as_mouse).collect();
+        assert_eq!(events.len(), 5);
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec![
+                PreparedMouseEventKind::Down,
+                PreparedMouseEventKind::Dragged,
+                PreparedMouseEventKind::Dragged,
+                PreparedMouseEventKind::Dragged,
+                PreparedMouseEventKind::Up,
+            ]
+        );
+        assert_eq!(events[2].point.screen, Point { x: 20.0, y: 40.0 });
+        assert_eq!(events[2].scheduled_after, Duration::from_millis(150));
+        assert_eq!(events[3].scheduled_after, Duration::from_millis(300));
+        assert_eq!(events[4].scheduled_after, Duration::from_millis(300));
+        assert!(events.iter().all(|event| {
+            event.button == MouseButton::Right && event.modifiers == [Modifier::Alt]
         }));
     }
 
@@ -909,7 +1710,7 @@ mod tests {
 
     #[test]
     fn failed_up_posts_targeted_button_cleanup_without_cursor_warp() {
-        let sequence = build_click(point(0.0, 0.0));
+        let sequence = build_click(point(0.0, 0.0), MouseButton::Left, 1, &[]);
         let sink = FakeSink {
             events: Mutex::new(Vec::new()),
             fail_at: 1,
@@ -953,8 +1754,8 @@ mod tests {
         assert!(evidence.modifiers_cleared);
         assert!(!evidence.hardware_cursor_warp_attempted);
         let events = sink.events.lock().unwrap();
-        let cleanup = events.last().unwrap();
-        assert_eq!(cleanup.kind, PointerEventKind::Up);
+        let cleanup = as_mouse(events.last().unwrap());
+        assert_eq!(cleanup.kind, PreparedMouseEventKind::Up);
         assert!(cleanup.modifiers.is_empty());
         assert_eq!(cleanup.point.pid, sequence.target.pid);
         assert_eq!(cleanup.point.cg_window_id, sequence.target.cg_window_id);
@@ -962,7 +1763,7 @@ mod tests {
 
     #[test]
     fn advanced_observation_epoch_refuses_before_the_first_pointer_post() {
-        let sequence = build_click(point(5.0, 6.0));
+        let sequence = build_click(point(5.0, 6.0), MouseButton::Left, 1, &[]);
         let sink = FakeSink {
             events: Mutex::new(Vec::new()),
             fail_at: usize::MAX,
@@ -974,11 +1775,7 @@ mod tests {
             journal: journal.clone(),
         };
         journal.record(SettlementSignal::FocusChanged);
-        let mut evidence = PointerDispatchEvidence::new(&MacPreparedPointerAction {
-            final_cursor: sequence.target.logical,
-            route_name: "test",
-            sequence: sequence.clone(),
-        });
+        let mut evidence = PointerDispatchEvidence::new();
         let mut observations = cua_driver_core::api::observation::ObservationStore::default();
         let mut settlement = cua_driver_core::api::settlement::SettlementState::default();
         let mut boundary = NativeSideEffectBoundary::new(
@@ -1008,7 +1805,7 @@ mod tests {
 
     #[test]
     fn signal_from_first_post_does_not_abort_the_owned_pointer_sequence() {
-        let sequence = build_click(point(10.0, 20.0));
+        let sequence = build_click(point(10.0, 20.0), MouseButton::Left, 1, &[]);
         let journal = MacSignalJournal::default();
         let sink = FakeSink {
             events: Mutex::new(Vec::new()),
@@ -1019,11 +1816,7 @@ mod tests {
             expected: journal.epoch(),
             journal: journal.clone(),
         };
-        let mut evidence = PointerDispatchEvidence::new(&MacPreparedPointerAction {
-            final_cursor: sequence.target.logical,
-            route_name: "test",
-            sequence: sequence.clone(),
-        });
+        let mut evidence = PointerDispatchEvidence::new();
         let mut observations = cua_driver_core::api::observation::ObservationStore::default();
         let mut settlement = cua_driver_core::api::settlement::SettlementState::default();
         let mut boundary = NativeSideEffectBoundary::new(

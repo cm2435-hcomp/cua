@@ -84,7 +84,7 @@ pub struct ClickSpec {
 #[derive(Debug, Clone)]
 pub struct ElementScrollSpec {
     pub direction: ScrollDirection,
-    pub pages: u16,
+    pub pages: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +103,20 @@ pub struct NativeDispatch {
     pub menu: Option<NativeMenuEvidence>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Candidate<T> {
+    Prepared(T),
+    NotApplicable { reason: String },
+}
+
+impl<T> Candidate<T> {
+    pub fn not_applicable(reason: impl Into<String>) -> Self {
+        Self::NotApplicable {
+            reason: reason.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ResolvedAction {
     ElementClick {
@@ -116,7 +130,9 @@ pub enum ResolvedAction {
     },
     Drag(Box<ResolvedDrag>),
     ElementScroll {
-        element: ResolvedElement,
+        source: ElementRef,
+        element: Box<ResolvedElement>,
+        point: Option<ResolvedPoint>,
         spec: ElementScrollSpec,
     },
     DeltaScroll(ResolvedScroll),
@@ -241,7 +257,7 @@ pub trait SemanticActionProvider<TargetState>: Send + Sync {
     type PreparedAction: Send;
 
     /// Determines whether an element click has an exact, currently usable
-    /// semantic primitive. A false result lets core resolve the element's
+    /// semantic primitive. `NotApplicable` lets core resolve the element's
     /// current observation-owned point and query the captured-point route.
     /// Stale identity failures must be returned, never converted to fallback.
     async fn element_click_candidate(
@@ -249,7 +265,17 @@ pub trait SemanticActionProvider<TargetState>: Send + Sync {
         target: &mut TargetState,
         element: &ResolvedElement,
         spec: &ClickSpec,
-    ) -> Result<bool, NativeError>;
+    ) -> Result<Candidate<()>, NativeError>;
+
+    /// Determines whether the current retained element has an exact semantic
+    /// page-scroll primitive. Only `NotApplicable` permits core to advance to
+    /// the signed-compatible targeted page-scroll route.
+    async fn element_scroll_candidate(
+        &self,
+        target: &mut TargetState,
+        element: &ResolvedElement,
+        spec: &ElementScrollSpec,
+    ) -> Result<Candidate<()>, NativeError>;
 
     async fn prepare(
         &self,

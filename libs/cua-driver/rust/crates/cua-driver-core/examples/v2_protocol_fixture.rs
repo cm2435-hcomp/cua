@@ -235,6 +235,7 @@ fn fixture_window() -> anyhow::Result<WindowRef> {
         id: parse_id(WindowId::parse("window-1"))?,
         app: AppRef {
             id: parse_id(AppId::parse("app-1"))?,
+            canonical_id: None,
             name: Some("Fixture".to_owned()),
             pid: Some(42),
             running: true,

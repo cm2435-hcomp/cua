@@ -120,13 +120,11 @@ impl CapabilityRegistry {
         registry
     }
 
-    pub fn decision(&self, key: &CapabilityKey) -> RouteDecision {
-        self.cells
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| RouteDecision::Unsupported {
-                reason: "capability cell has not been proven for background execution".to_owned(),
-            })
+    /// Returns published release evidence for a cell. Runtime route
+    /// eligibility is decided from exact live provider preflight, never from
+    /// this registry.
+    pub fn evidence(&self, key: &CapabilityKey) -> Option<&RouteDecision> {
+        self.cells.get(key)
     }
 
     pub fn cells(&self) -> impl Iterator<Item = CapabilityCell> + '_ {

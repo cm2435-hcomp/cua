@@ -28,6 +28,7 @@ fn test_mutation_deadline() -> MutationDeadline {
 fn app_ref() -> AppRef {
     AppRef {
         id: id("app-1", AppId::parse),
+        canonical_id: None,
         name: Some("Fixture".to_owned()),
         pid: Some(42),
         running: true,
@@ -253,6 +254,26 @@ fn request_validation_rejects_unsafe_noops_and_non_finite_geometry() {
     }
     .validate()
     .is_err());
+    let scroll_element = ElementRef {
+        observation_id: id("observation-scroll", ObservationId::parse),
+        id: id("element-scroll", ElementId::parse),
+    };
+    assert!(ScrollRequest::Element {
+        element: scroll_element.clone(),
+        direction: ScrollDirection::Down,
+        pages: 0.25,
+    }
+    .validate()
+    .is_ok());
+    for pages in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+        assert!(ScrollRequest::Element {
+            element: scroll_element.clone(),
+            direction: ScrollDirection::Down,
+            pages,
+        }
+        .validate()
+        .is_err());
+    }
     assert!(PressKeyRequest {
         observation_id: id("observation-2", ObservationId::parse),
         stroke: KeyStroke {
@@ -608,6 +629,7 @@ impl ObservationProvider<FakeTargetState> for FakePlatform {
                 },
                 freshness: CaptureFreshness::Fresh,
                 owner: SurfaceOwner::Target(observed_window.stamp()),
+                menu_id: None,
             }],
             accessibility: Some(NativeAccessibilityUpdate {
                 normalized_tree: format!(
@@ -658,12 +680,28 @@ impl SemanticActionProvider<FakeTargetState> for FakePlatform {
         _target: &mut FakeTargetState,
         element: &ResolvedElement,
         spec: &ClickSpec,
-    ) -> Result<bool, NativeError> {
-        Ok(!self.semantic_candidate_unusable.load(Ordering::SeqCst)
+    ) -> Result<Candidate<()>, NativeError> {
+        let usable = !self.semantic_candidate_unusable.load(Ordering::SeqCst)
             && spec.button == MouseButton::Left
             && spec.click_count == 1
             && spec.modifiers.is_empty()
-            && element.actions.iter().any(|action| action == "AXPress"))
+            && element.actions.iter().any(|action| action == "AXPress");
+        Ok(if usable {
+            Candidate::Prepared(())
+        } else {
+            Candidate::not_applicable("fake semantic click unavailable")
+        })
+    }
+
+    async fn element_scroll_candidate(
+        &self,
+        _target: &mut FakeTargetState,
+        _element: &ResolvedElement,
+        _spec: &ElementScrollSpec,
+    ) -> Result<Candidate<()>, NativeError> {
+        Ok(Candidate::not_applicable(
+            "fake semantic page scroll unavailable",
+        ))
     }
 
     async fn prepare(
@@ -960,8 +998,8 @@ impl PlatformDriver for FakePlatform {
                     framework: Framework::AppKit,
                     window_state: WindowStateKind::Visible,
                 },
-                decision: RouteDecision::Supported {
-                    route: Route::TargetedPointer,
+                decision: RouteDecision::Unsupported {
+                    reason: "published evidence intentionally lags live fallback".to_owned(),
                 },
             },
             CapabilityCell {
@@ -1074,8 +1112,12 @@ async fn controller_preserves_target_state_and_consumes_at_dispatch_boundary() {
     assert_eq!(manifest.cells.len(), 4);
     assert!(manifest.cells.iter().any(|cell| matches!(
         cell.decision,
+        RouteDecision::Unsupported { .. }
+    )));
+    assert!(manifest.cells.iter().any(|cell| matches!(
+        cell.decision,
         RouteDecision::Supported {
-            route: Route::TargetedPointer
+            route: Route::Semantic
         }
     )));
 
@@ -1140,6 +1182,14 @@ async fn controller_preserves_target_state_and_consumes_at_dispatch_boundary() {
         .unwrap();
     assert_eq!(receipt.consumed_observation_id, second.observation_id);
     assert_eq!(receipt.route, Route::TargetedPointer);
+    assert_eq!(
+        receipt.native_evidence.fields["capability_evidence"],
+        "published_unsupported_nonblocking"
+    );
+    assert_eq!(
+        receipt.native_evidence.fields["route_detail"],
+        "direct_live_provider"
+    );
     assert_eq!(receipt.settlement.state, SettledState::Settled);
     assert_eq!(
         platform.preflight_action_ids.lock().unwrap().as_slice(),
@@ -1399,6 +1449,13 @@ async fn element_click_without_exact_semantic_candidate_uses_current_observation
         .unwrap();
 
     assert_eq!(receipt.route, Route::TargetedPointer);
+    assert_eq!(
+        receipt.native_evidence.fields["capability_evidence"],
+        "published_unsupported_nonblocking"
+    );
+    assert!(receipt.native_evidence.fields["route_detail"]
+        .as_str()
+        .is_some_and(|detail| detail.starts_with("semantic_not_applicable:")));
     assert!(platform
         .ordering
         .lock()
@@ -1417,6 +1474,52 @@ async fn element_click_without_exact_semantic_candidate_uses_current_observation
             .semantic_dispatches,
         0
     );
+}
+
+#[tokio::test]
+async fn element_scroll_without_semantic_page_action_uses_targeted_fractional_page_route() {
+    let platform = Arc::new(FakePlatform::default());
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
+    let client = id("element-scroll-fallback-client", ClientId::parse);
+    let observed = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    let element = observed.accessibility.as_ref().unwrap().elements[0]
+        .element_ref
+        .clone();
+
+    let receipt = controller
+        .scroll(
+            &client,
+            ScrollCommand {
+                window: window_ref(),
+                request: ScrollRequest::Element {
+                    element,
+                    direction: ScrollDirection::Down,
+                    pages: 0.5,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.route, Route::TargetedPointer);
+    assert_eq!(
+        receipt.native_evidence.fields["capability_evidence"],
+        "unmeasured"
+    );
+    assert!(receipt.native_evidence.fields["route_detail"]
+        .as_str()
+        .is_some_and(|detail| detail.starts_with("semantic_not_applicable:")));
 }
 
 #[tokio::test]
