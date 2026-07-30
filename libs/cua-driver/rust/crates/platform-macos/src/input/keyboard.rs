@@ -1,12 +1,11 @@
-//! Background keyboard synthesis via SLEventPostToPid (SkyLight SPI),
-//! with fallback to the public CGEvent::post_to_pid.
+//! macOS keyboard event construction.
 //!
-//! For keyboard events, `post_to_pid` attaches an `SLSEventAuthenticationMessage`
-//! so Chromium-based apps accept synthetic keystrokes as trusted live input
-//! (required on macOS 14+ for VS Code, Chrome, Electron apps).
+//! V2 builds the signed-helper-compatible sequence here and posts it directly
+//! with `CGEventPostToPid`. Legacy helpers below retain their existing
+//! SkyLight-first transport until a separate cutover.
 
 use core_graphics::{
-    event::{CGEvent, CGEventFlags},
+    event::{CGEvent, CGEventFlags, CGEventType},
     event_source::{CGEventSource, CGEventSourceStateID},
 };
 use cua_driver_core::api::{
@@ -33,10 +32,10 @@ pub(crate) struct NormalizedChord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TargetedKeyEventKind {
-    ModifierDown(Modifier),
+    FlagsChangedRequested,
     KeyDown,
     KeyUp,
-    ModifierUp(Modifier),
+    FlagsChangedRestore,
     UnicodeDown,
     UnicodeUp,
 }
@@ -50,13 +49,39 @@ pub(crate) struct TargetedKeyEvent {
     pub text: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TargetedPostPrimitive {
-    SkyLightAuthenticated,
-    CoreGraphicsPid,
+pub(crate) struct PreparedTargetedKeyEvent {
+    kind: TargetedKeyEventKind,
+    native: CGEvent,
 }
 
-pub(crate) struct PreparedTargetedKeyEvent(CGEvent);
+pub(crate) struct PreparedKeySequence {
+    events: Vec<PreparedTargetedKeyEvent>,
+}
+
+impl PreparedKeySequence {
+    pub(crate) fn events(&self) -> &[PreparedTargetedKeyEvent] {
+        &self.events
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.events.len()
+    }
+}
+
+impl PreparedTargetedKeyEvent {
+    pub(crate) fn kind(&self) -> TargetedKeyEventKind {
+        self.kind
+    }
+
+    pub(crate) fn set_fresh_timestamp(&self) {
+        unsafe {
+            crate::input::synthesized_event::set_event_timestamp(
+                self.native.as_ptr() as *mut std::ffi::c_void,
+                crate::input::synthesized_event::fresh_event_timestamp(),
+            );
+        }
+    }
+}
 
 /// Normalize the complete chord before any interaction lease is acquired.
 /// The mapping is the physical US ANSI key vocabulary used by the existing
@@ -99,44 +124,46 @@ pub(crate) fn normalize_chord(stroke: &KeyStroke) -> Result<NormalizedChord, Nat
     })
 }
 
-pub(crate) fn chord_events(chord: &NormalizedChord) -> Vec<TargetedKeyEvent> {
-    let mut events = Vec::with_capacity(chord.modifiers.len() * 2 + 2);
-    let mut flags = CGEventFlags::CGEventFlagNull;
-    for modifier in &chord.modifiers {
-        flags |= modifier.flag;
-        events.push(TargetedKeyEvent {
-            kind: TargetedKeyEventKind::ModifierDown(modifier.modifier),
-            key_code: modifier.key_code,
-            key_down: true,
-            flags,
-            text: None,
+pub(crate) fn chord_events(
+    chord: &NormalizedChord,
+    restore_flags: CGEventFlags,
+) -> [TargetedKeyEvent; 4] {
+    let requested_flags = chord
+        .modifiers
+        .iter()
+        .fold(CGEventFlags::CGEventFlagNull, |flags, modifier| {
+            flags | modifier.flag
         });
-    }
-    events.push(TargetedKeyEvent {
-        kind: TargetedKeyEventKind::KeyDown,
-        key_code: chord.key_code,
-        key_down: true,
-        flags,
-        text: None,
-    });
-    events.push(TargetedKeyEvent {
-        kind: TargetedKeyEventKind::KeyUp,
-        key_code: chord.key_code,
-        key_down: false,
-        flags,
-        text: None,
-    });
-    for modifier in chord.modifiers.iter().rev() {
-        flags.remove(modifier.flag);
-        events.push(TargetedKeyEvent {
-            kind: TargetedKeyEventKind::ModifierUp(modifier.modifier),
-            key_code: modifier.key_code,
+    [
+        TargetedKeyEvent {
+            kind: TargetedKeyEventKind::FlagsChangedRequested,
+            key_code: 0,
             key_down: false,
-            flags,
+            flags: requested_flags,
             text: None,
-        });
-    }
-    events
+        },
+        TargetedKeyEvent {
+            kind: TargetedKeyEventKind::KeyDown,
+            key_code: chord.key_code,
+            key_down: true,
+            flags: requested_flags,
+            text: None,
+        },
+        TargetedKeyEvent {
+            kind: TargetedKeyEventKind::KeyUp,
+            key_code: chord.key_code,
+            key_down: false,
+            flags: requested_flags,
+            text: None,
+        },
+        TargetedKeyEvent {
+            kind: TargetedKeyEventKind::FlagsChangedRestore,
+            key_code: 0,
+            key_down: false,
+            flags: restore_flags,
+            text: None,
+        },
+    ]
 }
 
 pub(crate) fn unicode_events(text: &str) -> Vec<TargetedKeyEvent> {
@@ -177,35 +204,78 @@ pub(crate) fn prepare_targeted_event(
             "CGEventSource creation failed for targeted keyboard dispatch",
         )
     })?;
-    let native =
-        CGEvent::new_keyboard_event(source, event.key_code, event.key_down).map_err(|_| {
-            NativeError::new(
-                ErrorCode::DispatchFailed,
-                ErrorPhase::Dispatch,
-                false,
-                "CGEvent keyboard event creation failed",
-            )
-        })?;
+    let native = match event.kind {
+        TargetedKeyEventKind::FlagsChangedRequested | TargetedKeyEventKind::FlagsChangedRestore => {
+            let native = CGEvent::new(source).map_err(|_| {
+                NativeError::new(
+                    ErrorCode::DispatchFailed,
+                    ErrorPhase::Dispatch,
+                    false,
+                    "CGEvent flags-changed event creation failed",
+                )
+            })?;
+            native.set_type(CGEventType::FlagsChanged);
+            native
+        }
+        TargetedKeyEventKind::KeyDown
+        | TargetedKeyEventKind::KeyUp
+        | TargetedKeyEventKind::UnicodeDown
+        | TargetedKeyEventKind::UnicodeUp => {
+            CGEvent::new_keyboard_event(source, event.key_code, event.key_down).map_err(|_| {
+                NativeError::new(
+                    ErrorCode::DispatchFailed,
+                    ErrorPhase::Dispatch,
+                    false,
+                    "CGEvent keyboard event creation failed",
+                )
+            })?
+        }
+    };
     native.set_flags(event.flags);
     if let Some(text) = &event.text {
         native.set_string(text);
     }
-    Ok(PreparedTargetedKeyEvent(native))
+    Ok(PreparedTargetedKeyEvent {
+        kind: event.kind,
+        native,
+    })
+}
+
+pub(crate) fn prepare_chord_sequence(
+    chord: &NormalizedChord,
+) -> Result<PreparedKeySequence, NativeError> {
+    let restore_flags = combined_session_flags();
+    prepare_sequence(chord_events(chord, restore_flags))
+}
+
+pub(crate) fn prepare_unicode_sequence(text: &str) -> Result<PreparedKeySequence, NativeError> {
+    prepare_sequence(unicode_events(text))
+}
+
+fn prepare_sequence(
+    events: impl IntoIterator<Item = TargetedKeyEvent>,
+) -> Result<PreparedKeySequence, NativeError> {
+    let events = events
+        .into_iter()
+        .map(|event| prepare_targeted_event(&event))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PreparedKeySequence { events })
 }
 
 /// Post an already-constructed event to one pid. No fallible operation occurs
 /// before the posting primitive is attempted.
-pub(crate) fn post_prepared_targeted_event(
-    pid: i32,
-    event: &PreparedTargetedKeyEvent,
-) -> TargetedPostPrimitive {
-    let event_ptr = event.0.as_ptr() as *mut std::ffi::c_void;
-    if crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, true) {
-        TargetedPostPrimitive::SkyLightAuthenticated
-    } else {
-        event.0.post_to_pid(pid as libc::pid_t);
-        TargetedPostPrimitive::CoreGraphicsPid
-    }
+pub(crate) fn post_prepared_targeted_event(pid: i32, event: &PreparedTargetedKeyEvent) {
+    event.native.post_to_pid(pid as libc::pid_t);
+}
+
+fn combined_session_flags() -> CGEventFlags {
+    let bits = unsafe { CGEventSourceFlagsState(CGEventSourceStateID::CombinedSessionState) };
+    CGEventFlags::from_bits_truncate(bits)
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceFlagsState(state_id: CGEventSourceStateID) -> u64;
 }
 
 fn normalized_modifier(modifier: Modifier) -> NormalizedModifier {
@@ -660,22 +730,25 @@ mod v2_tests {
             ]
         );
 
-        let events = chord_events(&chord);
+        let restore_flags = CGEventFlags::CGEventFlagAlphaShift;
+        let events = chord_events(&chord, restore_flags);
         assert_eq!(
             events.iter().map(|event| event.kind).collect::<Vec<_>>(),
             vec![
-                TargetedKeyEventKind::ModifierDown(Modifier::Shift),
-                TargetedKeyEventKind::ModifierDown(Modifier::Control),
-                TargetedKeyEventKind::ModifierDown(Modifier::Alt),
-                TargetedKeyEventKind::ModifierDown(Modifier::Meta),
+                TargetedKeyEventKind::FlagsChangedRequested,
                 TargetedKeyEventKind::KeyDown,
                 TargetedKeyEventKind::KeyUp,
-                TargetedKeyEventKind::ModifierUp(Modifier::Meta),
-                TargetedKeyEventKind::ModifierUp(Modifier::Alt),
-                TargetedKeyEventKind::ModifierUp(Modifier::Control),
-                TargetedKeyEventKind::ModifierUp(Modifier::Shift),
+                TargetedKeyEventKind::FlagsChangedRestore,
             ]
         );
+        let requested_flags = CGEventFlags::CGEventFlagShift
+            | CGEventFlags::CGEventFlagControl
+            | CGEventFlags::CGEventFlagAlternate
+            | CGEventFlags::CGEventFlagCommand;
+        assert_eq!(events[0].flags, requested_flags);
+        assert_eq!(events[1].flags, requested_flags);
+        assert_eq!(events[2].flags, requested_flags);
+        assert_eq!(events[3].flags, restore_flags);
 
         assert_eq!(
             normalize_chord(&KeyStroke {

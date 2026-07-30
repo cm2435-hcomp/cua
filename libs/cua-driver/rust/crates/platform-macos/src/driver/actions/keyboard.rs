@@ -1,19 +1,14 @@
 //! Exact focused-control preparation and background-only macOS keyboard routes.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
-use core_graphics::event::CGEventFlags;
 use cua_driver_core::api::{
     capabilities::{
         ActionKind, AddressingMode, CapabilityCell, CapabilityKey, Framework, PlatformName,
         RouteDecision, WindowStateKind,
     },
-    contracts::{Modifier, Route, VerificationLevel},
+    contracts::{Route, VerificationLevel},
     errors::{ErrorCode, ErrorPhase, NativeError},
     interaction::{InteractionScope, LeaseDecision, NativeEvidence, NativeSideEffectBoundary},
     observation::ResolvedFocus,
@@ -24,13 +19,13 @@ use serde_json::{json, Value};
 
 use crate::{
     ax::bindings::{
-        self, copy_cf_range_attr, copy_string_attr_exact, focused_element_of_pid,
-        is_attribute_settable, kAXErrorSuccess, AxCfRange,
+        self, copy_bool_attr_exact, copy_cf_range_attr, copy_element_attr, copy_string_attr_exact,
+        focused_element_of_pid, is_attribute_settable, kAXErrorSuccess, AxCfRange,
     },
     input::keyboard::{
-        chord_events, normalize_chord, post_prepared_targeted_event, prepare_targeted_event,
-        unicode_events, NormalizedChord, NormalizedModifier, TargetedKeyEvent,
-        TargetedKeyEventKind, TargetedPostPrimitive,
+        normalize_chord, post_prepared_targeted_event, prepare_chord_sequence,
+        prepare_unicode_sequence, NormalizedChord, PreparedKeySequence, PreparedTargetedKeyEvent,
+        TargetedKeyEventKind,
     },
 };
 
@@ -40,30 +35,16 @@ use super::super::{
     windows::{MacWindowFacts, MacWindowRegistry},
 };
 
-const EVENT_GAP: Duration = Duration::from_millis(8);
-
 trait KeyboardEventPoster: Send + Sync {
-    fn post(
-        &self,
-        pid: i32,
-        event: &TargetedKeyEvent,
-        boundary: &mut NativeSideEffectBoundary<'_>,
-    ) -> Result<TargetedPostPrimitive, NativeError>;
+    fn post_to_pid(&self, pid: i32, event: &PreparedTargetedKeyEvent);
 }
 
 #[derive(Default)]
 struct SystemKeyboardEventPoster;
 
 impl KeyboardEventPoster for SystemKeyboardEventPoster {
-    fn post(
-        &self,
-        pid: i32,
-        event: &TargetedKeyEvent,
-        boundary: &mut NativeSideEffectBoundary<'_>,
-    ) -> Result<TargetedPostPrimitive, NativeError> {
-        let event = prepare_targeted_event(event)?;
-        boundary.begin()?;
-        Ok(post_prepared_targeted_event(pid, &event))
+    fn post_to_pid(&self, pid: i32, event: &PreparedTargetedKeyEvent) {
+        post_prepared_targeted_event(pid, event);
     }
 }
 
@@ -71,32 +52,31 @@ impl KeyboardEventPoster for SystemKeyboardEventPoster {
 pub struct MacKeyboardActions {
     windows: MacWindowRegistry,
     poster: Arc<dyn KeyboardEventPoster>,
-    event_gap: Duration,
 }
 
 pub struct MacPreparedKeyboardAction(PreparedKind);
 
 enum PreparedKind {
     Chord {
-        pid: i32,
+        target: MacKeyboardEventTarget,
         chord: NormalizedChord,
-        focus: PreparedFocus,
     },
     SemanticInsertion {
-        focus: PreparedFocus,
+        target: MacKeyboardEventTarget,
         text: String,
         expected_value: String,
         expected_selection: AxCfRange,
     },
     UnicodeInsertion {
-        pid: i32,
-        focus: PreparedFocus,
+        target: MacKeyboardEventTarget,
         text: String,
         expected: Option<ExpectedInsertion>,
     },
 }
 
-struct PreparedFocus {
+struct MacKeyboardEventTarget {
+    application_pid: i32,
+    dispatch_pid: i32,
     element: RetainedAxElement,
     snapshot: RegisteredElementSnapshot,
     ax_revision: String,
@@ -115,7 +95,6 @@ impl MacKeyboardActions {
         Self {
             windows,
             poster: Arc::new(SystemKeyboardEventPoster),
-            event_gap: EVENT_GAP,
         }
     }
 
@@ -132,18 +111,18 @@ impl MacKeyboardActions {
                 // Repeated here after the no-lease InteractionProvider check so
                 // the retained plan never depends on mutable side state.
                 let chord = normalize_chord(stroke)?;
-                let (focus, _) = prepare_focus(target, focus, &facts, FocusProof::IdentityOnly)?;
+                let (keyboard_target, _) =
+                    prepare_keyboard_target(target, focus, &facts, FocusProof::IdentityOnly)?;
                 PreparedKind::Chord {
-                    pid: facts.pid,
+                    target: keyboard_target,
                     chord,
-                    focus,
                 }
             }
             ResolvedAction::TypeText { focus, text } => match scope.route {
                 Route::Semantic => {
                     require_scope(target, scope, Route::Semantic, false)?;
-                    let (focus, snapshot) =
-                        prepare_focus(target, focus, &facts, FocusProof::TextState)?;
+                    let (keyboard_target, snapshot) =
+                        prepare_keyboard_target(target, focus, &facts, FocusProof::TextState)?;
                     if snapshot.selected_text_settable != Some(true) {
                         return Err(NativeError::unsupported(
                             "focused macOS control has no exact writable AXSelectedText insertion route",
@@ -161,7 +140,7 @@ impl MacKeyboardActions {
                     })?;
                     let expected = apply_insertion(before, selection, text)?;
                     PreparedKind::SemanticInsertion {
-                        focus,
+                        target: keyboard_target,
                         text: text.clone(),
                         expected_value: expected.value,
                         expected_selection: expected.selection,
@@ -169,8 +148,8 @@ impl MacKeyboardActions {
                 }
                 Route::TargetedKeyboard => {
                     require_scope(target, scope, Route::TargetedKeyboard, true)?;
-                    let (focus, snapshot) =
-                        prepare_focus(target, focus, &facts, FocusProof::TextState)?;
+                    let (keyboard_target, snapshot) =
+                        prepare_keyboard_target(target, focus, &facts, FocusProof::TextState)?;
                     let expected = match (
                         snapshot.string_value.as_deref(),
                         snapshot.selected_text_range,
@@ -181,8 +160,7 @@ impl MacKeyboardActions {
                         _ => None,
                     };
                     PreparedKind::UnicodeInsertion {
-                        pid: facts.pid,
-                        focus,
+                        target: keyboard_target,
                         text: text.clone(),
                         expected,
                     }
@@ -216,28 +194,37 @@ impl MacKeyboardActions {
         action: MacPreparedKeyboardAction,
     ) -> Result<NativeDispatch, NativeError> {
         match action.0 {
-            PreparedKind::Chord { pid, chord, focus } => {
+            PreparedKind::Chord {
+                target: keyboard_target,
+                chord,
+            } => {
                 self.final_focus_validation(
                     target,
                     scope.owner.clone(),
                     scope.window.stamp(),
-                    pid,
-                    &focus,
+                    &keyboard_target,
                     FocusProof::IdentityOnly,
                 )
                 .await?;
-                let evidence =
-                    dispatch_chord(self.poster.as_ref(), self.event_gap, pid, &chord, boundary)
-                        .map_err(|error| poison_unproved_cleanup(target, scope, error))?;
+                let focus_write = focus_field_if_needed(&keyboard_target, boundary)?;
+                let sequence = prepare_chord_sequence(&chord)
+                    .map_err(|error| sequence_construction_error(error, boundary.started()))?;
+                let evidence = dispatch_sequence(
+                    self.poster.as_ref(),
+                    keyboard_target.application_pid,
+                    keyboard_target.dispatch_pid,
+                    &sequence,
+                    boundary,
+                    focus_write,
+                )?;
                 Ok(dispatch_unverified(
                     "macos_targeted_key_chord",
-                    focus,
+                    keyboard_target,
                     evidence,
                 ))
             }
             PreparedKind::UnicodeInsertion {
-                pid,
-                focus,
+                target: keyboard_target,
                 text,
                 expected,
             } => {
@@ -245,23 +232,38 @@ impl MacKeyboardActions {
                     target,
                     scope.owner.clone(),
                     scope.window.stamp(),
-                    pid,
-                    &focus,
+                    &keyboard_target,
                     FocusProof::TextState,
                 )
                 .await?;
-                let mut evidence = dispatch_unicode(
+                let focus_write = focus_field_if_needed(&keyboard_target, boundary)?;
+                if Instant::now() >= scope.deadline.work {
+                    return Err(NativeError::new(
+                        ErrorCode::DispatchFailed,
+                        if boundary.started() {
+                            ErrorPhase::Dispatch
+                        } else {
+                            ErrorPhase::Preflight
+                        },
+                        true,
+                        "targeted Unicode sequence reached its controller deadline before construction",
+                    )
+                    .with_detail("possibly_partial_delivery", boundary.started())
+                    .with_detail("field_focus_write_attempted", focus_write));
+                }
+                let sequence = prepare_unicode_sequence(&text)
+                    .map_err(|error| sequence_construction_error(error, boundary.started()))?;
+                let mut evidence = dispatch_sequence(
                     self.poster.as_ref(),
-                    self.event_gap,
-                    pid,
-                    &text,
-                    scope.deadline.work,
+                    keyboard_target.application_pid,
+                    keyboard_target.dispatch_pid,
+                    &sequence,
                     boundary,
-                )
-                .map_err(|error| poison_unproved_cleanup(target, scope, error))?;
-                let readback = expected
-                    .as_ref()
-                    .map(|expected| exact_insertion_readback(focus.element.as_ptr(), expected));
+                    focus_write,
+                )?;
+                let readback = expected.as_ref().map(|expected| {
+                    exact_insertion_readback(keyboard_target.element.as_ptr(), expected)
+                });
                 let readback_available = readback.is_some();
                 let readback_matched = matches!(&readback, Some(Ok(true)));
                 if let Some(Err(error)) = &readback {
@@ -285,29 +287,31 @@ impl MacKeyboardActions {
                 // the contract honest and let notification settlement finish.
                 Ok(dispatch_unverified(
                     "macos_targeted_unicode_events",
-                    focus,
+                    keyboard_target,
                     evidence,
                 ))
             }
             PreparedKind::SemanticInsertion {
-                focus,
+                target: keyboard_target,
                 text,
                 expected_value,
                 expected_selection,
             } => {
-                let pid = self.windows.facts_for_stamp(&target.window).await?.pid;
                 self.final_focus_validation(
                     target,
                     scope.owner.clone(),
                     scope.window.stamp(),
-                    pid,
-                    &focus,
+                    &keyboard_target,
                     FocusProof::TextState,
                 )
                 .await?;
                 boundary.begin()?;
                 let result = unsafe {
-                    bindings::set_string_attr(focus.element.as_ptr(), "AXSelectedText", &text)
+                    bindings::set_string_attr(
+                        keyboard_target.element.as_ptr(),
+                        "AXSelectedText",
+                        &text,
+                    )
                 };
                 if result != kAXErrorSuccess {
                     return Err(NativeError::new(
@@ -323,7 +327,8 @@ impl MacKeyboardActions {
                     value: expected_value,
                     selection: expected_selection,
                 };
-                let readback = exact_insertion_readback(focus.element.as_ptr(), &expected)?;
+                let readback =
+                    exact_insertion_readback(keyboard_target.element.as_ptr(), &expected)?;
                 target
                     .signals
                     .record(SettlementSignal::VerificationReadbackComplete);
@@ -336,7 +341,7 @@ impl MacKeyboardActions {
                     )
                     .with_detail("possibly_partial_delivery", true));
                 }
-                let mut evidence = focus_evidence(&focus);
+                let mut evidence = focus_evidence(&keyboard_target);
                 evidence.insert(
                     "primitive".to_owned(),
                     Value::String("macos_ax_selected_text_insertion".to_owned()),
@@ -365,8 +370,7 @@ impl MacKeyboardActions {
         target: &mut MacTargetState,
         scope_owner: cua_driver_core::api::observation::ResolvedWindowStamp,
         scope_window: cua_driver_core::api::observation::ResolvedWindowStamp,
-        pid: i32,
-        focus: &PreparedFocus,
+        keyboard_target: &MacKeyboardEventTarget,
         proof: FocusProof,
     ) -> Result<(), NativeError> {
         if target.invalidated() || scope_owner != target.window || scope_window != target.window {
@@ -376,39 +380,51 @@ impl MacKeyboardActions {
             ));
         }
         let facts = self.windows.facts_for_stamp(&target.window).await?;
-        if facts.pid != pid || facts.cg_window_id != focus.snapshot.owner_window_id {
+        if facts.pid != keyboard_target.application_pid
+            || facts.cg_window_id != keyboard_target.snapshot.owner_window_id
+        {
             return Err(focus_drift(
                 "keyboard pid/window identity changed before native dispatch",
             ));
         }
-        if target.signals.epoch() != focus.signal_epoch {
+        if target.signals.epoch() != keyboard_target.signal_epoch {
             return Err(NativeError::stale(
                 ErrorCode::ObservationRaced,
                 "focus/content notification raced keyboard action preparation",
             ));
         }
-        let live = unsafe { focused_element_of_pid(pid) }
+        let live = unsafe { focused_element_of_pid(keyboard_target.application_pid) }
             .map(|element| unsafe { RetainedAxElement::from_owned(element) })
             .ok_or_else(|| focus_drift("target process lost its exact focused AX element"))?;
         validate_focus_identity_proof(
-            focus.snapshot.owner == target.window,
-            focus.snapshot.owner_window_id,
-            live.same_identity(&focus.element),
+            keyboard_target.snapshot.owner == target.window,
+            keyboard_target.snapshot.owner_window_id,
+            live.same_identity(&keyboard_target.snapshot.element),
             unsafe { bindings::ax_get_window_id(live.as_ptr()) },
             facts.cg_window_id,
         )?;
         let live_role = unsafe { copy_string_attr_exact(live.as_ptr(), "AXRole") }
             .map_err(|error| ax_focus_error("AXRole", error))?;
-        if !focus.snapshot.role_proven || live_role.as_deref() != Some(focus.snapshot.role.as_str())
+        if !keyboard_target.snapshot.role_proven
+            || live_role.as_deref() != Some(keyboard_target.snapshot.role.as_str())
         {
             return Err(focus_drift(
                 "focused-control role changed before native dispatch",
             ));
         }
-        if matches!(proof, FocusProof::TextState) {
-            revalidate_text_state(&live, &focus.snapshot)?;
+        let (live_effective_element, live_dispatch_pid) =
+            effective_keyboard_element(keyboard_target.application_pid, &live)?;
+        if live_dispatch_pid != keyboard_target.dispatch_pid
+            || !live_effective_element.same_identity(&keyboard_target.element)
+        {
+            return Err(focus_drift(
+                "effective keyboard event target changed before native dispatch",
+            ));
         }
-        if target.signals.epoch() != focus.signal_epoch {
+        if matches!(proof, FocusProof::TextState) {
+            revalidate_text_state(&live, &keyboard_target.snapshot)?;
+        }
+        if target.signals.epoch() != keyboard_target.signal_epoch {
             return Err(NativeError::stale(
                 ErrorCode::ObservationRaced,
                 "focus/content notification raced final keyboard validation",
@@ -448,12 +464,12 @@ enum FocusProof {
     TextState,
 }
 
-fn prepare_focus(
+fn prepare_keyboard_target(
     target: &MacTargetState,
     focus: &ResolvedFocus,
     facts: &MacWindowFacts,
     proof: FocusProof,
-) -> Result<(PreparedFocus, RegisteredElementSnapshot), NativeError> {
+) -> Result<(MacKeyboardEventTarget, RegisteredElementSnapshot), NativeError> {
     let epoch = target.signals.epoch();
     let element_id = focus_element_id(focus_contract(target, focus)?)?;
     let snapshot = target
@@ -486,9 +502,12 @@ fn prepare_focus(
             "target focus/content notification raced keyboard preparation",
         ));
     }
+    let (effective_element, dispatch_pid) = effective_keyboard_element(facts.pid, &live)?;
     Ok((
-        PreparedFocus {
-            element: live,
+        MacKeyboardEventTarget {
+            application_pid: facts.pid,
+            dispatch_pid,
+            element: effective_element,
             snapshot: snapshot.clone(),
             ax_revision: focus
                 .ax_revision
@@ -501,6 +520,51 @@ fn prepare_focus(
         },
         snapshot,
     ))
+}
+
+fn effective_keyboard_element(
+    application_pid: i32,
+    focused: &RetainedAxElement,
+) -> Result<(RetainedAxElement, i32), NativeError> {
+    let focused_pid = unsafe { bindings::element_pid(focused.as_ptr()) }
+        .map_err(|error| effective_pid_error(application_pid, error))?;
+    if focused_pid != application_pid {
+        return Ok((focused.clone(), focused_pid));
+    }
+
+    let mut current = focused.clone();
+    for _ in 0..64 {
+        let Some(parent) = (unsafe { copy_element_attr(current.as_ptr(), "AXParent") })
+            .map_err(|error| effective_pid_error(application_pid, error))?
+            .map(|parent| unsafe { RetainedAxElement::from_owned(parent) })
+        else {
+            return Ok((focused.clone(), focused_pid));
+        };
+        if parent.same_identity(&current) {
+            return Err(NativeError::unsupported(
+                "effective keyboard target ancestry contains a cycle",
+            )
+            .with_detail("application_pid", application_pid));
+        }
+        let parent_pid = unsafe { bindings::element_pid(parent.as_ptr()) }
+            .map_err(|error| effective_pid_error(application_pid, error))?;
+        if parent_pid != application_pid {
+            return Ok((parent, parent_pid));
+        }
+        current = parent;
+    }
+    Err(NativeError::unsupported(
+        "effective keyboard target ancestry exceeded the bounded AX parent walk",
+    )
+    .with_detail("application_pid", application_pid))
+}
+
+fn effective_pid_error(application_pid: i32, error: bindings::AXError) -> NativeError {
+    NativeError::unsupported(
+        "effective keyboard dispatch pid could not be proved from the focused AX target",
+    )
+    .with_detail("application_pid", application_pid)
+    .with_detail("ax_error", error)
 }
 
 fn validate_focus_identity_proof(
@@ -610,343 +674,157 @@ fn require_scope(
     Ok(())
 }
 
-/// Deliberately contains no await point. Once the first modifier-down is
-/// posted, controller cancellation cannot drop this future before every
-/// modifier-up attempt has completed.
-fn dispatch_chord(
+/// Deliberately contains no await point. `CGEventPostToPid` is void, so after
+/// the boundary starts this loop cannot report or recover a partial post.
+fn dispatch_sequence(
     poster: &dyn KeyboardEventPoster,
-    event_gap: Duration,
-    pid: i32,
-    chord: &NormalizedChord,
+    application_pid: i32,
+    dispatch_pid: i32,
+    sequence: &PreparedKeySequence,
     boundary: &mut NativeSideEffectBoundary<'_>,
+    field_focus_write: bool,
 ) -> Result<BTreeMap<String, Value>, NativeError> {
-    let events = chord_events(chord);
-    let first_release = chord.modifiers.len() + 2;
-    let mut attempted = 0_usize;
-    let mut delivered = 0_usize;
-    let mut possibly_down = Vec::new();
-    let mut main_key_possibly_down = false;
-    let mut primitives = BTreeSet::new();
+    boundary.begin()?;
+    let kinds = post_sequence(poster, dispatch_pid, sequence);
+    Ok(sequence_evidence(
+        application_pid,
+        dispatch_pid,
+        sequence.len(),
+        kinds,
+        field_focus_write,
+    ))
+}
 
-    for event in &events[..first_release] {
-        attempted += 1;
-        if let TargetedKeyEventKind::ModifierDown(modifier) = event.kind {
-            possibly_down.push(normalized_modifier_for(chord, modifier));
-        }
-        if event.kind == TargetedKeyEventKind::KeyDown {
-            // A void post can return an error after native delivery, so key
-            // cleanup ownership starts before the down attempt.
-            main_key_possibly_down = true;
-        }
-        match poster.post(pid, event, boundary) {
-            Ok(primitive) => {
-                delivered += 1;
-                primitives.insert(primitive_name(primitive));
-                if event.kind == TargetedKeyEventKind::KeyUp {
-                    main_key_possibly_down = false;
-                }
-                wait_gap_blocking(event_gap);
-            }
-            Err(error) => {
-                let main_cleanup = release_main_key(
-                    poster,
-                    event_gap,
-                    pid,
-                    chord.key_code,
-                    event.flags,
-                    main_key_possibly_down,
-                    boundary,
-                );
-                let cleanup = release_modifiers(
-                    poster,
-                    event_gap,
-                    pid,
-                    &possibly_down,
-                    event.flags,
-                    boundary,
-                );
-                attempted += usize::from(main_cleanup.attempted) + cleanup.attempted.len();
-                delivered += usize::from(main_cleanup.succeeded) + cleanup.succeeded.len();
-                return Err(chord_failure(
-                    error,
-                    attempted,
-                    delivered,
-                    main_cleanup,
-                    cleanup,
-                ));
-            }
-        }
+fn post_sequence(
+    poster: &dyn KeyboardEventPoster,
+    dispatch_pid: i32,
+    sequence: &PreparedKeySequence,
+) -> Vec<&'static str> {
+    let mut kinds = Vec::with_capacity(sequence.len());
+    for event in sequence.events() {
+        event.set_fresh_timestamp();
+        poster.post_to_pid(dispatch_pid, event);
+        kinds.push(event_kind_name(event.kind()));
+    }
+    kinds
+}
+
+fn sequence_evidence(
+    application_pid: i32,
+    dispatch_pid: i32,
+    event_count: usize,
+    event_kinds: Vec<&'static str>,
+    field_focus_write: bool,
+) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("event_count_attempted".to_owned(), event_count.into()),
+        ("event_count_posted".to_owned(), event_count.into()),
+        ("event_sequence".to_owned(), json!(event_kinds)),
+        ("post_primitives".to_owned(), json!(["core_graphics_pid"])),
+        ("application_pid".to_owned(), application_pid.into()),
+        ("dispatch_pid".to_owned(), dispatch_pid.into()),
+        (
+            "out_of_process_target".to_owned(),
+            (application_pid != dispatch_pid).into(),
+        ),
+        (
+            "field_focus_write_attempted".to_owned(),
+            field_focus_write.into(),
+        ),
+        ("delivery_acknowledged".to_owned(), false.into()),
+        ("clipboard_used".to_owned(), false.into()),
+    ])
+}
+
+fn focus_field_if_needed(
+    target: &MacKeyboardEventTarget,
+    boundary: &mut NativeSideEffectBoundary<'_>,
+) -> Result<bool, NativeError> {
+    let focused = unsafe { copy_bool_attr_exact(target.element.as_ptr(), "AXFocused") }
+        .map_err(|error| ax_focus_error("AXFocused", error))?;
+    let Some(false) = focused else {
+        return Ok(false);
+    };
+    let settable = unsafe { is_attribute_settable(target.element.as_ptr(), "AXFocused") }
+        .map_err(|error| ax_focus_error("AXFocused settable", error))?;
+    if !settable {
+        return Err(NativeError::unsupported(
+            "exact keyboard target is not focused and AXFocused is not writable",
+        )
+        .with_detail("application_pid", target.application_pid)
+        .with_detail("dispatch_pid", target.dispatch_pid)
+        .with_detail("role", target.snapshot.role.clone()));
     }
 
-    let cleanup = release_modifiers(
-        poster,
-        event_gap,
-        pid,
-        &possibly_down,
-        events
-            .get(first_release.saturating_sub(1))
-            .map_or(CGEventFlags::CGEventFlagNull, |event| event.flags),
-        boundary,
-    );
-    attempted += cleanup.attempted.len();
-    delivered += cleanup.succeeded.len();
-    primitives.extend(cleanup.primitives.iter().copied());
-    if !cleanup.failures.is_empty() {
-        let error = NativeError::new(
+    boundary.begin()?;
+    let result = unsafe { bindings::set_bool_attr_true(target.element.as_ptr(), "AXFocused") };
+    if result != kAXErrorSuccess {
+        return Err(NativeError::new(
             ErrorCode::DispatchFailed,
             ErrorPhase::Dispatch,
-            false,
-            "one or more modifier-up posts failed",
-        );
-        return Err(chord_failure(
-            error,
-            attempted,
-            delivered,
-            MainKeyCleanup::default(),
-            cleanup,
-        ));
+            true,
+            "AXFocused restoration failed after entering the native side-effect boundary",
+        )
+        .with_detail("application_pid", target.application_pid)
+        .with_detail("dispatch_pid", target.dispatch_pid)
+        .with_detail("ax_error", result)
+        .with_detail("field_focus_write_attempted", true)
+        .with_detail("event_count_posted", 0)
+        .with_detail("possibly_partial_delivery", true));
     }
-
-    Ok(BTreeMap::from([
-        ("event_count_attempted".to_owned(), attempted.into()),
-        ("event_count_posted".to_owned(), delivered.into()),
-        (
-            "modifier_releases_attempted".to_owned(),
-            json!(modifier_names(&possibly_down)),
-        ),
-        ("main_key_cleanup_attempted".to_owned(), false.into()),
-        (
-            "post_primitives".to_owned(),
-            json!(primitives.into_iter().collect::<Vec<_>>()),
-        ),
-        ("clipboard_used".to_owned(), false.into()),
-    ]))
+    let restored =
+        unsafe { copy_bool_attr_exact(target.element.as_ptr(), "AXFocused") }.map_err(|error| {
+            NativeError::new(
+                ErrorCode::DispatchFailed,
+                ErrorPhase::Dispatch,
+                true,
+                "AXFocused restoration could not be read back",
+            )
+            .with_detail("application_pid", target.application_pid)
+            .with_detail("dispatch_pid", target.dispatch_pid)
+            .with_detail("ax_error", error)
+            .with_detail("field_focus_write_attempted", true)
+            .with_detail("event_count_posted", 0)
+            .with_detail("possibly_partial_delivery", true)
+        })?;
+    if restored != Some(true) {
+        return Err(NativeError::new(
+            ErrorCode::DispatchFailed,
+            ErrorPhase::Dispatch,
+            true,
+            "AXFocused restoration was not acknowledged by the exact keyboard target",
+        )
+        .with_detail("application_pid", target.application_pid)
+        .with_detail("dispatch_pid", target.dispatch_pid)
+        .with_detail("field_focus_write_attempted", true)
+        .with_detail("event_count_posted", 0)
+        .with_detail("possibly_partial_delivery", true));
+    }
+    Ok(true)
 }
 
-#[derive(Default)]
-struct MainKeyCleanup {
-    attempted: bool,
-    succeeded: bool,
-    failure: Option<NativeError>,
-    primitive: Option<&'static str>,
-}
-
-fn release_main_key(
-    poster: &dyn KeyboardEventPoster,
-    event_gap: Duration,
-    pid: i32,
-    key_code: u16,
-    flags: CGEventFlags,
-    possibly_down: bool,
-    boundary: &mut NativeSideEffectBoundary<'_>,
-) -> MainKeyCleanup {
-    if !possibly_down {
-        return MainKeyCleanup::default();
-    }
-    let event = TargetedKeyEvent {
-        kind: TargetedKeyEventKind::KeyUp,
-        key_code,
-        key_down: false,
-        flags,
-        text: None,
+fn sequence_construction_error(mut error: NativeError, side_effect_started: bool) -> NativeError {
+    error.retryable = !side_effect_started;
+    error.phase = if side_effect_started {
+        ErrorPhase::Dispatch
+    } else {
+        ErrorPhase::Preflight
     };
-    let result = poster.post(pid, &event, boundary);
-    wait_gap_blocking(event_gap);
-    match result {
-        Ok(primitive) => MainKeyCleanup {
-            attempted: true,
-            succeeded: true,
-            failure: None,
-            primitive: Some(primitive_name(primitive)),
-        },
-        Err(error) => MainKeyCleanup {
-            attempted: true,
-            succeeded: false,
-            failure: Some(error),
-            primitive: None,
-        },
-    }
-}
-
-fn dispatch_unicode(
-    poster: &dyn KeyboardEventPoster,
-    event_gap: Duration,
-    pid: i32,
-    text: &str,
-    deadline: Instant,
-    boundary: &mut NativeSideEffectBoundary<'_>,
-) -> Result<BTreeMap<String, Value>, NativeError> {
-    let events = unicode_events(text);
-    let mut primitives = BTreeSet::new();
-    let mut attempted = 0_usize;
-    let mut posted = 0_usize;
-    let mut completed_pairs = 0_usize;
-    for pair in events.chunks_exact(2) {
-        if Instant::now() >= deadline {
-            return Err(NativeError::new(
-                ErrorCode::DispatchFailed,
-                ErrorPhase::Dispatch,
-                false,
-                "targeted Unicode sequence reached its controller deadline between complete key pairs",
-            )
-            .with_detail("deadline_stage", "unicode_pair_boundary")
-            .with_detail("completed_pairs", completed_pairs)
-            .with_detail("event_count_attempted", attempted)
-            .with_detail("event_count_posted", posted));
-        }
-        let down = &pair[0];
-        let up = &pair[1];
-        attempted += 1;
-        let down_result = poster.post(pid, down, boundary);
-        if let Ok(primitive) = down_result.as_ref() {
-            posted += 1;
-            primitives.insert(primitive_name(*primitive));
-        }
-        wait_gap_blocking(event_gap);
-
-        // The pair is one non-cancellable synchronous region. Even when the
-        // down post reports failure, it may have reached the void native API,
-        // so up is always attempted before control returns.
-        attempted += 1;
-        let up_result = poster.post(pid, up, boundary);
-        if let Ok(primitive) = up_result.as_ref() {
-            posted += 1;
-            primitives.insert(primitive_name(*primitive));
-        }
-        wait_gap_blocking(event_gap);
-
-        if down_result.is_err() || up_result.is_err() {
-            let cleanup_unproved = up_result.is_err();
-            let mut failure = NativeError::new(
-                ErrorCode::DispatchFailed,
-                ErrorPhase::Dispatch,
-                false,
-                "targeted Unicode pair failed after possible partial delivery; key-up was attempted",
-            )
-            .with_detail("possibly_partial_delivery", boundary.started())
-            .with_detail("event_count_attempted", attempted)
-            .with_detail("event_count_posted", posted)
-            .with_detail("unicode_key_up_attempted", true)
-            .with_detail("unicode_key_up_succeeded", up_result.is_ok());
-            if let Err(error) = down_result {
-                failure = failure.with_related(&error);
-            }
-            if let Err(error) = up_result {
-                failure = failure.with_related(&error);
-            }
-            if cleanup_unproved {
-                failure = failure.with_target_invalidated();
-            }
-            return Err(failure);
-        }
-        completed_pairs += 1;
-    }
-    Ok(BTreeMap::from([
-        ("event_count_attempted".to_owned(), attempted.into()),
-        ("event_count_posted".to_owned(), posted.into()),
-        ("completed_pairs".to_owned(), completed_pairs.into()),
-        (
-            "post_primitives".to_owned(),
-            json!(primitives.into_iter().collect::<Vec<_>>()),
-        ),
-        ("clipboard_used".to_owned(), false.into()),
-    ]))
-}
-
-#[derive(Default)]
-struct ModifierCleanup {
-    attempted: Vec<Modifier>,
-    succeeded: Vec<Modifier>,
-    failures: Vec<NativeError>,
-    primitives: BTreeSet<&'static str>,
-}
-
-fn release_modifiers(
-    poster: &dyn KeyboardEventPoster,
-    event_gap: Duration,
-    pid: i32,
-    modifiers: &[NormalizedModifier],
-    mut flags: core_graphics::event::CGEventFlags,
-    boundary: &mut NativeSideEffectBoundary<'_>,
-) -> ModifierCleanup {
-    let mut cleanup = ModifierCleanup::default();
-    for modifier in modifiers.iter().rev() {
-        flags.remove(modifier.flag);
-        let event = TargetedKeyEvent {
-            kind: TargetedKeyEventKind::ModifierUp(modifier.modifier),
-            key_code: modifier.key_code,
-            key_down: false,
-            flags,
-            text: None,
-        };
-        cleanup.attempted.push(modifier.modifier);
-        match poster.post(pid, &event, boundary) {
-            Ok(primitive) => {
-                cleanup.succeeded.push(modifier.modifier);
-                cleanup.primitives.insert(primitive_name(primitive));
-            }
-            Err(error) => cleanup.failures.push(error),
-        }
-        wait_gap_blocking(event_gap);
-    }
-    cleanup
-}
-
-fn chord_failure(
-    error: NativeError,
-    attempted: usize,
-    delivered: usize,
-    main_cleanup: MainKeyCleanup,
-    cleanup: ModifierCleanup,
-) -> NativeError {
-    let mut failure = NativeError::new(
-        ErrorCode::DispatchFailed,
-        ErrorPhase::Dispatch,
-        false,
-        "targeted key chord failed after possible partial delivery; every possible modifier release was attempted",
-    )
-    .with_detail("possibly_partial_delivery", delivered > 0)
-    .with_detail("event_count_attempted", attempted)
-    .with_detail("event_count_posted", delivered)
-    .with_detail("main_key_cleanup_attempted", main_cleanup.attempted)
-    .with_detail("main_key_cleanup_succeeded", main_cleanup.succeeded)
-    .with_detail(
-        "modifier_releases_attempted",
-        json!(modifier_names_raw(&cleanup.attempted)),
-    )
-    .with_detail(
-        "modifier_releases_succeeded",
-        json!(modifier_names_raw(&cleanup.succeeded)),
-    )
-    .with_detail("modifier_release_failures", cleanup.failures.len())
-    .with_related(&error);
-    let cleanup_unproved =
-        (main_cleanup.attempted && !main_cleanup.succeeded) || !cleanup.failures.is_empty();
-    if let Some(primitive) = main_cleanup.primitive {
-        failure = failure.with_detail("main_key_cleanup_primitive", primitive);
-    }
-    if let Some(main_error) = main_cleanup.failure {
-        failure = failure.with_related(&main_error);
-    }
-    for release_error in cleanup.failures {
-        failure = failure.with_related(&release_error);
-    }
-    if cleanup_unproved {
-        failure = failure.with_target_invalidated();
-    }
-    failure
-}
-
-fn poison_unproved_cleanup(
-    target: &mut MacTargetState,
-    scope: &InteractionScope,
-    error: NativeError,
-) -> NativeError {
-    if error.target_invalidated() {
-        target.invalidate();
-        scope.invalidate_target();
-    }
     error
+        .with_detail("field_focus_side_effect_started", side_effect_started)
+        .with_detail("event_count_posted", 0)
+        .with_detail("possibly_partial_delivery", side_effect_started)
+}
+
+fn event_kind_name(kind: TargetedKeyEventKind) -> &'static str {
+    match kind {
+        TargetedKeyEventKind::FlagsChangedRequested => "flags_changed_requested",
+        TargetedKeyEventKind::KeyDown => "key_down",
+        TargetedKeyEventKind::KeyUp => "key_up",
+        TargetedKeyEventKind::FlagsChangedRestore => "flags_changed_restore",
+        TargetedKeyEventKind::UnicodeDown => "unicode_down",
+        TargetedKeyEventKind::UnicodeUp => "unicode_up",
+    }
 }
 
 fn apply_insertion(
@@ -1009,10 +887,10 @@ fn exact_insertion_readback(
 
 fn dispatch_unverified(
     primitive: &str,
-    focus: PreparedFocus,
+    target: MacKeyboardEventTarget,
     mut fields: BTreeMap<String, Value>,
 ) -> NativeDispatch {
-    fields.extend(focus_evidence(&focus));
+    fields.extend(focus_evidence(&target));
     fields.insert("primitive".to_owned(), Value::String(primitive.to_owned()));
     NativeDispatch {
         verification: VerificationLevel::DispatchUnverified,
@@ -1025,60 +903,24 @@ fn dispatch_unverified(
     }
 }
 
-fn focus_evidence(focus: &PreparedFocus) -> BTreeMap<String, Value> {
+fn focus_evidence(target: &MacKeyboardEventTarget) -> BTreeMap<String, Value> {
     BTreeMap::from([
         (
             "focus_ax_revision".to_owned(),
-            Value::String(focus.ax_revision.clone()),
+            Value::String(target.ax_revision.clone()),
         ),
         (
             "focus_observation_id".to_owned(),
-            Value::String(focus.observation_id.clone()),
+            Value::String(target.observation_id.clone()),
         ),
         ("focus_identity_revalidated".to_owned(), true.into()),
+        ("application_pid".to_owned(), target.application_pid.into()),
+        ("dispatch_pid".to_owned(), target.dispatch_pid.into()),
+        (
+            "out_of_process_target".to_owned(),
+            (target.application_pid != target.dispatch_pid).into(),
+        ),
     ])
-}
-
-fn normalized_modifier_for(chord: &NormalizedChord, modifier: Modifier) -> NormalizedModifier {
-    chord
-        .modifiers
-        .iter()
-        .find(|candidate| candidate.modifier == modifier)
-        .copied()
-        .expect("modifier-down event came from normalized chord")
-}
-
-fn modifier_names(modifiers: &[NormalizedModifier]) -> Vec<&'static str> {
-    modifiers
-        .iter()
-        .map(|modifier| modifier_name(modifier.modifier))
-        .collect()
-}
-
-fn modifier_names_raw(modifiers: &[Modifier]) -> Vec<&'static str> {
-    modifiers.iter().copied().map(modifier_name).collect()
-}
-
-fn modifier_name(modifier: Modifier) -> &'static str {
-    match modifier {
-        Modifier::Shift => "shift",
-        Modifier::Control => "control",
-        Modifier::Alt => "alt",
-        Modifier::Meta => "meta",
-    }
-}
-
-fn primitive_name(primitive: TargetedPostPrimitive) -> &'static str {
-    match primitive {
-        TargetedPostPrimitive::SkyLightAuthenticated => "skylight_authenticated_pid",
-        TargetedPostPrimitive::CoreGraphicsPid => "core_graphics_pid",
-    }
-}
-
-fn wait_gap_blocking(gap: Duration) {
-    if !gap.is_zero() {
-        std::thread::sleep(gap);
-    }
 }
 
 fn missing_focus_identity() -> NativeError {
@@ -1172,8 +1014,15 @@ pub(crate) fn keyboard_capability_cells(os_version: &str) -> Vec<CapabilityCell>
                     framework: framework.clone(),
                     window_state: state.clone(),
                 },
-                decision: RouteDecision::Unsupported {
-                    reason: "recipe_unproven: targeted key chords are implemented but no exact target-belief recipe is published before manual host QA".to_owned(),
+                decision: match state {
+                    WindowStateKind::Visible | WindowStateKind::Occluded => {
+                        RouteDecision::Supported {
+                            route: Route::TargetedKeyboard,
+                        }
+                    }
+                    _ => RouteDecision::Unsupported {
+                        reason: "macOS targeted keyboard actions require an exact current-Space non-minimized window state".to_owned(),
+                    },
                 },
             });
         }
@@ -1185,247 +1034,47 @@ pub(crate) fn keyboard_capability_cells(os_version: &str) -> Vec<CapabilityCell>
 mod tests {
     use std::sync::Mutex;
 
-    use cua_driver_core::api::contracts::KeyStroke;
+    use cua_driver_core::api::contracts::{KeyStroke, Modifier};
 
     use super::*;
 
-    struct FailingPoster {
-        calls: Mutex<Vec<TargetedKeyEventKind>>,
-        fail_at: usize,
+    struct RecordingPoster {
+        calls: Mutex<Vec<(i32, TargetedKeyEventKind)>>,
     }
 
-    impl KeyboardEventPoster for FailingPoster {
-        fn post(
-            &self,
-            _pid: i32,
-            event: &TargetedKeyEvent,
-            _boundary: &mut NativeSideEffectBoundary<'_>,
-        ) -> Result<TargetedPostPrimitive, NativeError> {
-            let mut calls = self.calls.lock().unwrap();
-            let index = calls.len();
-            calls.push(event.kind);
-            if index == self.fail_at {
-                Err(NativeError::new(
-                    ErrorCode::DispatchFailed,
-                    ErrorPhase::Dispatch,
-                    false,
-                    "injected event-post failure",
-                ))
-            } else {
-                Ok(TargetedPostPrimitive::CoreGraphicsPid)
-            }
-        }
-    }
-
-    struct FailingSetPoster {
-        calls: Mutex<Vec<TargetedKeyEventKind>>,
-        fail_at: BTreeSet<usize>,
-    }
-
-    impl KeyboardEventPoster for FailingSetPoster {
-        fn post(
-            &self,
-            _pid: i32,
-            event: &TargetedKeyEvent,
-            _boundary: &mut NativeSideEffectBoundary<'_>,
-        ) -> Result<TargetedPostPrimitive, NativeError> {
-            let mut calls = self.calls.lock().unwrap();
-            let index = calls.len();
-            calls.push(event.kind);
-            if self.fail_at.contains(&index) {
-                Err(NativeError::new(
-                    ErrorCode::DispatchFailed,
-                    ErrorPhase::Dispatch,
-                    false,
-                    "injected event-post failure",
-                ))
-            } else {
-                Ok(TargetedPostPrimitive::CoreGraphicsPid)
-            }
+    impl KeyboardEventPoster for RecordingPoster {
+        fn post_to_pid(&self, pid: i32, event: &PreparedTargetedKeyEvent) {
+            self.calls.lock().unwrap().push((pid, event.kind()));
         }
     }
 
     #[test]
-    fn every_partial_chord_failure_attempts_all_possible_modifier_releases() {
+    fn prepared_chord_posts_once_per_event_to_the_effective_pid() {
         let chord = normalize_chord(&KeyStroke {
             key: "k".to_owned(),
-            modifiers: vec![Modifier::Control, Modifier::Alt, Modifier::Meta],
+            modifiers: vec![Modifier::Meta],
         })
         .unwrap();
-        let pre_release_events = chord.modifiers.len() + 2;
-        for fail_at in 0..pre_release_events {
-            let poster = FailingPoster {
-                calls: Mutex::new(Vec::new()),
-                fail_at,
-            };
-            let mut observations = cua_driver_core::api::observation::ObservationStore::default();
-            let mut settlement = cua_driver_core::api::settlement::SettlementState::default();
-            let mut boundary = NativeSideEffectBoundary::new(
-                &mut observations,
-                &mut settlement,
-                cua_driver_core::api::contracts::ObservationId::parse("unused-observation")
-                    .unwrap(),
-                cua_driver_core::api::contracts::ActionId::parse("unused-action").unwrap(),
-                cua_driver_core::api::settlement::SettlementProfile::dispatch_only("test"),
-            );
-            let error =
-                dispatch_chord(&poster, Duration::ZERO, 42, &chord, &mut boundary).unwrap_err();
-            assert_eq!(error.code, ErrorCode::DispatchFailed);
-            let calls = poster.calls.lock().unwrap();
-            let attempted_modifiers: Vec<_> = calls[..=fail_at]
-                .iter()
-                .filter_map(|kind| match kind {
-                    TargetedKeyEventKind::ModifierDown(modifier) => Some(*modifier),
-                    _ => None,
-                })
-                .collect();
-            let releases: Vec<_> = calls[fail_at + 1..]
-                .iter()
-                .filter_map(|kind| match kind {
-                    TargetedKeyEventKind::ModifierUp(modifier) => Some(*modifier),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                releases,
-                attempted_modifiers.into_iter().rev().collect::<Vec<_>>()
-            );
-        }
-
-        let poster = FailingPoster {
+        let sequence = prepare_chord_sequence(&chord).unwrap();
+        let poster = RecordingPoster {
             calls: Mutex::new(Vec::new()),
-            fail_at: pre_release_events,
         };
-        let mut observations = cua_driver_core::api::observation::ObservationStore::default();
-        let mut settlement = cua_driver_core::api::settlement::SettlementState::default();
-        let mut boundary = NativeSideEffectBoundary::new(
-            &mut observations,
-            &mut settlement,
-            cua_driver_core::api::contracts::ObservationId::parse("unused-observation").unwrap(),
-            cua_driver_core::api::contracts::ActionId::parse("unused-action").unwrap(),
-            cua_driver_core::api::settlement::SettlementProfile::dispatch_only("test"),
-        );
-        let error = dispatch_chord(&poster, Duration::ZERO, 42, &chord, &mut boundary).unwrap_err();
-        assert_eq!(error.code, ErrorCode::DispatchFailed);
-        let calls = poster.calls.lock().unwrap();
-        assert_eq!(calls.len(), pre_release_events + chord.modifiers.len());
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|kind| matches!(kind, TargetedKeyEventKind::ModifierUp(_)))
-                .count(),
-            chord.modifiers.len()
-        );
-        assert!(error.target_invalidated());
-    }
-
-    #[test]
-    fn unicode_pair_always_attempts_up_and_poison_depends_on_up_cleanup() {
-        for (fail_at, poisoned) in [(0, false), (1, true)] {
-            let poster = FailingPoster {
-                calls: Mutex::new(Vec::new()),
-                fail_at,
-            };
-            let mut observations = cua_driver_core::api::observation::ObservationStore::default();
-            let mut settlement = cua_driver_core::api::settlement::SettlementState::default();
-            let mut boundary = NativeSideEffectBoundary::new(
-                &mut observations,
-                &mut settlement,
-                cua_driver_core::api::contracts::ObservationId::parse("unused-observation")
-                    .unwrap(),
-                cua_driver_core::api::contracts::ActionId::parse("unused-action").unwrap(),
-                cua_driver_core::api::settlement::SettlementProfile::dispatch_only("test"),
-            );
-            let error = dispatch_unicode(
-                &poster,
-                Duration::ZERO,
-                42,
-                "x",
-                Instant::now() + Duration::from_secs(1),
-                &mut boundary,
-            )
-            .unwrap_err();
-            assert_eq!(
-                *poster.calls.lock().unwrap(),
-                vec![
-                    TargetedKeyEventKind::UnicodeDown,
-                    TargetedKeyEventKind::UnicodeUp,
-                ]
-            );
-            assert_eq!(error.target_invalidated(), poisoned);
-        }
-    }
-
-    #[test]
-    fn failed_main_key_up_is_retried_before_modifiers_and_poisoned_if_unproved() {
-        let chord = normalize_chord(&KeyStroke {
-            key: "k".to_owned(),
-            modifiers: vec![Modifier::Control],
-        })
-        .unwrap();
-        for (fail_at, poisoned) in [([2].as_slice(), false), ([2, 3].as_slice(), true)] {
-            let poster = FailingSetPoster {
-                calls: Mutex::new(Vec::new()),
-                fail_at: fail_at.iter().copied().collect(),
-            };
-            let mut observations = cua_driver_core::api::observation::ObservationStore::default();
-            let mut settlement = cua_driver_core::api::settlement::SettlementState::default();
-            let mut boundary = NativeSideEffectBoundary::new(
-                &mut observations,
-                &mut settlement,
-                cua_driver_core::api::contracts::ObservationId::parse("unused-observation")
-                    .unwrap(),
-                cua_driver_core::api::contracts::ActionId::parse("unused-action").unwrap(),
-                cua_driver_core::api::settlement::SettlementProfile::dispatch_only("test"),
-            );
-            let error =
-                dispatch_chord(&poster, Duration::ZERO, 42, &chord, &mut boundary).unwrap_err();
-            assert_eq!(
-                *poster.calls.lock().unwrap(),
-                vec![
-                    TargetedKeyEventKind::ModifierDown(Modifier::Control),
-                    TargetedKeyEventKind::KeyDown,
-                    TargetedKeyEventKind::KeyUp,
-                    TargetedKeyEventKind::KeyUp,
-                    TargetedKeyEventKind::ModifierUp(Modifier::Control),
-                ]
-            );
-            assert_eq!(error.target_invalidated(), poisoned);
-        }
-    }
-
-    #[test]
-    fn unicode_deadline_is_checked_between_atomic_pairs() {
-        let poster = FailingPoster {
-            calls: Mutex::new(Vec::new()),
-            fail_at: usize::MAX,
-        };
-        let mut observations = cua_driver_core::api::observation::ObservationStore::default();
-        let mut settlement = cua_driver_core::api::settlement::SettlementState::default();
-        let mut boundary = NativeSideEffectBoundary::new(
-            &mut observations,
-            &mut settlement,
-            cua_driver_core::api::contracts::ObservationId::parse("unused-observation").unwrap(),
-            cua_driver_core::api::contracts::ActionId::parse("unused-action").unwrap(),
-            cua_driver_core::api::settlement::SettlementProfile::dispatch_only("test"),
-        );
-        let error = dispatch_unicode(
-            &poster,
-            Duration::from_millis(2),
-            42,
-            "xy",
-            Instant::now() + Duration::from_millis(1),
-            &mut boundary,
-        )
-        .unwrap_err();
-        assert_eq!(error.details["completed_pairs"], 1);
+        let kinds = post_sequence(&poster, 42, &sequence);
+        let evidence = sequence_evidence(41, 42, sequence.len(), kinds, false);
         assert_eq!(
             *poster.calls.lock().unwrap(),
             vec![
-                TargetedKeyEventKind::UnicodeDown,
-                TargetedKeyEventKind::UnicodeUp,
+                (42, TargetedKeyEventKind::FlagsChangedRequested),
+                (42, TargetedKeyEventKind::KeyDown),
+                (42, TargetedKeyEventKind::KeyUp),
+                (42, TargetedKeyEventKind::FlagsChangedRestore),
             ]
         );
+        assert_eq!(evidence["application_pid"], 41);
+        assert_eq!(evidence["dispatch_pid"], 42);
+        assert_eq!(evidence["out_of_process_target"], true);
+        assert_eq!(evidence["delivery_acknowledged"], false);
+        assert_eq!(evidence["post_primitives"], json!(["core_graphics_pid"]));
     }
 
     #[test]
@@ -1456,40 +1105,18 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_publish_only_semantic_insertion_before_keyboard_host_qa() {
+    fn capabilities_publish_generic_targeted_keyboard_including_unknown() {
         let cells = keyboard_capability_cells("fixture");
         assert!(cells
             .iter()
-            .filter(|cell| matches!(cell.decision, RouteDecision::Supported { .. }))
-            .all(|cell| {
-                cell.key.action == ActionKind::TypeText
-                    && matches!(
-                        cell.key.window_state,
-                        WindowStateKind::Visible | WindowStateKind::Occluded
-                    )
-                    && matches!(
-                        cell.decision,
-                        RouteDecision::Supported {
-                            route: Route::Semantic
-                        }
-                    )
-            }));
-        assert!(cells
-            .iter()
             .filter(|cell| cell.key.action == ActionKind::PressKey)
-            .all(|cell| matches!(cell.decision, RouteDecision::Unsupported { .. })));
-        assert!(cells
-            .iter()
-            .filter(|cell| {
-                cell.key.action == ActionKind::TypeText && cell.key.framework == Framework::Unknown
-            })
             .all(|cell| {
                 matches!(
                     (&cell.key.window_state, &cell.decision),
                     (
                         WindowStateKind::Visible | WindowStateKind::Occluded,
                         RouteDecision::Supported {
-                            route: Route::Semantic
+                            route: Route::TargetedKeyboard
                         }
                     ) | (
                         WindowStateKind::Minimized
@@ -1499,5 +1126,19 @@ mod tests {
                     )
                 )
             }));
+        let unknown = cells
+            .iter()
+            .find(|cell| {
+                cell.key.action == ActionKind::PressKey
+                    && cell.key.framework == Framework::Unknown
+                    && cell.key.window_state == WindowStateKind::Visible
+            })
+            .unwrap();
+        assert!(matches!(
+            unknown.decision,
+            RouteDecision::Supported {
+                route: Route::TargetedKeyboard
+            }
+        ));
     }
 }

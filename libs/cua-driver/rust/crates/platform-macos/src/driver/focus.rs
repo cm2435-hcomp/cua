@@ -72,6 +72,7 @@ pub enum MenuSuppressionRecipe {
 pub enum TargetBeliefRecipe {
     NotApplicable,
     SwiftCoordinateClick,
+    SwiftKeyboard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +88,9 @@ impl MacScopeRecipe {
             TargetBeliefRecipe::NotApplicable => "semantic_no_target_belief",
             TargetBeliefRecipe::SwiftCoordinateClick => {
                 "swift_coordinate_click_cps_key_focus_returned_macos_26_5_1_arm64"
+            }
+            TargetBeliefRecipe::SwiftKeyboard => {
+                "swift_keyboard_cps_key_focus_returned_macos_26_5_1_arm64"
             }
         }
     }
@@ -118,7 +122,10 @@ pub fn select_scope_recipe(
         ));
     }
 
-    let accessibility = if requirements.accessibility && *framework == Framework::Chromium {
+    let accessibility = if requirements.accessibility
+        && *framework == Framework::Chromium
+        && requires_action_time_chromium_enablement(route, action)
+    {
         AccessibilityRecipe::ChromiumPriorStatePreserving
     } else {
         AccessibilityRecipe::NotApplicable
@@ -133,6 +140,14 @@ pub fn select_scope_recipe(
                 && is_exact_proven_point_click(action) =>
         {
             TargetBeliefRecipe::SwiftCoordinateClick
+        }
+        Route::TargetedKeyboard
+            if requirements.target_belief
+                && host.os_version == PROVEN_OS_VERSION
+                && host.architecture == PROVEN_ARCHITECTURE
+                && is_keyboard_action(action) =>
+        {
+            TargetBeliefRecipe::SwiftKeyboard
         }
         _ => {
             return Err(recipe_unproven(
@@ -150,6 +165,27 @@ pub fn select_scope_recipe(
         menu: MenuSuppressionRecipe::NotApplicable,
         target_belief,
     })
+}
+
+fn is_keyboard_action(action: &ResolvedAction) -> bool {
+    matches!(
+        action,
+        ResolvedAction::PressKey { .. } | ResolvedAction::TypeText { .. }
+    )
+}
+
+fn requires_action_time_chromium_enablement(route: Route, action: &ResolvedAction) -> bool {
+    match (route, action) {
+        // Captured-point dispatch consumes exact surface/window coordinates
+        // and never dereferences an AX element during the action.
+        (Route::TargetedPointer, ResolvedAction::PointClick { .. }) => false,
+        // Targeted keyboard preparation starts from the exact focused element
+        // retained by the consumed observation and revalidates it before
+        // dispatch. Re-enabling Chromium here is both redundant and can fail
+        // for profiles whose web AX tree was materialized at launch.
+        (Route::TargetedKeyboard, action) if is_keyboard_action(action) => false,
+        _ => true,
+    }
 }
 
 fn is_exact_proven_point_click(action: &ResolvedAction) -> bool {
@@ -269,6 +305,14 @@ pub(crate) fn prepare_target_focus(
     match recipe {
         TargetBeliefRecipe::NotApplicable => Ok(None),
         TargetBeliefRecipe::SwiftCoordinateClick => prepare_target_focus_with(
+            facts,
+            state,
+            deadline,
+            &SystemTargetFocusPoster,
+            &SystemTargetFocusReader,
+        )
+        .map(Some),
+        TargetBeliefRecipe::SwiftKeyboard => prepare_target_focus_with(
             facts,
             state,
             deadline,
@@ -402,10 +446,13 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex};
 
     use cua_driver_core::api::{
-        contracts::{CaptureRevision, GeometryRevision, Point, Rect, SurfaceId, WindowGeneration},
+        contracts::{
+            AxRevision, CaptureRevision, ElementId, GeometryRevision, KeyStroke, ObservationId,
+            Point, Rect, SurfaceId, WindowGeneration,
+        },
         observation::{
-            NativeProcessHandle, NativeWindowHandle, ResolvedPoint, ResolvedWindow, SurfaceOwner,
-            WindowGeometry,
+            NativeProcessHandle, NativeWindowHandle, ResolvedFocus, ResolvedPoint, ResolvedWindow,
+            SurfaceOwner, WindowGeometry,
         },
         platform::ClickSpec,
     };
@@ -532,6 +579,25 @@ mod tests {
         }
     }
 
+    fn press_key(framework: Framework) -> ResolvedAction {
+        let ResolvedAction::PointClick { point, .. } = point_click(framework, MouseButton::Left, 1)
+        else {
+            unreachable!("fixture is a point click");
+        };
+        ResolvedAction::PressKey {
+            focus: ResolvedFocus {
+                window: point.window,
+                observation_id: ObservationId::parse("observation").unwrap(),
+                focused_element: Some(ElementId::parse("focused").unwrap()),
+                ax_revision: Some(AxRevision::parse("ax-revision").unwrap()),
+            },
+            stroke: KeyStroke {
+                key: "return".to_owned(),
+                modifiers: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn recipe_selector_uses_exact_host_and_action_facts_not_framework_guessing() {
         let host = HostRecipeContext {
@@ -552,6 +618,17 @@ mod tests {
                 recipe.target_belief,
                 TargetBeliefRecipe::SwiftCoordinateClick
             );
+            assert_eq!(recipe.accessibility, AccessibilityRecipe::NotApplicable);
+            let keyboard = select_scope_recipe(
+                &host,
+                &framework,
+                Route::TargetedKeyboard,
+                &press_key(framework.clone()),
+                &ScopeRequirements::for_route(Route::TargetedKeyboard),
+            )
+            .unwrap();
+            assert_eq!(keyboard.target_belief, TargetBeliefRecipe::SwiftKeyboard);
+            assert_eq!(keyboard.accessibility, AccessibilityRecipe::NotApplicable);
         }
         let catalyst_error = select_scope_recipe(
             &host,

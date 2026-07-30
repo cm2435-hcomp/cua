@@ -222,9 +222,27 @@ unsafe fn timestamp_and_post(pid: i32, event: CGEventRef) -> Result<(), NativeEr
                 "macOS event timestamp overflowed",
             )
         })?;
-    CGEventSetTimestamp(event, timestamp);
+    CGEventSetTimestamp(event as *mut c_void, timestamp);
     CGEventPostToPid(pid, event);
     Ok(())
+}
+
+pub(crate) fn fresh_event_timestamp() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut time) } != 0 {
+        return 0;
+    }
+    u64::try_from(time.tv_sec)
+        .unwrap_or_default()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(time.tv_nsec).unwrap_or_default())
+}
+
+pub(crate) unsafe fn set_event_timestamp(event: *mut c_void, timestamp: u64) {
+    CGEventSetTimestamp(event, timestamp);
 }
 
 fn next_event_number() -> isize {
@@ -272,7 +290,7 @@ extern "C" {
     fn CGEventSetLocation(event: *mut c_void, x: f64, y: f64);
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
     fn CGEventSetWindowLocation(event: CGEventRef, x: f64, y: f64);
-    fn CGEventSetTimestamp(event: CGEventRef, timestamp: u64);
+    fn CGEventSetTimestamp(event: *mut c_void, timestamp: u64);
     fn CGEventPostToPid(pid: i32, event: CGEventRef);
 }
 

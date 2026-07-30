@@ -84,6 +84,7 @@ extern "C" {
         attribute: CFStringRef,
         settable: *mut u8,
     ) -> AXError;
+    pub fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> AXError;
     pub fn AXUIElementGetTypeID() -> CFTypeID;
     pub fn AXObserverCreate(
         application: i32,
@@ -189,20 +190,57 @@ pub unsafe fn copy_number_attr(element: AXUIElementRef, attr_name: &str) -> Opti
 /// Copy a boolean attribute from an AX element. Returns `None` when the
 /// attribute is missing, unsupported, or not a CFBoolean.
 pub unsafe fn copy_bool_attr(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
+    copy_bool_attr_exact(element, attr_name).ok().flatten()
+}
+
+/// Copy a boolean attribute without collapsing query/type failures into a
+/// truthful missing value.
+///
+/// # Safety
+///
+/// `element` must be a live AX element reference for the duration of the call.
+pub unsafe fn copy_bool_attr_exact(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Result<Option<bool>, AXError> {
     use core_foundation::boolean::CFBoolean;
 
     let attr = CFStr::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    if err != kAXErrorSuccess || value.is_null() {
-        return None;
+    if err == kAXErrorNoValue || err == kAXErrorAttributeUnsupported {
+        return Ok(None);
+    }
+    if err != kAXErrorSuccess {
+        return Err(err);
+    }
+    if value.is_null() {
+        return Ok(None);
     }
     if core_foundation::base::CFGetTypeID(value) != CFBoolean::type_id() {
         CFRelease(value);
-        return None;
+        return Err(kAXErrorFailure);
     }
     let boolean = CFBoolean::wrap_under_create_rule(value as _);
-    Some(bool::from(boolean))
+    Ok(Some(bool::from(boolean)))
+}
+
+/// Read the process which owns an AX element without inferring ownership from
+/// the top-level application used to discover it.
+///
+/// # Safety
+///
+/// `element` must be a live AX element reference for the duration of the call.
+pub unsafe fn element_pid(element: AXUIElementRef) -> Result<i32, AXError> {
+    let mut pid = 0_i32;
+    let error = AXUIElementGetPid(element, &mut pid);
+    if error != kAXErrorSuccess {
+        return Err(error);
+    }
+    if pid <= 0 {
+        return Err(kAXErrorFailure);
+    }
+    Ok(pid)
 }
 
 /// Get the action names for an AX element.

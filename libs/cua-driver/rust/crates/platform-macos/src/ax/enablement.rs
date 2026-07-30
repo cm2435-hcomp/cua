@@ -82,7 +82,7 @@ impl AxBooleanAccess for SystemAxBooleanAccess {
         &self,
         pid: i32,
         attribute: &'static str,
-        value: bool,
+        requested: bool,
         phase: ErrorPhase,
     ) -> Result<(), NativeError> {
         unsafe {
@@ -98,7 +98,7 @@ impl AxBooleanAccess for SystemAxBooleanAccess {
                 ));
             }
             let name = CFString::new(attribute);
-            let value = if value {
+            let value = if requested {
                 CFBoolean::true_value()
             } else {
                 CFBoolean::false_value()
@@ -109,7 +109,12 @@ impl AxBooleanAccess for SystemAxBooleanAccess {
                 value.as_CFTypeRef(),
             );
             CFRelease(application as CFTypeRef);
-            if status == kAXErrorSuccess {
+            let readback = if status == kAXErrorSuccess {
+                Some(requested)
+            } else {
+                self.read(pid, attribute).ok().flatten()
+            };
+            if bool_write_acknowledged(status, readback, requested) {
                 Ok(())
             } else {
                 Err(ax_error(
@@ -123,6 +128,10 @@ impl AxBooleanAccess for SystemAxBooleanAccess {
             }
         }
     }
+}
+
+fn bool_write_acknowledged(status: i32, readback: Option<bool>, requested: bool) -> bool {
+    status == kAXErrorSuccess || readback == Some(requested)
 }
 
 pub struct AxEnablementLease {
@@ -270,6 +279,14 @@ mod tests {
                 ("AXManualAccessibility", false)
             ]
         );
+    }
+
+    #[test]
+    fn non_success_write_is_acknowledged_by_exact_readback() {
+        assert!(bool_write_acknowledged(-25208, Some(true), true));
+        assert!(bool_write_acknowledged(-25208, Some(false), false));
+        assert!(!bool_write_acknowledged(-25208, Some(false), true));
+        assert!(!bool_write_acknowledged(-25208, None, true));
     }
 
     #[test]
