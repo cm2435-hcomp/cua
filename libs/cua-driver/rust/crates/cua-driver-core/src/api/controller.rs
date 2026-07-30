@@ -1018,8 +1018,13 @@ impl<P: PlatformDriver> DriverController<P> {
             }
         }
 
-        let profile =
-            settlement_profile(&action, route, menu_opening, requires_effect_verification);
+        let profile = settlement_profile(
+            &action,
+            route,
+            menu_opening,
+            requires_effect_verification,
+            action_allows_target_disappearance(&prepared),
+        );
         // Refresh the store's current proof immediately before handing the
         // provider its explicit first-native-side-effect boundary. The target
         // lock prevents any concurrent core mutation of this record.
@@ -1634,7 +1639,16 @@ fn settlement_profile(
     route: Route,
     menu_opening: bool,
     exact_readback: bool,
+    target_may_disappear: bool,
 ) -> SettlementProfile {
+    if target_may_disappear {
+        return SettlementProfile::requiring(
+            "performsecondaryaction_target_close",
+            [SettlementSignal::WindowListChanged],
+        )
+        .with_relevant_signals([SettlementSignal::WindowListChanged])
+        .allowing_target_disappearance();
+    }
     if exact_readback {
         return SettlementProfile::requiring(
             format!("{action:?}_exact_readback").to_lowercase(),
@@ -1700,6 +1714,58 @@ fn settlement_profile(
             .with_relevant_signals(relevant)
     } else {
         SettlementProfile::dispatch_only(name).with_relevant_signals(relevant)
+    }
+}
+
+fn action_allows_target_disappearance(action: &ResolvedAction) -> bool {
+    matches!(
+        action,
+        ResolvedAction::Secondary { element, action }
+            if secondary_action_allows_target_disappearance(element.subrole.as_deref(), action)
+    )
+}
+
+fn secondary_action_allows_target_disappearance(subrole: Option<&str>, action: &str) -> bool {
+    subrole == Some("AXCloseButton") && action == "AXPress"
+}
+
+#[cfg(test)]
+mod target_disappearance_tests {
+    use super::*;
+
+    #[test]
+    fn only_exact_close_button_press_allows_target_disappearance() {
+        assert!(secondary_action_allows_target_disappearance(
+            Some("AXCloseButton"),
+            "AXPress"
+        ));
+        assert!(!secondary_action_allows_target_disappearance(
+            Some("AXCloseButton"),
+            "AXShowMenu"
+        ));
+        assert!(!secondary_action_allows_target_disappearance(
+            Some("AXMinimizeButton"),
+            "AXPress"
+        ));
+        assert!(!secondary_action_allows_target_disappearance(
+            None, "AXPress"
+        ));
+    }
+
+    #[test]
+    fn close_profile_requires_window_disappearance_evidence() {
+        let profile = settlement_profile(
+            &ActionKind::PerformSecondaryAction,
+            Route::Semantic,
+            false,
+            false,
+            true,
+        );
+        assert!(profile.target_may_disappear);
+        assert_eq!(
+            profile.required_terminal_signals,
+            [SettlementSignal::WindowListChanged].into()
+        );
     }
 }
 

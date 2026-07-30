@@ -345,7 +345,24 @@ impl ObservationProvider<MacTargetState> for MacObservationProvider {
         dirty: &DirtyState,
         deadline: std::time::Instant,
     ) -> Result<SettlementAttempt, NativeError> {
-        self.record_fresh_frame_signal(target, deadline).await?;
+        if let Err(fresh_frame_error) = self.record_fresh_frame_signal(target, deadline).await {
+            if !dirty.profile.target_may_disappear {
+                return Err(fresh_frame_error);
+            }
+            match self.windows.facts_for_identity(&target.window).await {
+                Err(missing_error)
+                    if matches!(
+                        missing_error.code,
+                        ErrorCode::WindowNotFound | ErrorCode::WindowIdentityChanged
+                    ) =>
+                {
+                    target.signals.record(
+                        cua_driver_core::api::settlement::SettlementSignal::WindowListChanged,
+                    );
+                }
+                _ => return Err(fresh_frame_error),
+            }
+        }
         Ok(target
             .signals
             .settle(dirty, &dirty.profile.relevant_signals, deadline)
@@ -1365,6 +1382,7 @@ impl MacElementRegistry {
                 native: native.clone(),
                 owner: owner.clone(),
                 role: Some(node.role.clone()),
+                subrole: node.subrole.clone(),
                 label: node.label,
                 value: node.value,
                 bounds,

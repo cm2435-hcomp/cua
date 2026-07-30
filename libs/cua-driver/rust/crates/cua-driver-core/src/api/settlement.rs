@@ -36,6 +36,10 @@ pub struct SettlementProfile {
     /// evidence exists. Keeping this profile-specific prevents unrelated or
     /// continuously animated state from holding every action dirty.
     pub relevant_signals: BTreeSet<SettlementSignal>,
+    /// The exact action is expected to remove its target window, so native
+    /// settlement may terminate from target disappearance instead of a fresh
+    /// post-action frame.
+    pub target_may_disappear: bool,
     pub quiet_window_ms: u64,
     pub deadline_ms: u64,
 }
@@ -46,6 +50,7 @@ impl SettlementProfile {
             name: name.into(),
             required_terminal_signals: BTreeSet::new(),
             relevant_signals: BTreeSet::new(),
+            target_may_disappear: false,
             quiet_window_ms: 30,
             deadline_ms: 2_000,
         }
@@ -61,6 +66,7 @@ impl SettlementProfile {
             name: name.into(),
             relevant_signals: required_terminal_signals.clone(),
             required_terminal_signals,
+            target_may_disappear: false,
             quiet_window_ms: 30,
             deadline_ms: 2_000,
         }
@@ -71,6 +77,11 @@ impl SettlementProfile {
         relevant_signals: impl IntoIterator<Item = SettlementSignal>,
     ) -> Self {
         self.relevant_signals = relevant_signals.into_iter().collect();
+        self
+    }
+
+    pub fn allowing_target_disappearance(mut self) -> Self {
+        self.target_may_disappear = true;
         self
     }
 }

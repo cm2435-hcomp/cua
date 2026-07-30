@@ -197,6 +197,7 @@ fn ax_diff_round_trip_is_exact_and_malformed_ranges_fail_closed() {
             native: NativeElementHandle::new("native-element-1").unwrap(),
             owner: resolved_window().stamp(),
             role: Some("button".to_owned()),
+            subrole: None,
             label: None,
             value: None,
             bounds: Some(Rect {
@@ -623,6 +624,7 @@ impl ObservationProvider<FakeTargetState> for FakePlatform {
                             .clone()
                             .unwrap_or_else(|| "button".to_owned()),
                     ),
+                    subrole: None,
                     label: Some("Fixture button".to_owned()),
                     value: Some(observation_suffix.to_string()),
                     bounds: Some(Rect {

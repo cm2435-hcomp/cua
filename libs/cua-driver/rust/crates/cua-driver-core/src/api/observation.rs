@@ -214,6 +214,9 @@ pub struct NativeAccessibilityElement {
     /// when the observation was captured.
     pub owner: ResolvedWindowStamp,
     pub role: Option<String>,
+    /// Exact native accessibility subrole retained for internal route and
+    /// settlement decisions. It is not part of the public AX projection.
+    pub subrole: Option<String>,
     pub label: Option<String>,
     pub value: Option<String>,
     pub bounds: Option<Rect>,
@@ -302,6 +305,7 @@ pub struct ElementRecord {
     pub native: NativeElementHandle,
     pub owner: ResolvedWindowStamp,
     pub role: Option<String>,
+    pub subrole: Option<String>,
     pub bounds: Option<Rect>,
     pub actions: Vec<String>,
     pub ax_revision: AxRevision,
@@ -396,6 +400,7 @@ pub struct ResolvedElement {
     pub owner: ResolvedWindowStamp,
     pub ax_revision: AxRevision,
     pub role: Option<String>,
+    pub subrole: Option<String>,
     pub bounds: Option<Rect>,
     pub actions: Vec<String>,
     pub menu_id: Option<MenuId>,
@@ -642,6 +647,7 @@ impl ObservationStore {
             owner: resolved.owner.clone(),
             ax_revision: resolved.ax_revision.clone(),
             role: resolved.role.clone(),
+            subrole: resolved.subrole.clone(),
             bounds: resolved.bounds,
             actions: resolved.actions.clone(),
             menu_id: resolved.menu_id.clone(),
@@ -1057,6 +1063,7 @@ pub fn revision_accessibility(
                 native: element.native,
                 owner: element.owner,
                 role: element.role,
+                subrole: element.subrole,
                 bounds: element.bounds,
                 actions: element.actions,
                 ax_revision: revision.clone(),
@@ -1357,6 +1364,7 @@ mod store_tests {
                     native: NativeElementHandle::new("native-related-element").unwrap(),
                     owner: related,
                     role: Some("AXButton".to_owned()),
+                    subrole: None,
                     bounds: Some(Rect {
                         x: 30.0,
                         y: 40.0,
