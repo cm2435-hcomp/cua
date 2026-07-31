@@ -974,11 +974,9 @@ impl<P: PlatformDriver> DriverController<P> {
             }
             return Err(error);
         }
-        let dispatch_scope = DispatchScope::materialize(
-            scope_plan.dispatch_scope,
-            key.clone(),
-            resolved.process.clone(),
-        );
+        let dispatch_scope_kind = scope_plan.dispatch_scope;
+        let dispatch_scope =
+            DispatchScope::materialize(dispatch_scope_kind, key.clone(), resolved.process.clone());
         let _dispatch_permit = match self.dispatch_guards.try_acquire(dispatch_scope) {
             Ok(permit) => permit,
             Err(error) => {
@@ -1070,6 +1068,11 @@ impl<P: PlatformDriver> DriverController<P> {
                 return Err(error);
             }
         };
+        scope.native_evidence.fields.insert(
+            "dispatch_scope".to_owned(),
+            serde_json::to_value(dispatch_scope_kind)
+                .expect("typed dispatch scope kind must serialize"),
+        );
         scope.bind_target_validity(target.validity_handle());
         let dispatch_plan_result = {
             let platform = &mut state.platform;

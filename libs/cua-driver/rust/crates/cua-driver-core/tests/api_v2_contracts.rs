@@ -1316,6 +1316,7 @@ async fn controller_preserves_target_state_and_consumes_at_dispatch_boundary() {
         receipt.native_evidence.fields["route_detail"],
         "direct_live_provider"
     );
+    assert_eq!(receipt.native_evidence.fields["dispatch_scope"], "process");
     assert_eq!(receipt.settlement.state, SettledState::Settled);
     assert_eq!(
         platform.preflight_action_ids.lock().unwrap().as_slice(),
