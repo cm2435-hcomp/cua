@@ -326,7 +326,6 @@ struct RegistryEntry {
     key: NativeWindowKey,
     process: NativeProcessHandle,
     native: NativeWindowHandle,
-    generation: WindowGeneration,
     geometry_revision: GeometryRevision,
     snapshot: NativeWindowSnapshot,
 }
@@ -343,7 +342,6 @@ struct RelatedRegistryEntry {
     key: NativeWindowKey,
     process: NativeProcessHandle,
     native: NativeWindowHandle,
-    generation: WindowGeneration,
     geometry_revision: GeometryRevision,
     parent: ResolvedWindowStamp,
     bounds: Rect,
@@ -447,10 +445,10 @@ impl MacWindowRegistry {
                         .publish(TargetInvalidation::WindowGenerationChanged {
                             app_id: entry.public.app.id.clone(),
                             window_id: entry.public.id.clone(),
-                            previous: entry.generation,
-                            current: WindowGeneration(entry.generation.0.saturating_add(1)),
+                            previous: entry.public.generation,
+                            current: WindowGeneration(entry.public.generation.0.saturating_add(1)),
                         });
-                    state.remove_related_for_parent(&entry.public.id, entry.generation);
+                    state.remove_related_for_parent(&entry.public.id, entry.public.generation);
                     state.tombstone(id, WindowTombstone::Missing);
                 }
             }
@@ -485,10 +483,10 @@ impl MacWindowRegistry {
                         .publish(TargetInvalidation::WindowGenerationChanged {
                             app_id: entry.public.app.id.clone(),
                             window_id: entry.public.id.clone(),
-                            previous: entry.generation,
-                            current: WindowGeneration(entry.generation.0.saturating_add(1)),
+                            previous: entry.public.generation,
+                            current: WindowGeneration(entry.public.generation.0.saturating_add(1)),
                         });
-                    state.remove_related_for_parent(&entry.public.id, entry.generation);
+                    state.remove_related_for_parent(&entry.public.id, entry.public.generation);
                     state.tombstone(existing_id, WindowTombstone::IdentityChanged);
                 }
             }
@@ -500,6 +498,7 @@ impl MacWindowRegistry {
             let public = WindowRef {
                 id: id.clone(),
                 app,
+                generation,
                 title: snapshot.title.clone(),
                 usable: false,
                 is_standard: None,
@@ -524,7 +523,6 @@ impl MacWindowRegistry {
                     key: snapshot.key.clone(),
                     process,
                     native,
-                    generation,
                     geometry_revision: GeometryRevision::new(),
                     snapshot,
                 },
@@ -635,7 +633,7 @@ impl MacWindowRegistry {
         tokio::task::spawn_blocking(move || {
             let entry = registry.entry(&stamp.window_id, None)?;
             if entry.public.app.id != stamp.app_id
-                || entry.generation != stamp.generation
+                || entry.public.generation != stamp.generation
                 || entry.native != stamp.native_window
                 || entry.process != stamp.process
             {
@@ -816,6 +814,7 @@ impl MacWindowRegistry {
                     pid: u32::try_from(parent.pid).ok(),
                     running: true,
                 },
+                generation,
                 title: snapshot.title,
                 usable: false,
                 is_standard: None,
@@ -832,7 +831,6 @@ impl MacWindowRegistry {
                 key: snapshot.key.clone(),
                 process,
                 native,
-                generation,
                 geometry_revision: GeometryRevision::new(),
                 parent: parent.stamp.clone(),
                 bounds: snapshot.bounds,
@@ -969,7 +967,7 @@ fn related_facts_for_entry(entry: &RelatedRegistryEntry) -> MacRelatedWindowFact
         stamp: ResolvedWindowStamp {
             app_id: entry.public.app.id.clone(),
             window_id: entry.public.id.clone(),
-            generation: entry.generation,
+            generation: entry.public.generation,
             geometry_revision: entry.geometry_revision.clone(),
             native_window: entry.native.clone(),
             process: entry.process.clone(),
@@ -989,7 +987,7 @@ fn related_stamp_for_entry(entry: &RelatedRegistryEntry) -> ResolvedWindowStamp 
     ResolvedWindowStamp {
         app_id: entry.public.app.id.clone(),
         window_id: entry.public.id.clone(),
-        generation: entry.generation,
+        generation: entry.public.generation,
         geometry_revision: entry.geometry_revision.clone(),
         native_window: entry.native.clone(),
         process: entry.process.clone(),
@@ -1059,7 +1057,6 @@ impl WindowProvider for MacWindowRegistry {
                     scale_factor,
                     revision: entry.geometry_revision,
                 },
-                generation: entry.generation,
                 state: window_state(&entry.snapshot),
             })
         })
@@ -1132,7 +1129,7 @@ fn facts_for_entry(entry: &RegistryEntry) -> MacWindowFacts {
         stamp: ResolvedWindowStamp {
             app_id: entry.public.app.id.clone(),
             window_id: entry.public.id.clone(),
-            generation: entry.generation,
+            generation: entry.public.generation,
             geometry_revision: entry.geometry_revision.clone(),
             native_window: entry.native.clone(),
             process: entry.process.clone(),
@@ -1168,7 +1165,7 @@ fn identity_error(entry: &RegistryEntry, message: &str) -> NativeError {
     .with_detail("window_id", entry.public.id.to_string())
     .with_detail("pid", entry.key.pid)
     .with_detail("cg_window_id", entry.key.cg_window_id)
-    .with_detail("generation", entry.generation.0)
+    .with_detail("generation", entry.public.generation.0)
 }
 
 fn join_error(error: tokio::task::JoinError) -> NativeError {

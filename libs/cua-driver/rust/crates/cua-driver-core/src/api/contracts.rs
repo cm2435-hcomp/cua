@@ -126,6 +126,9 @@ pub struct AppRef {
 pub struct WindowRef {
     pub id: WindowId,
     pub app: AppRef,
+    /// Opaque native lifetime stamp. A reused app/window id with a new stamp
+    /// is a different claim and target-controller identity.
+    pub generation: WindowGeneration,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Exact native facts used by the app-addressed facade to choose a

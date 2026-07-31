@@ -6,6 +6,7 @@
 pub mod capabilities;
 pub mod contracts;
 pub mod controller;
+pub mod dispatch;
 pub mod errors;
 pub mod interaction;
 pub mod menu;
@@ -17,6 +18,7 @@ pub mod target;
 pub use capabilities::*;
 pub use contracts::*;
 pub use controller::*;
+pub use dispatch::*;
 pub use errors::*;
 pub use interaction::*;
 pub use menu::*;

@@ -1344,6 +1344,7 @@ mod tests {
         let public = WindowRef {
             id: WindowId::parse("window").unwrap(),
             app,
+            generation: WindowGeneration(1),
             title: None,
             usable: true,
             is_standard: Some(true),

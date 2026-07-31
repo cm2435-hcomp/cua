@@ -39,6 +39,7 @@ fn window_ref() -> WindowRef {
     WindowRef {
         id: id("window-1", WindowId::parse),
         app: app_ref(),
+        generation: WindowGeneration(1),
         title: Some("Fixture window".to_owned()),
         usable: true,
         is_standard: Some(true),
@@ -63,8 +64,59 @@ fn resolved_window() -> ResolvedWindow {
             scale_factor: 1.0,
             revision: id("geometry-1", GeometryRevision::parse),
         },
-        generation: WindowGeneration(1),
         state: WindowStateKind::Visible,
+    }
+}
+
+fn alternate_window(id: &str, app_id: &str, pid: u32, process: &str) -> ResolvedWindow {
+    let public = WindowRef {
+        id: WindowId::parse(id).unwrap(),
+        app: AppRef {
+            id: AppId::parse(app_id).unwrap(),
+            canonical_id: Some(format!("com.example.{app_id}")),
+            name: Some(app_id.to_owned()),
+            pid: Some(pid),
+            running: true,
+        },
+        generation: WindowGeneration(1),
+        title: Some(id.to_owned()),
+        usable: true,
+        is_standard: Some(true),
+        is_main: Some(true),
+        z_index: Some(1),
+    };
+    ResolvedWindow {
+        public,
+        native: NativeWindowHandle::new(format!("native-{id}")).unwrap(),
+        process: NativeProcessHandle::new(process).unwrap(),
+        framework: Framework::AppKit,
+        geometry: WindowGeometry {
+            bounds: Rect {
+                x: 100.0,
+                y: 200.0,
+                width: 640.0,
+                height: 480.0,
+            },
+            scale_factor: 1.0,
+            revision: GeometryRevision::parse(format!("geometry-{id}")).unwrap(),
+        },
+        state: WindowStateKind::Visible,
+    }
+}
+
+fn point_click_command(window: WindowRef, state: &WindowState) -> ClickCommand {
+    ClickCommand {
+        window,
+        request: ClickRequest {
+            target: ClickTarget::Point {
+                observation_id: state.observation_id.clone(),
+                surface_id: state.surfaces[0].id.clone(),
+                point: Point { x: 20.0, y: 20.0 },
+            },
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: Vec::new(),
+        },
     }
 }
 
@@ -72,7 +124,7 @@ fn resolved_window() -> ResolvedWindow {
 fn v2_protocol_rejects_schema_drift_and_version_mismatch() {
     let valid = serde_json::json!({
         "request_id": "request-1",
-        "protocol_version": {"major": 2, "minor": 0},
+        "protocol_version": {"major": 2, "minor": 1},
         "method": "driver.v2.click",
         "params": {
             "window": window_ref(),
@@ -106,7 +158,7 @@ fn v2_protocol_rejects_schema_drift_and_version_mismatch() {
     assert!(serde_json::from_value::<V2RequestEnvelope>(ambiguous_union).is_err());
 
     let mut wrong_version = valid;
-    wrong_version["protocol_version"]["minor"] = serde_json::json!(1);
+    wrong_version["protocol_version"]["minor"] = serde_json::json!(0);
     let mismatch: V2RequestEnvelope = serde_json::from_value(wrong_version).unwrap();
     let error = mismatch.validate_version().unwrap_err();
     assert_eq!(error.code, ErrorCode::ProtocolMismatch);
@@ -118,7 +170,7 @@ fn v2_protocol_rejects_schema_drift_and_version_mismatch() {
 
     let both_result_and_error = serde_json::json!({
         "request_id": "request-1",
-        "protocol_version": {"major": 2, "minor": 0},
+        "protocol_version": {"major": 2, "minor": 1},
         "result": {},
         "error": serde_json::to_value(&error).unwrap(),
     });
@@ -366,9 +418,12 @@ struct FakePlatform {
     observation_role: Mutex<Option<String>>,
     cleanup_failure_count: AtomicUsize,
     settle_pending: std::sync::atomic::AtomicBool,
+    block_settle: std::sync::atomic::AtomicBool,
     launch_fail: std::sync::atomic::AtomicBool,
     refresh_geometry_during_observe: std::sync::atomic::AtomicBool,
     dispatch_entered: Notify,
+    settle_entered: Notify,
+    blocked_dispatch_process: Mutex<Option<String>>,
 }
 
 enum FakePreparedSemantic {
@@ -436,7 +491,7 @@ impl LifecycleProvider for FakePlatform {
         Ok(CapabilityManifest {
             platform: PlatformName::Macos,
             driver_version: "test".to_owned(),
-            protocol_version: "2.0".to_owned(),
+            protocol_version: "2.1".to_owned(),
             permissions: BTreeMap::new(),
             cells: Vec::new(),
         })
@@ -528,13 +583,25 @@ impl WindowProvider for FakePlatform {
     }
 
     async fn resolve(&self, window: &WindowRef) -> Result<ResolvedWindow, NativeError> {
-        if window.id != window_ref().id || window.app.id != app_ref().id {
+        let resolved = if window.id == window_ref().id && window.app.id == app_ref().id {
+            resolved_window()
+        } else if window.id.as_str() == "window-2" && window.app.id.as_str() == "app-2" {
+            alternate_window("window-2", "app-2", 84, "process-84")
+        } else if window.id.as_str() == "window-3" && window.app.id == app_ref().id {
+            alternate_window("window-3", "app-1", 42, "process-42")
+        } else {
             return Err(NativeError::stale(
                 ErrorCode::WindowIdentityChanged,
                 "fake window mismatch",
             ));
+        };
+        if window.generation != resolved.public.generation {
+            return Err(NativeError::stale(
+                ErrorCode::WindowIdentityChanged,
+                "fake window generation mismatch",
+            ));
         }
-        Ok(resolved_window())
+        Ok(resolved)
     }
 }
 
@@ -547,6 +614,10 @@ impl ObservationProvider<FakeTargetState> for FakePlatform {
         _deadline: Instant,
     ) -> Result<SettlementAttempt, NativeError> {
         self.record("settle");
+        if self.block_settle.load(Ordering::SeqCst) {
+            self.settle_entered.notify_waiters();
+            std::future::pending::<()>().await;
+        }
         if self.settle_pending.load(Ordering::SeqCst) {
             let mut pending = dirty.pending_evidence();
             pending.observed_signals.push(SettlementSignal::AxAction);
@@ -806,7 +877,16 @@ impl PointerActionProvider<FakeTargetState> for FakePlatform {
         boundary.begin()?;
         self.dispatch_count.fetch_add(1, Ordering::SeqCst);
         self.record("dispatch");
-        if self.block_dispatch.load(Ordering::SeqCst) {
+        let process = match &_action {
+            ResolvedAction::PointClick { point, .. } => Some(point.window.process.as_str()),
+            _ => None,
+        };
+        let blocked_process = self.blocked_dispatch_process.lock().unwrap().clone();
+        if self.block_dispatch.load(Ordering::SeqCst)
+            && blocked_process
+                .as_deref()
+                .is_none_or(|blocked| process == Some(blocked))
+        {
             self.dispatch_entered.notify_waiters();
             std::future::pending::<()>().await;
         }
@@ -882,6 +962,7 @@ impl InteractionProvider<FakeTargetState, FakeFocus> for FakePlatform {
             route,
             deadline,
             requirements,
+            DispatchScopeKind::Process,
             (),
         ))
     }
@@ -1363,15 +1444,6 @@ async fn controller_preserves_target_state_and_consumes_at_dispatch_boundary() {
         )
         .await
         .unwrap();
-    let first_key = TargetKey::from_window(client_one.clone(), &resolved_window());
-    let second_key = TargetKey::from_window(client_two.clone(), &resolved_window());
-    let first_target = controller.targets.get(&first_key).await.unwrap();
-    let second_target = controller.targets.get(&second_key).await.unwrap();
-    assert!(Arc::ptr_eq(
-        &first_target.mutation_lock,
-        &second_target.mutation_lock
-    ));
-
     assert_eq!(controller.close_connection(&client_one).await.unwrap(), 1);
     assert_eq!(controller.targets.len().await, 1);
     assert_eq!(platform.shutdowns.load(Ordering::SeqCst), 1);
@@ -1792,10 +1864,7 @@ async fn coherent_observation_accepts_refreshed_geometry_without_relaxing_identi
 #[tokio::test]
 async fn target_registry_tears_down_idle_and_superseded_generations_exactly() {
     let platform = FakePlatform::default();
-    let registry = TargetControllerRegistry::new(
-        Arc::new(ProcessMutationLockRegistry::default()),
-        Duration::ZERO,
-    );
+    let registry = TargetControllerRegistry::new(Duration::ZERO);
     let client = id("registry-client", ClientId::parse);
     let generation_one = resolved_window();
     registry
@@ -1818,7 +1887,7 @@ async fn target_registry_tears_down_idle_and_superseded_generations_exactly() {
         .await
         .unwrap();
     let mut generation_two = generation_one;
-    generation_two.generation = WindowGeneration(2);
+    generation_two.public.generation = WindowGeneration(2);
     registry
         .get_or_create(
             &platform,
@@ -1834,10 +1903,7 @@ async fn target_registry_tears_down_idle_and_superseded_generations_exactly() {
 #[tokio::test]
 async fn native_event_source_lag_tears_down_every_cached_target() {
     let platform = FakePlatform::default();
-    let registry = TargetControllerRegistry::new(
-        Arc::new(ProcessMutationLockRegistry::default()),
-        Duration::from_secs(60),
-    );
+    let registry = TargetControllerRegistry::new(Duration::from_secs(60));
     let first = resolved_window();
     registry
         .get_or_create(
@@ -1882,6 +1948,7 @@ fn interaction_scope_release_is_idempotent_and_accumulates_teardown_evidence() {
         Route::TargetedPointer,
         test_mutation_deadline(),
         ScopeRequirements::for_route(Route::TargetedPointer),
+        DispatchScopeKind::Process,
         (),
     )
     .into_scope(
@@ -2001,6 +2068,127 @@ async fn dispatch_failure_remains_primary_and_keeps_every_cleanup_failure() {
         .expect("failed scope teardown removes the target");
     assert_eq!(missing.code, ErrorCode::ObservationStale);
     assert_eq!(platform.shutdowns.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn different_process_mutations_progress_while_one_dispatch_is_blocked() {
+    let platform = Arc::new(FakePlatform::default());
+    let controller = Arc::new(DriverController::new(
+        Arc::clone(&platform),
+        PlatformName::Macos,
+        "test-os",
+    ));
+    let client = id("disjoint-process-client", ClientId::parse);
+    let first_window = window_ref();
+    let second_window = alternate_window("window-2", "app-2", 84, "process-84").public;
+    let first_state = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: first_window.clone(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    let second_state = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: second_window.clone(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+
+    *platform.blocked_dispatch_process.lock().unwrap() = Some("process-42".to_owned());
+    platform.block_dispatch.store(true, Ordering::SeqCst);
+    let dispatch_entered = platform.dispatch_entered.notified();
+    let first = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let client = client.clone();
+        let command = point_click_command(first_window, &first_state);
+        async move { controller.click(&client, command).await }
+    });
+    dispatch_entered.await;
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        controller.click(&client, point_click_command(second_window, &second_state)),
+    )
+    .await
+    .expect("a different process must not wait behind the blocked dispatch")
+    .unwrap();
+    assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 2);
+
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn process_guard_remains_held_through_settlement() {
+    let platform = Arc::new(FakePlatform::default());
+    let controller = Arc::new(DriverController::new(
+        Arc::clone(&platform),
+        PlatformName::Macos,
+        "test-os",
+    ));
+    let client = id("settlement-guard-client", ClientId::parse);
+    let first_window = window_ref();
+    let same_process_window = alternate_window("window-3", "app-1", 42, "process-42").public;
+    let first_state = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: first_window.clone(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    let second_state = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: same_process_window.clone(),
+                include_text: true,
+                include_screenshots: true,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+
+    platform.block_settle.store(true, Ordering::SeqCst);
+    let settle_entered = platform.settle_entered.notified();
+    let first = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let client = client.clone();
+        let command = point_click_command(first_window, &first_state);
+        async move { controller.click(&client, command).await }
+    });
+    settle_entered.await;
+
+    let conflict = controller
+        .click(
+            &client,
+            point_click_command(same_process_window, &second_state),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code, ErrorCode::TargetBusy);
+    assert_eq!(conflict.details["native_side_effect_started"], false);
+    assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 1);
+
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]

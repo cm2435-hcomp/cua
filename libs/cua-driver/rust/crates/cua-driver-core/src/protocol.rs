@@ -60,7 +60,7 @@ pub struct V2ProtocolVersion {
     pub minor: u16,
 }
 
-pub const V2_PROTOCOL_VERSION: V2ProtocolVersion = V2ProtocolVersion { major: 2, minor: 0 };
+pub const V2_PROTOCOL_VERSION: V2ProtocolVersion = V2ProtocolVersion { major: 2, minor: 1 };
 
 /// Canonical native method inventory. Keep this list as the single schema
 /// comparison boundary for the Rust daemon and typed clients.
@@ -136,25 +136,6 @@ impl V2Command {
             Self::SelectText(_) => "driver.v2.select_text",
             Self::PerformSecondaryAction(_) => "driver.v2.perform_secondary_action",
         }
-    }
-
-    /// Returns whether dispatch may change externally visible application
-    /// state. These requests share one connection-wide lane so launch and
-    /// action ordering stays deterministic while discovery and observation
-    /// requests remain free to overlap.
-    pub fn requires_serial_dispatch(&self) -> bool {
-        matches!(
-            self,
-            Self::LaunchApp(_)
-                | Self::Click(_)
-                | Self::Drag(_)
-                | Self::Scroll(_)
-                | Self::PressKey(_)
-                | Self::TypeText(_)
-                | Self::SetValue(_)
-                | Self::SelectText(_)
-                | Self::PerformSecondaryAction(_)
-        )
     }
 }
 

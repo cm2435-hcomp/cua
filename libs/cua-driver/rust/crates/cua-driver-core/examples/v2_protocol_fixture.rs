@@ -240,6 +240,7 @@ fn fixture_window() -> anyhow::Result<WindowRef> {
             pid: Some(42),
             running: true,
         },
+        generation: cua_driver_core::api::WindowGeneration(1),
         title: Some("Fixture window".to_owned()),
         usable: true,
         is_standard: Some(true),

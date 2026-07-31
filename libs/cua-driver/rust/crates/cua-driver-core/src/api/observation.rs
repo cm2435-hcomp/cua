@@ -73,7 +73,6 @@ pub struct ResolvedWindow {
     pub process: NativeProcessHandle,
     pub framework: Framework,
     pub geometry: WindowGeometry,
-    pub generation: WindowGeneration,
     pub state: WindowStateKind,
 }
 
@@ -82,7 +81,7 @@ impl ResolvedWindow {
         ResolvedWindowStamp {
             app_id: self.public.app.id.clone(),
             window_id: self.public.id.clone(),
-            generation: self.generation,
+            generation: self.public.generation,
             geometry_revision: self.geometry.revision.clone(),
             native_window: self.native.clone(),
             process: self.process.clone(),
@@ -824,7 +823,7 @@ fn ensure_window_stamp(
 ) -> Result<(), NativeError> {
     if stamp.app_id != window.public.app.id
         || stamp.window_id != window.public.id
-        || stamp.generation != window.generation
+        || stamp.generation != window.public.generation
         || stamp.native_window != window.native
         || stamp.process != window.process
     {
@@ -1136,6 +1135,7 @@ mod store_tests {
                 pid: Some(100),
                 running: true,
             },
+            generation: WindowGeneration(1),
             title: Some("Fixture".to_owned()),
             usable: true,
             is_standard: Some(true),
@@ -1157,7 +1157,6 @@ mod store_tests {
                 scale_factor: 2.0,
                 revision: GeometryRevision::parse("geometry-1").unwrap(),
             },
-            generation: WindowGeneration(1),
             state: WindowStateKind::Visible,
         }
     }
@@ -1334,6 +1333,7 @@ mod store_tests {
         let related_window = WindowRef {
             id: related.window_id.clone(),
             app: target.public.app.clone(),
+            generation: related.generation,
             title: Some("Popover".to_owned()),
             usable: false,
             is_standard: Some(false),

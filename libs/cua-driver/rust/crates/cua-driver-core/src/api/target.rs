@@ -1,10 +1,10 @@
-//! Long-lived per-client/window target ownership and process mutation locks.
+//! Long-lived per-client/window target ownership and controller state.
 
 use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, Weak,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -38,12 +38,10 @@ impl TargetKey {
             client_id,
             app_id: window.public.app.id.clone(),
             window_id: window.public.id.clone(),
-            window_generation: window.generation,
+            window_generation: window.public.generation,
         }
     }
 }
-
-pub type SharedProcessMutationLock = Arc<AsyncMutex<()>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TargetValidityHandle(Arc<AtomicBool>);
@@ -59,23 +57,6 @@ impl TargetValidityHandle {
 
     fn is_valid(&self) -> bool {
         self.0.load(Ordering::Acquire)
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct ProcessMutationLockRegistry {
-    locks: Mutex<HashMap<NativeProcessHandle, Weak<AsyncMutex<()>>>>,
-}
-
-impl ProcessMutationLockRegistry {
-    pub fn lock_for(&self, process: &NativeProcessHandle) -> SharedProcessMutationLock {
-        let mut locks = self.locks.lock().expect("process lock registry poisoned");
-        if let Some(lock) = locks.get(process).and_then(Weak::upgrade) {
-            return lock;
-        }
-        let lock = Arc::new(AsyncMutex::new(()));
-        locks.insert(process.clone(), Arc::downgrade(&lock));
-        lock
     }
 }
 
@@ -96,7 +77,6 @@ pub struct TargetController<P: PlatformDriver> {
     pub instance_id: String,
     pub key: TargetKey,
     pub process: NativeProcessHandle,
-    pub mutation_lock: SharedProcessMutationLock,
     pub state: AsyncMutex<TargetControllerState<P>>,
     last_used: Mutex<Instant>,
     validity: TargetValidityHandle,
@@ -109,13 +89,11 @@ impl<P: PlatformDriver> TargetController<P> {
         window: ResolvedWindow,
         platform: P::TargetState,
         focus: P::TargetFocusCoordinator,
-        mutation_lock: SharedProcessMutationLock,
     ) -> Self {
         Self {
             instance_id: Uuid::new_v4().to_string(),
             key,
             process: window.process.clone(),
-            mutation_lock,
             state: AsyncMutex::new(TargetControllerState {
                 window,
                 platform,
@@ -187,15 +165,13 @@ impl<P: PlatformDriver> TargetController<P> {
 
 pub struct TargetControllerRegistry<P: PlatformDriver> {
     targets: AsyncMutex<HashMap<TargetKey, Arc<TargetController<P>>>>,
-    process_locks: Arc<ProcessMutationLockRegistry>,
     idle_ttl: Duration,
 }
 
 impl<P: PlatformDriver> TargetControllerRegistry<P> {
-    pub fn new(process_locks: Arc<ProcessMutationLockRegistry>, idle_ttl: Duration) -> Self {
+    pub fn new(idle_ttl: Duration) -> Self {
         Self {
             targets: AsyncMutex::new(HashMap::new()),
-            process_locks,
             idle_ttl,
         }
     }
@@ -229,7 +205,6 @@ impl<P: PlatformDriver> TargetControllerRegistry<P> {
         // Native creation/teardown never runs while the registry mutex is
         // held. A racing creator is resolved by discarding this extra state.
         let (mut target_state, mut focus) = platform.create_target_state(&window).await?;
-        let mutation_lock = self.process_locks.lock_for(&window.process);
         let mut targets = self.targets.lock().await;
         if let Some(target) = targets.get(&key).cloned() {
             drop(targets);
@@ -245,7 +220,6 @@ impl<P: PlatformDriver> TargetControllerRegistry<P> {
             window,
             target_state,
             focus,
-            mutation_lock,
         ));
         targets.insert(key, Arc::clone(&target));
         Ok(target)

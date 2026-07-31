@@ -535,6 +535,7 @@ mod tests {
         let public = cua_driver_core::api::contracts::WindowRef {
             id: cua_driver_core::api::contracts::WindowId::parse("window").unwrap(),
             app,
+            generation: WindowGeneration(1),
             title: None,
             usable: true,
             is_standard: Some(true),
@@ -556,7 +557,6 @@ mod tests {
                 scale_factor: 1.0,
                 revision: GeometryRevision::parse("geometry").unwrap(),
             },
-            generation: WindowGeneration(1),
             state: cua_driver_core::api::capabilities::WindowStateKind::Visible,
         };
         ResolvedAction::PointClick {

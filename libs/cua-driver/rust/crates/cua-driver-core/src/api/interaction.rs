@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use super::{
     contracts::{ActionId, ObservationId, Point, Route},
+    dispatch::DispatchScopeKind,
     errors::NativeError,
     menu::MenuMutationIntent,
     observation::{InvalidationReason, ObservationStore, ResolvedWindow, ResolvedWindowStamp},
@@ -186,6 +187,7 @@ pub struct ScopePlan<NativePlan> {
     pub route: Route,
     pub deadline: MutationDeadline,
     pub requirements: ScopeRequirements,
+    pub dispatch_scope: DispatchScopeKind,
     pub menu_intent: Option<MenuMutationIntent>,
     pub native: NativePlan,
 }
@@ -197,6 +199,7 @@ impl<NativePlan> ScopePlan<NativePlan> {
         route: Route,
         deadline: MutationDeadline,
         requirements: ScopeRequirements,
+        dispatch_scope: DispatchScopeKind,
         native: NativePlan,
     ) -> Self {
         Self {
@@ -205,6 +208,7 @@ impl<NativePlan> ScopePlan<NativePlan> {
             route,
             deadline,
             requirements,
+            dispatch_scope,
             menu_intent: None,
             native,
         }

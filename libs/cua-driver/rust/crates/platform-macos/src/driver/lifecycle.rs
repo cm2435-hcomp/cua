@@ -989,6 +989,7 @@ mod tests {
                 pid: Some(120),
                 running: true,
             },
+            generation: cua_driver_core::api::contracts::WindowGeneration(1),
             title: None,
             usable: true,
             is_standard: Some(true),

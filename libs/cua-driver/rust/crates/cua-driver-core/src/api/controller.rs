@@ -20,6 +20,7 @@ use super::{
         ScrollCommand, ScrollRequest, SecondaryActionCommand, SelectTextCommand, SetValueCommand,
         TypeTextCommand, VerificationLevel, WindowRef, WindowState,
     },
+    dispatch::{DispatchGuardRegistry, DispatchScope},
     errors::{ErrorCode, ErrorPhase, NativeError, PartialEvidence, PartialNativeDispatch},
     interaction::{
         MutationDeadline, NativeEvidence, NativeSideEffectBoundary, ScopePlan, ScopeRequirements,
@@ -38,13 +39,10 @@ use super::{
         PendingSettlementEvidence, SettlementAttempt, SettlementEvidence, SettlementProfile,
         SettlementSignal,
     },
-    target::{
-        ProcessMutationLockRegistry, TargetControllerRegistry, TargetControllerState, TargetKey,
-    },
+    target::{TargetControllerRegistry, TargetControllerState, TargetKey},
 };
 
 const DEFAULT_TARGET_IDLE_TTL: Duration = Duration::from_secs(300);
-const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_MUTATION_WORK_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MUTATION_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -60,7 +58,7 @@ pub struct DriverController<P: PlatformDriver> {
     os_version: String,
     capabilities: RwLock<CapabilityRegistry>,
     pub targets: Arc<TargetControllerRegistry<P>>,
-    lock_timeout: Duration,
+    dispatch_guards: DispatchGuardRegistry,
     mutation_work_timeout: Duration,
     mutation_teardown_timeout: Duration,
 }
@@ -71,7 +69,6 @@ impl<P: PlatformDriver> DriverController<P> {
         platform_name: PlatformName,
         os_version: impl Into<String>,
     ) -> Self {
-        let process_locks = Arc::new(ProcessMutationLockRegistry::default());
         let os_version = os_version.into();
         let capabilities = CapabilityRegistry::from_cells(platform.capability_cells(&os_version));
         Self {
@@ -79,11 +76,8 @@ impl<P: PlatformDriver> DriverController<P> {
             platform_name,
             os_version,
             capabilities: RwLock::new(capabilities),
-            targets: Arc::new(TargetControllerRegistry::new(
-                process_locks,
-                DEFAULT_TARGET_IDLE_TTL,
-            )),
-            lock_timeout: DEFAULT_LOCK_TIMEOUT,
+            targets: Arc::new(TargetControllerRegistry::new(DEFAULT_TARGET_IDLE_TTL)),
+            dispatch_guards: DispatchGuardRegistry::default(),
             mutation_work_timeout: DEFAULT_MUTATION_WORK_TIMEOUT,
             mutation_teardown_timeout: DEFAULT_MUTATION_TEARDOWN_TIMEOUT,
         }
@@ -136,6 +130,7 @@ impl<P: PlatformDriver> DriverController<P> {
     pub async fn launch_app(&self, request: LaunchAppRequest) -> Result<LaunchResult, NativeError> {
         request.validate().map_err(NativeError::invalid)?;
         let action_id = ActionId::new();
+        let _dispatch_permit = self.dispatch_guards.try_acquire(DispatchScope::Desktop)?;
         let mut launch_scope = LaunchScope::for_action(action_id.clone());
         let launch = match self
             .platform
@@ -204,14 +199,14 @@ impl<P: PlatformDriver> DriverController<P> {
             operation = "get_window_state",
             "v2 target controller acquired"
         );
-        let _process_guard = tokio::time::timeout(
-            self.lock_timeout,
-            Arc::clone(&target.mutation_lock).lock_owned(),
-        )
-        .await
-        .map_err(|_| target_busy(&resolved))?;
+        let _dispatch_permit = self
+            .dispatch_guards
+            .try_acquire(DispatchScope::Process(resolved.process.clone()))?;
         target.ensure_valid()?;
-        let mut state = target.state.lock().await;
+        let mut state = target
+            .state
+            .try_lock()
+            .map_err(|_| target_busy(&resolved))?;
         ensure_target_window_matches(&state.window, &resolved)?;
         let settlement = self.settle_if_dirty(&mut state, true, None).await?;
         let mut native = self
@@ -552,14 +547,11 @@ impl<P: PlatformDriver> DriverController<P> {
         ensure_public_window_matches(&public_window, &resolved)?;
         let key = TargetKey::from_window(client_id.clone(), &resolved);
         let target = self.targets.get(&key).await?;
-        let _process_guard = tokio::time::timeout(
-            self.lock_timeout,
-            Arc::clone(&target.mutation_lock).lock_owned(),
-        )
-        .await
-        .map_err(|_| target_busy(&resolved))?;
         target.ensure_valid()?;
-        let mut state = target.state.lock().await;
+        let mut state = target
+            .state
+            .try_lock()
+            .map_err(|_| target_busy(&resolved))?;
         ensure_target_window_matches(&state.window, &resolved)?;
         let settlement = state
             .settlement
@@ -732,14 +724,11 @@ impl<P: PlatformDriver> DriverController<P> {
         ensure_public_window_matches(&public_window, &resolved)?;
         let key = TargetKey::from_window(client_id.clone(), &resolved);
         let target = self.targets.get(&key).await?;
-        let _process_guard = tokio::time::timeout(
-            self.lock_timeout,
-            Arc::clone(&target.mutation_lock).lock_owned(),
-        )
-        .await
-        .map_err(|_| target_busy(&resolved))?;
         target.ensure_valid()?;
-        let mut state = target.state.lock().await;
+        let mut state = target
+            .state
+            .try_lock()
+            .map_err(|_| target_busy(&resolved))?;
         ensure_target_window_matches(&state.window, &resolved)?;
         if state.settlement.settled_evidence().is_none() {
             let mut error = NativeError::new(
@@ -985,6 +974,20 @@ impl<P: PlatformDriver> DriverController<P> {
             }
             return Err(error);
         }
+        let dispatch_scope = DispatchScope::materialize(
+            scope_plan.dispatch_scope,
+            key.clone(),
+            resolved.process.clone(),
+        );
+        let _dispatch_permit = match self.dispatch_guards.try_acquire(dispatch_scope) {
+            Ok(permit) => permit,
+            Err(error) => {
+                if menu_intent.is_some() {
+                    state.menu.abort_transition(&action_id)?;
+                }
+                return Err(error);
+            }
+        };
         if let Some(intent) = menu_intent.clone() {
             tracing::debug!(
                 target_instance_id = %target.instance_id,
@@ -1743,7 +1746,10 @@ fn ensure_public_window_matches(
     requested: &WindowRef,
     resolved: &ResolvedWindow,
 ) -> Result<(), NativeError> {
-    if requested.id != resolved.public.id || requested.app.id != resolved.public.app.id {
+    if requested.id != resolved.public.id
+        || requested.app.id != resolved.public.app.id
+        || requested.generation != resolved.public.generation
+    {
         return Err(NativeError::stale(
             ErrorCode::WindowIdentityChanged,
             "resolved window does not match the supplied app/window identity",
@@ -1759,7 +1765,7 @@ fn ensure_target_window_matches(
 ) -> Result<(), NativeError> {
     if target.public.id != resolved.public.id
         || target.public.app.id != resolved.public.app.id
-        || target.generation != resolved.generation
+        || target.public.generation != resolved.public.generation
         || target.process != resolved.process
         || target.native != resolved.native
     {
@@ -1973,8 +1979,10 @@ fn target_busy(window: &ResolvedWindow) -> NativeError {
         ErrorCode::TargetBusy,
         ErrorPhase::Preflight,
         true,
-        "timed out acquiring the bounded process mutation lock",
+        "the exact target controller is already handling another request",
     )
+    .with_detail("native_side_effect_started", false)
+    .with_detail("requested_scope", "target_state")
     .with_detail("window_id", window.public.id.to_string())
     .with_detail("app_id", window.public.app.id.to_string())
 }

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinSet};
 use tracing::{debug, error, warn};
 
@@ -190,7 +190,6 @@ where
     let (response_tx, response_rx) = mpsc::channel(V2_RESPONSE_QUEUE_CAPACITY);
     let mut writer_task = tokio::spawn(write_v2_responses(output, response_rx));
     let mut dispatch_tasks = JoinSet::new();
-    let effectful_dispatch = Arc::new(Semaphore::new(1));
 
     let handshake_line = match read_v2_line(&mut reader).await {
         Ok(Some(line)) => line,
@@ -306,37 +305,11 @@ where
                     }
                     continue;
                 }
-                let effectful_permit = if request.command.requires_serial_dispatch() {
-                    match Arc::clone(&effectful_dispatch).try_acquire_owned() {
-                        Ok(permit) => Some(permit),
-                        Err(_) => {
-                            let busy = NativeError::new(
-                                ErrorCode::TargetBusy,
-                                ErrorPhase::Preflight,
-                                true,
-                                "another launch or mutation is already active on this v2 connection",
-                            )
-                            .with_detail("method", method);
-                            if let Err(write_error) =
-                                queue_v2_failure(&response_tx, request_id, busy).await
-                            {
-                                serve_result = Err(write_error);
-                                break;
-                            }
-                            continue;
-                        }
-                    }
-                } else {
-                    None
-                };
                 debug!(request_id, method, client_id = %client_id, "v2 request started");
                 let task_controller = Arc::clone(controller);
                 let task_client_id = client_id.clone();
                 let task_response_tx = response_tx.clone();
                 dispatch_tasks.spawn(async move {
-                    // The owned permit covers the complete native dispatch and
-                    // is dropped only after its typed result is constructed.
-                    let _effectful_permit = effectful_permit;
                     let result =
                         dispatch_v2(&task_controller, &task_client_id, request.command).await;
                     match result {
@@ -671,8 +644,8 @@ mod v2_tests {
     #[test]
     fn handshake_accepts_only_a_range_containing_the_native_version() {
         assert!(validate_handshake_range(&handshake(
-            V2ProtocolVersion { major: 2, minor: 0 },
-            V2ProtocolVersion { major: 2, minor: 0 },
+            V2ProtocolVersion { major: 2, minor: 1 },
+            V2ProtocolVersion { major: 2, minor: 1 },
         ))
         .is_ok());
 
@@ -686,8 +659,8 @@ mod v2_tests {
                 V2ProtocolVersion { major: 1, minor: 9 },
             ),
             handshake(
+                V2ProtocolVersion { major: 2, minor: 2 },
                 V2ProtocolVersion { major: 2, minor: 1 },
-                V2ProtocolVersion { major: 2, minor: 0 },
             ),
         ] {
             let error = validate_handshake_range(&request).expect_err("incompatible range");

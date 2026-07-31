@@ -11,6 +11,7 @@ use std::{
 use async_trait::async_trait;
 use cua_driver_core::api::{
     contracts::{ActionId, Route},
+    dispatch::DispatchScopeKind,
     errors::{ErrorCode, NativeError},
     interaction::{
         InteractionScope, LeaseDecision, LeaseTeardownStatus, MutationDeadline, NativeEvidence,
@@ -211,6 +212,7 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
             route,
             deadline,
             requirements,
+            DispatchScopeKind::Process,
             MacNativeScopePlan {
                 facts,
                 host: self.host.clone(),
@@ -703,6 +705,7 @@ mod tests {
         let public = WindowRef {
             id: WindowId::parse("window").unwrap(),
             app,
+            generation: WindowGeneration(1),
             title: None,
             usable: true,
             is_standard: Some(true),
@@ -724,7 +727,6 @@ mod tests {
                 scale_factor: 2.0,
                 revision: GeometryRevision::parse("geometry").unwrap(),
             },
-            generation: WindowGeneration(1),
             state: WindowStateKind::Visible,
         };
         let facts = MacWindowFacts {
@@ -749,6 +751,7 @@ mod tests {
             Route::TargetedPointer,
             test_deadline(),
             ScopeRequirements::for_route(Route::TargetedPointer),
+            DispatchScopeKind::Process,
             MacNativeScopePlan {
                 facts,
                 host: HostRecipeContext {
