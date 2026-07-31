@@ -114,6 +114,7 @@ impl PlatformDriver for MacDriver {
         target: &mut Self::TargetState,
         focus: &mut Self::TargetFocusCoordinator,
     ) -> Result<(), NativeError> {
+        self.windows.clear_menu_parent(&target.window);
         target.invalidate();
         focus.shutdown().await
     }

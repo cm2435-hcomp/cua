@@ -11,6 +11,7 @@ use cua_driver_core::api::{
         AppId, AppRef, GeometryRevision, Point, Rect, WindowGeneration, WindowId, WindowRef,
     },
     errors::{ErrorCode, ErrorPhase, NativeError},
+    menu::NativeMenuIdentity,
     observation::{
         NativeProcessHandle, NativeWindowHandle, ResolvedWindow, ResolvedWindowStamp,
         WindowGeometry,
@@ -24,7 +25,7 @@ use crate::{
     permissions, windows,
 };
 
-use super::target::MacInvalidationHub;
+use super::{observation::native_ax_element_is_live, target::MacInvalidationHub};
 
 const MAX_WINDOW_TOMBSTONES: usize = 512;
 
@@ -330,6 +331,14 @@ struct RegistryEntry {
     snapshot: NativeWindowSnapshot,
 }
 
+#[derive(Debug, Clone)]
+struct MenuParentPin {
+    owner: ResolvedWindowStamp,
+    identity: NativeMenuIdentity,
+    menu_window_id: u32,
+    menu_element: RetainedAxWindow,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum WindowTombstone {
     Missing,
@@ -358,6 +367,7 @@ struct RegistryState {
     by_native: HashMap<NativeWindowKey, WindowId>,
     related_by_id: HashMap<WindowId, RelatedRegistryEntry>,
     related_by_native: HashMap<NativeWindowKey, WindowId>,
+    menu_pins: HashMap<WindowId, MenuParentPin>,
     tombstones: HashMap<WindowId, WindowTombstone>,
     tombstone_order: VecDeque<WindowId>,
 }
@@ -421,10 +431,32 @@ impl MacWindowRegistry {
 
     fn refresh(&self, pid_scope: Option<i32>) -> Result<(), NativeError> {
         let snapshots = self.source.snapshot(pid_scope)?;
+        let cached_pins: Vec<_> = {
+            let state = self
+                .state
+                .lock()
+                .expect("macOS window registry lock poisoned");
+            state
+                .menu_pins
+                .iter()
+                .filter_map(|(id, pin)| {
+                    state
+                        .by_id
+                        .get(id)
+                        .cloned()
+                        .map(|entry| (id.clone(), pin.clone(), entry))
+                })
+                .collect()
+        };
+        let live_menu_pins: HashSet<_> = cached_pins
+            .into_iter()
+            .filter_map(|(id, pin, entry)| menu_parent_pin_is_live(&pin, &entry).then_some(id))
+            .collect();
         let mut state = self
             .state
             .lock()
             .expect("macOS window registry lock poisoned");
+        state.menu_pins.retain(|id, _| live_menu_pins.contains(id));
         let current_keys: HashSet<_> = snapshots
             .iter()
             .map(|snapshot| snapshot.key.clone())
@@ -434,13 +466,20 @@ impl MacWindowRegistry {
             .by_native
             .keys()
             .filter(|key| {
-                pid_scope.is_none_or(|pid| key.pid == pid) && !current_keys.contains(*key)
+                let pinned = state
+                    .by_native
+                    .get(*key)
+                    .is_some_and(|id| live_menu_pins.contains(id));
+                pid_scope.is_none_or(|pid| key.pid == pid)
+                    && !current_keys.contains(*key)
+                    && !pinned
             })
             .cloned()
             .collect();
         for key in missing {
             if let Some(id) = state.by_native.remove(&key) {
                 if let Some(entry) = state.by_id.remove(&id) {
+                    state.menu_pins.remove(&id);
                     self.invalidations
                         .publish(TargetInvalidation::WindowGenerationChanged {
                             app_id: entry.public.app.id.clone(),
@@ -479,6 +518,7 @@ impl MacWindowRegistry {
                 }
                 state.by_native.remove(&snapshot.key);
                 if let Some(entry) = state.by_id.remove(&existing_id) {
+                    state.menu_pins.remove(&existing_id);
                     self.invalidations
                         .publish(TargetInvalidation::WindowGenerationChanged {
                             app_id: entry.public.app.id.clone(),
@@ -643,6 +683,108 @@ impl MacWindowRegistry {
                 ));
             }
             Ok(facts_for_entry(&entry))
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub(crate) fn pin_menu_parent(
+        &self,
+        owner: &ResolvedWindowStamp,
+        identity: NativeMenuIdentity,
+        menu_window_id: u32,
+        menu_element: AXUIElementRef,
+    ) -> Result<(), NativeError> {
+        let role = unsafe { bindings::copy_string_attr_exact(menu_element, "AXRole") }.map_err(
+            |error| {
+                NativeError::stale(
+                    ErrorCode::MenuStateStale,
+                    format!("native menu role could not be retained: AX error {error}"),
+                )
+            },
+        )?;
+        if role.as_deref() != Some("AXMenu") {
+            return Err(NativeError::stale(
+                ErrorCode::MenuStateStale,
+                "native menu pin requires an exact AXMenu element",
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .expect("macOS window registry lock poisoned");
+        let entry = state.by_id.get(&owner.window_id).ok_or_else(|| {
+            NativeError::stale(
+                ErrorCode::WindowNotFound,
+                "menu owner is no longer registered",
+            )
+        })?;
+        if entry.public.app.id != owner.app_id
+            || entry.public.generation != owner.generation
+            || entry.geometry_revision != owner.geometry_revision
+            || entry.native != owner.native_window
+            || entry.process != owner.process
+        {
+            return Err(identity_error(
+                entry,
+                "menu owner stamp changed before the native menu pin was recorded",
+            ));
+        }
+        let pin = MenuParentPin {
+            owner: owner.clone(),
+            identity,
+            menu_window_id,
+            menu_element: unsafe { RetainedAxWindow::from_borrowed(menu_element) },
+        };
+        state.menu_pins.insert(owner.window_id.clone(), pin);
+        Ok(())
+    }
+
+    pub(crate) fn clear_menu_parent(&self, owner: &ResolvedWindowStamp) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("macOS window registry lock poisoned");
+        if state
+            .menu_pins
+            .get(&owner.window_id)
+            .is_some_and(|pin| pin.owner == *owner)
+        {
+            state.menu_pins.remove(&owner.window_id);
+        }
+    }
+
+    pub(crate) async fn menu_identity_is_live(
+        &self,
+        owner: &ResolvedWindowStamp,
+        identity: &NativeMenuIdentity,
+    ) -> Result<bool, NativeError> {
+        let registry = self.clone();
+        let owner = owner.clone();
+        let identity = identity.clone();
+        tokio::task::spawn_blocking(move || {
+            let candidate = {
+                let state = registry
+                    .state
+                    .lock()
+                    .expect("macOS window registry lock poisoned");
+                state
+                    .menu_pins
+                    .get(&owner.window_id)
+                    .cloned()
+                    .zip(state.by_id.get(&owner.window_id).cloned())
+            };
+            let Some((pin, entry)) = candidate else {
+                return Ok(false);
+            };
+            if pin.owner != owner || pin.identity != identity {
+                return Ok(false);
+            }
+            let live = menu_parent_pin_is_live(&pin, &entry);
+            if !live {
+                registry.clear_menu_parent(&owner);
+            }
+            Ok(live)
         })
         .await
         .map_err(join_error)?
@@ -959,6 +1101,64 @@ fn same_stable_stamp(left: &ResolvedWindowStamp, right: &ResolvedWindowStamp) ->
         && left.generation == right.generation
         && left.native_window == right.native_window
         && left.process == right.process
+}
+
+fn menu_parent_pin_is_live(pin: &MenuParentPin, entry: &RegistryEntry) -> bool {
+    if pin.owner.app_id != entry.public.app.id
+        || pin.owner.window_id != entry.public.id
+        || pin.owner.generation != entry.public.generation
+        || pin.owner.geometry_revision != entry.geometry_revision
+        || pin.owner.native_window != entry.native
+        || pin.owner.process != entry.process
+        || pin.identity.process != entry.process
+    {
+        return false;
+    }
+    let menu_role =
+        unsafe { bindings::copy_string_attr_exact(pin.menu_element.as_ptr(), "AXRole") };
+    if !matches!(menu_role, Ok(Some(role)) if role == "AXMenu") {
+        return false;
+    }
+    let menu_pid = unsafe { bindings::element_pid(pin.menu_element.as_ptr()) };
+    if menu_pid != Ok(entry.key.pid) {
+        return false;
+    }
+    if !native_ax_element_is_live(entry.key.pid, pin.menu_element.as_ptr()) {
+        return false;
+    }
+    let menu_window_id = unsafe { bindings::ax_get_window_id(pin.menu_element.as_ptr()) };
+    if menu_window_id.is_some_and(|window_id| window_id != pin.menu_window_id) {
+        return false;
+    }
+    if unsafe { bindings::ax_get_window_id(entry.snapshot.ax_identity.as_ptr()) }
+        != Some(entry.key.cg_window_id)
+    {
+        return false;
+    }
+    let process_generation = nsworkspace::running_applications()
+        .into_iter()
+        .find(|application| application.pid == entry.key.pid)
+        .and_then(|application| application.process_generation);
+    if process_generation != Some(entry.key.process_generation) {
+        return false;
+    }
+    let matching_windows: Vec<_> = windows::all_windows()
+        .into_iter()
+        .filter(|window| window.pid == entry.key.pid && window.window_id == entry.key.cg_window_id)
+        .collect();
+    if matching_windows.len() != 1 {
+        return false;
+    }
+    let window = &matching_windows[0];
+    let bounds = Rect {
+        x: window.bounds.x,
+        y: window.bounds.y,
+        width: window.bounds.width,
+        height: window.bounds.height,
+    };
+    bounds == entry.snapshot.bounds
+        && window.layer == entry.snapshot.layer
+        && windows::display_scale_for_bounds(&window.bounds) == entry.snapshot.scale_factor
 }
 
 fn related_facts_for_entry(entry: &RelatedRegistryEntry) -> MacRelatedWindowFacts {

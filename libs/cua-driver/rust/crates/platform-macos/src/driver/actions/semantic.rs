@@ -799,9 +799,15 @@ impl MacSemanticActions {
         let Some((menu_window_id, menu_element)) = discovered else {
             return Ok(None);
         };
-        Ok(Some(
-            resolve_menu_identity(&self.windows, &parent, menu_window_id, &menu_element).await?,
-        ))
+        let identity =
+            resolve_menu_identity(&self.windows, &parent, menu_window_id, &menu_element).await?;
+        self.windows.pin_menu_parent(
+            &owner,
+            identity.clone(),
+            menu_window_id,
+            menu_element.as_ptr(),
+        )?;
+        Ok(Some(identity))
     }
 
     async fn revalidate_prepared(

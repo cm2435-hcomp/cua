@@ -1,6 +1,10 @@
 //! Exact focused-control preparation and background-only macOS keyboard routes.
 
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use cua_driver_core::api::{
@@ -11,6 +15,7 @@ use cua_driver_core::api::{
     contracts::{Route, VerificationLevel},
     errors::{ErrorCode, ErrorPhase, NativeError},
     interaction::{InteractionScope, LeaseDecision, NativeEvidence, NativeSideEffectBoundary},
+    menu::{MenuMutationIntent, NativeMenuEvidence},
     observation::ResolvedFocus,
     platform::{KeyboardActionProvider, NativeDispatch, ResolvedAction},
     settlement::SettlementSignal,
@@ -227,22 +232,32 @@ impl MacKeyboardActions {
                         FocusProof::IdentityOnly,
                     )
                     .await?;
-                    let sequence = prepare_chord_sequence(&chord)
-                        .map_err(|error| sequence_construction_error(error, boundary.started()))?;
                     let focus_write = focus_field_if_needed(&keyboard_target, boundary)?;
-                    let evidence = dispatch_sequence(
-                        self.poster.as_ref(),
-                        keyboard_target.application_pid,
-                        keyboard_target.dispatch_pid,
-                        &sequence,
-                        boundary,
-                        focus_write,
-                    )?;
-                    Ok(dispatch_unverified(
-                        "macos_targeted_key_chord",
-                        *keyboard_target,
-                        evidence,
-                    ))
+                    let evidence = {
+                        let sequence = prepare_chord_sequence(&chord).map_err(|error| {
+                            sequence_construction_error(error, boundary.started())
+                        })?;
+                        dispatch_sequence(
+                            self.poster.as_ref(),
+                            keyboard_target.application_pid,
+                            keyboard_target.dispatch_pid,
+                            &sequence,
+                            boundary,
+                            focus_write,
+                        )?
+                    };
+                    let mut dispatch =
+                        dispatch_unverified("macos_targeted_key_chord", *keyboard_target, evidence);
+                    self.reconcile_menu_dismissal(
+                        target,
+                        scope.owner.clone(),
+                        scope.action_id.clone(),
+                        scope.deadline.work,
+                        scope.menu_intent.clone(),
+                        &mut dispatch,
+                    )
+                    .await?;
+                    Ok(dispatch)
                 }
                 MacChordTarget::Application(keyboard_target) => {
                     self.final_application_validation(
@@ -252,21 +267,34 @@ impl MacKeyboardActions {
                         &keyboard_target,
                     )
                     .await?;
-                    let sequence = prepare_chord_sequence(&chord)
-                        .map_err(|error| sequence_construction_error(error, boundary.started()))?;
-                    let evidence = dispatch_sequence(
-                        self.poster.as_ref(),
-                        keyboard_target.application_pid,
-                        keyboard_target.application_pid,
-                        &sequence,
-                        boundary,
-                        false,
-                    )?;
-                    Ok(dispatch_unverified_application(
+                    let evidence = {
+                        let sequence = prepare_chord_sequence(&chord).map_err(|error| {
+                            sequence_construction_error(error, boundary.started())
+                        })?;
+                        dispatch_sequence(
+                            self.poster.as_ref(),
+                            keyboard_target.application_pid,
+                            keyboard_target.application_pid,
+                            &sequence,
+                            boundary,
+                            false,
+                        )?
+                    };
+                    let mut dispatch = dispatch_unverified_application(
                         "macos_targeted_application_key_chord",
                         keyboard_target,
                         evidence,
-                    ))
+                    );
+                    self.reconcile_menu_dismissal(
+                        target,
+                        scope.owner.clone(),
+                        scope.action_id.clone(),
+                        scope.deadline.work,
+                        scope.menu_intent.clone(),
+                        &mut dispatch,
+                    )
+                    .await?;
+                    Ok(dispatch)
                 }
             },
             PreparedKind::UnicodeInsertion {
@@ -411,6 +439,45 @@ impl MacKeyboardActions {
                     menu: None,
                 })
             }
+        }
+    }
+
+    async fn reconcile_menu_dismissal(
+        &self,
+        target: &mut MacTargetState,
+        owner: cua_driver_core::api::observation::ResolvedWindowStamp,
+        action_id: cua_driver_core::api::contracts::ActionId,
+        deadline: Instant,
+        menu_intent: Option<MenuMutationIntent>,
+        dispatch: &mut NativeDispatch,
+    ) -> Result<(), NativeError> {
+        let Some(MenuMutationIntent::Dismissing { menu_id, identity }) = menu_intent else {
+            return Ok(());
+        };
+        loop {
+            if !self
+                .windows
+                .menu_identity_is_live(&owner, &identity)
+                .await?
+            {
+                self.windows.clear_menu_parent(&owner);
+                target.signals.record(SettlementSignal::MenuDismissed);
+                dispatch.menu = Some(NativeMenuEvidence::Dismissed {
+                    menu_id,
+                    action_id,
+                    owner,
+                    identity,
+                });
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(NativeError::stale(
+                    ErrorCode::MenuStateStale,
+                    "targeted Escape posted but the exact native menu remained open through the action deadline",
+                )
+                .with_detail("native_side_effect_started", true));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 

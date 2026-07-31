@@ -1403,6 +1403,50 @@ pub(crate) fn discover_native_menu(
     Ok(Some((window_id, menu.element)))
 }
 
+pub(crate) fn native_ax_element_is_live(pid: i32, expected: AXUIElementRef) -> bool {
+    unsafe {
+        let application = AXUIElementCreateApplication(pid);
+        if application.is_null() {
+            return false;
+        }
+        let windows = copy_ax_windows(application);
+        let mut visited = HashSet::new();
+        let mut remaining = MAX_AX_ELEMENTS;
+        let live = windows.iter().copied().any(|window| {
+            ax_tree_contains_identity(window, expected, 0, &mut visited, &mut remaining)
+        });
+        for window in windows {
+            CFRelease(window as CFTypeRef);
+        }
+        CFRelease(application as CFTypeRef);
+        live
+    }
+}
+
+unsafe fn ax_tree_contains_identity(
+    element: AXUIElementRef,
+    expected: AXUIElementRef,
+    depth: usize,
+    visited: &mut HashSet<usize>,
+    remaining: &mut usize,
+) -> bool {
+    if depth > MAX_AX_DEPTH || *remaining == 0 || !visited.insert(element as usize) {
+        return false;
+    }
+    *remaining -= 1;
+    if CFEqual(element as CFTypeRef, expected as CFTypeRef) != 0 {
+        return true;
+    }
+    for child in copy_children(element) {
+        let found = ax_tree_contains_identity(child, expected, depth + 1, visited, remaining);
+        CFRelease(child as CFTypeRef);
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn walk_ax(
     element: AXUIElementRef,

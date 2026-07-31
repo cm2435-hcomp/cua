@@ -408,6 +408,12 @@ impl MacPointerActions {
                 let identity =
                     resolve_menu_identity(&self.windows, &parent, menu_window_id, &menu_element)
                         .await?;
+                self.windows.pin_menu_parent(
+                    &owner,
+                    identity.clone(),
+                    menu_window_id,
+                    menu_element.as_ptr(),
+                )?;
                 return Ok(NativeMenuEvidence::Opened {
                     menu_id,
                     opened_by_action_id: action_id,
@@ -436,14 +442,19 @@ impl MacPointerActions {
         prior_identity: NativeMenuIdentity,
     ) -> Result<NativeMenuEvidence, NativeError> {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Some(identity) = self.discover_menu_identity(owner.clone()).await? {
+        if self
+            .windows
+            .menu_identity_is_live(&owner, &prior_identity)
+            .await?
+        {
             return Ok(NativeMenuEvidence::Targeted {
                 menu_id,
                 action_id,
                 owner,
-                identity,
+                identity: prior_identity,
             });
         }
+        self.windows.clear_menu_parent(&owner);
         Ok(NativeMenuEvidence::Dismissed {
             menu_id,
             action_id,
@@ -461,7 +472,12 @@ impl MacPointerActions {
         prior_identity: NativeMenuIdentity,
     ) -> Result<NativeMenuEvidence, NativeError> {
         loop {
-            if self.discover_menu_identity(owner.clone()).await?.is_none() {
+            if !self
+                .windows
+                .menu_identity_is_live(&owner, &prior_identity)
+                .await?
+            {
+                self.windows.clear_menu_parent(&owner);
                 return Ok(NativeMenuEvidence::Dismissed {
                     menu_id,
                     action_id,
@@ -478,31 +494,6 @@ impl MacPointerActions {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-
-    async fn discover_menu_identity(
-        &self,
-        owner: ResolvedWindowStamp,
-    ) -> Result<Option<NativeMenuIdentity>, NativeError> {
-        let parent = self.windows.facts_for_stamp(&owner).await?;
-        let pid = parent.pid;
-        let window_id = parent.cg_window_id;
-        let discovered = tokio::task::spawn_blocking(move || discover_native_menu(pid, window_id))
-            .await
-            .map_err(|error| {
-                NativeError::new(
-                    ErrorCode::MenuStateStale,
-                    ErrorPhase::Dispatch,
-                    false,
-                    format!("native menu discovery task failed: {error}"),
-                )
-            })??;
-        let Some((menu_window_id, menu_element)) = discovered else {
-            return Ok(None);
-        };
-        Ok(Some(
-            resolve_menu_identity(&self.windows, &parent, menu_window_id, &menu_element).await?,
-        ))
     }
 
     async fn revalidate_sequence_target(
