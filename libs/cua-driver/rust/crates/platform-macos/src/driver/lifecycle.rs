@@ -990,6 +990,10 @@ mod tests {
                 running: true,
             },
             title: None,
+            usable: true,
+            is_standard: Some(true),
+            is_main: Some(true),
+            z_index: Some(1),
         }
     }
 

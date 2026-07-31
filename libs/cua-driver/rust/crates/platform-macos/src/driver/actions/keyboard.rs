@@ -58,7 +58,7 @@ pub struct MacPreparedKeyboardAction(PreparedKind);
 
 enum PreparedKind {
     Chord {
-        target: MacKeyboardEventTarget,
+        target: MacChordTarget,
         chord: NormalizedChord,
     },
     SemanticInsertion {
@@ -72,6 +72,19 @@ enum PreparedKind {
         text: String,
         expected: Option<ExpectedInsertion>,
     },
+}
+
+enum MacChordTarget {
+    Focused(Box<MacKeyboardEventTarget>),
+    Application(MacApplicationKeyboardTarget),
+}
+
+struct MacApplicationKeyboardTarget {
+    application_pid: i32,
+    cg_window_id: u32,
+    ax_revision: String,
+    observation_id: String,
+    signal_epoch: u64,
 }
 
 struct MacKeyboardEventTarget {
@@ -111,8 +124,15 @@ impl MacKeyboardActions {
                 // Repeated here after the no-lease InteractionProvider check so
                 // the retained plan never depends on mutable side state.
                 let chord = normalize_chord(stroke)?;
-                let (keyboard_target, _) =
-                    prepare_keyboard_target(target, focus, &facts, FocusProof::IdentityOnly)?;
+                let keyboard_target = if focus.focused_element.is_some() {
+                    let (target, _) =
+                        prepare_keyboard_target(target, focus, &facts, FocusProof::IdentityOnly)?;
+                    MacChordTarget::Focused(Box::new(target))
+                } else {
+                    MacChordTarget::Application(prepare_application_keyboard_target(
+                        target, focus, &facts,
+                    )?)
+                };
                 PreparedKind::Chord {
                     target: keyboard_target,
                     chord,
@@ -197,32 +217,58 @@ impl MacKeyboardActions {
             PreparedKind::Chord {
                 target: keyboard_target,
                 chord,
-            } => {
-                self.final_focus_validation(
-                    target,
-                    scope.owner.clone(),
-                    scope.window.stamp(),
-                    &keyboard_target,
-                    FocusProof::IdentityOnly,
-                )
-                .await?;
-                let focus_write = focus_field_if_needed(&keyboard_target, boundary)?;
-                let sequence = prepare_chord_sequence(&chord)
-                    .map_err(|error| sequence_construction_error(error, boundary.started()))?;
-                let evidence = dispatch_sequence(
-                    self.poster.as_ref(),
-                    keyboard_target.application_pid,
-                    keyboard_target.dispatch_pid,
-                    &sequence,
-                    boundary,
-                    focus_write,
-                )?;
-                Ok(dispatch_unverified(
-                    "macos_targeted_key_chord",
-                    keyboard_target,
-                    evidence,
-                ))
-            }
+            } => match keyboard_target {
+                MacChordTarget::Focused(keyboard_target) => {
+                    self.final_focus_validation(
+                        target,
+                        scope.owner.clone(),
+                        scope.window.stamp(),
+                        &keyboard_target,
+                        FocusProof::IdentityOnly,
+                    )
+                    .await?;
+                    let sequence = prepare_chord_sequence(&chord)
+                        .map_err(|error| sequence_construction_error(error, boundary.started()))?;
+                    let focus_write = focus_field_if_needed(&keyboard_target, boundary)?;
+                    let evidence = dispatch_sequence(
+                        self.poster.as_ref(),
+                        keyboard_target.application_pid,
+                        keyboard_target.dispatch_pid,
+                        &sequence,
+                        boundary,
+                        focus_write,
+                    )?;
+                    Ok(dispatch_unverified(
+                        "macos_targeted_key_chord",
+                        *keyboard_target,
+                        evidence,
+                    ))
+                }
+                MacChordTarget::Application(keyboard_target) => {
+                    self.final_application_validation(
+                        target,
+                        scope.owner.clone(),
+                        scope.window.stamp(),
+                        &keyboard_target,
+                    )
+                    .await?;
+                    let sequence = prepare_chord_sequence(&chord)
+                        .map_err(|error| sequence_construction_error(error, boundary.started()))?;
+                    let evidence = dispatch_sequence(
+                        self.poster.as_ref(),
+                        keyboard_target.application_pid,
+                        keyboard_target.application_pid,
+                        &sequence,
+                        boundary,
+                        false,
+                    )?;
+                    Ok(dispatch_unverified_application(
+                        "macos_targeted_application_key_chord",
+                        keyboard_target,
+                        evidence,
+                    ))
+                }
+            },
             PreparedKind::UnicodeInsertion {
                 target: keyboard_target,
                 text,
@@ -283,8 +329,11 @@ impl MacKeyboardActions {
                         .record(SettlementSignal::VerificationReadbackComplete);
                 }
                 // A same-thread AX readback is useful positive evidence when it
-                // matches, but a targeted pid post has no delivery ack. Keep
-                // the contract honest and let notification settlement finish.
+                // matches. A mismatch or unavailable readback is not a
+                // negative delivery acknowledgement for an asynchronous web
+                // control, so retain it as evidence and keep the signed
+                // helper's void action semantics. The next observation owns
+                // effect confirmation.
                 Ok(dispatch_unverified(
                     "macos_targeted_unicode_events",
                     keyboard_target,
@@ -432,11 +481,65 @@ impl MacKeyboardActions {
         }
         Ok(())
     }
+
+    async fn final_application_validation(
+        &self,
+        target: &mut MacTargetState,
+        scope_owner: cua_driver_core::api::observation::ResolvedWindowStamp,
+        scope_window: cua_driver_core::api::observation::ResolvedWindowStamp,
+        keyboard_target: &MacApplicationKeyboardTarget,
+    ) -> Result<(), NativeError> {
+        if target.invalidated() || scope_owner != target.window || scope_window != target.window {
+            return Err(NativeError::stale(
+                ErrorCode::WindowIdentityChanged,
+                "application keyboard target window changed after action preparation",
+            ));
+        }
+        let facts = self.windows.facts_for_stamp(&target.window).await?;
+        if facts.pid != keyboard_target.application_pid
+            || facts.cg_window_id != keyboard_target.cg_window_id
+        {
+            return Err(focus_drift(
+                "application keyboard pid/window identity changed before native dispatch",
+            ));
+        }
+        if target.signals.epoch() != keyboard_target.signal_epoch {
+            return Err(NativeError::stale(
+                ErrorCode::ObservationRaced,
+                "focus/content notification raced application keyboard action preparation",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl KeyboardActionProvider<MacTargetState> for MacKeyboardActions {
     type PreparedAction = MacPreparedKeyboardAction;
+
+    async fn semantic_type_text_candidate(
+        &self,
+        target: &mut MacTargetState,
+        focus: &ResolvedFocus,
+    ) -> Result<cua_driver_core::api::platform::Candidate<()>, NativeError> {
+        let facts = self.windows.facts_for_stamp(&target.window).await?;
+        let (_, snapshot) = prepare_keyboard_target(target, focus, &facts, FocusProof::TextState)?;
+        let exact_insertion_available =
+            snapshot.string_value.is_some() && snapshot.selected_text_range.is_some();
+        Ok(
+            if should_use_exact_focused_insertion(
+                &focus.window.framework,
+                snapshot.selected_text_settable,
+                exact_insertion_available,
+            ) {
+                cua_driver_core::api::platform::Candidate::Prepared(())
+            } else {
+                cua_driver_core::api::platform::Candidate::not_applicable(
+                    "focused control has no verified exact AXSelectedText insertion route",
+                )
+            },
+        )
+    }
 
     async fn prepare(
         &self,
@@ -522,6 +625,34 @@ fn prepare_keyboard_target(
     ))
 }
 
+fn prepare_application_keyboard_target(
+    target: &MacTargetState,
+    focus: &ResolvedFocus,
+    facts: &MacWindowFacts,
+) -> Result<MacApplicationKeyboardTarget, NativeError> {
+    let focus = focus_contract(target, focus)?;
+    if focus.focused_element.is_some() {
+        return Err(NativeError::new(
+            ErrorCode::Internal,
+            ErrorPhase::Preflight,
+            false,
+            "application keyboard target was prepared despite an exact focused element",
+        ));
+    }
+    Ok(MacApplicationKeyboardTarget {
+        application_pid: facts.pid,
+        cg_window_id: facts.cg_window_id,
+        ax_revision: focus
+            .ax_revision
+            .as_ref()
+            .expect("focus contract requires AX revision")
+            .as_str()
+            .to_owned(),
+        observation_id: focus.observation_id.to_string(),
+        signal_epoch: target.signals.epoch(),
+    })
+}
+
 fn effective_keyboard_element(
     application_pid: i32,
     focused: &RetainedAxElement,
@@ -574,10 +705,19 @@ fn validate_focus_identity_proof(
     live_window_id: Option<u32>,
     target_window_id: u32,
 ) -> Result<(), NativeError> {
-    if !observed_owner_matches || observed_window_id != target_window_id {
+    if !observed_owner_matches {
         return Err(focus_drift(
-            "observed focused control no longer belongs to the exact target window",
-        ));
+            "observed focused control owner stamp no longer matches the exact target window",
+        )
+        .with_detail("observed_window_id", observed_window_id)
+        .with_detail("target_window_id", target_window_id));
+    }
+    if observed_window_id != target_window_id {
+        return Err(
+            focus_drift("observed focused control belongs to a different native window")
+                .with_detail("observed_window_id", observed_window_id)
+                .with_detail("target_window_id", target_window_id),
+        );
     }
     if !live_identity_matches || live_window_id != Some(target_window_id) {
         return Err(focus_drift(
@@ -674,6 +814,16 @@ fn require_scope(
     Ok(())
 }
 
+fn should_use_exact_focused_insertion(
+    framework: &Framework,
+    selected_text_settable: Option<bool>,
+    exact_insertion_available: bool,
+) -> bool {
+    selected_text_settable == Some(true)
+        && exact_insertion_available
+        && !matches!(framework, Framework::Chromium | Framework::Electron)
+}
+
 /// Deliberately contains no await point. `CGEventPostToPid` is void, so after
 /// the boundary starts this loop cannot report or recover a partial post.
 fn dispatch_sequence(
@@ -685,6 +835,7 @@ fn dispatch_sequence(
     field_focus_write: bool,
 ) -> Result<BTreeMap<String, Value>, NativeError> {
     boundary.begin()?;
+    crate::focus_steal::record_synthesized_action(application_pid);
     let kinds = post_sequence(poster, dispatch_pid, sequence);
     Ok(sequence_evidence(
         application_pid,
@@ -701,10 +852,18 @@ fn post_sequence(
     sequence: &PreparedKeySequence,
 ) -> Vec<&'static str> {
     let mut kinds = Vec::with_capacity(sequence.len());
-    for event in sequence.events() {
+    for (index, event) in sequence.events().iter().enumerate() {
         event.set_fresh_timestamp();
         poster.post_to_pid(dispatch_pid, event);
         kinds.push(event_kind_name(event.kind()));
+        // `SynthesizedEvent.type(string:)` is sent through the helper's
+        // delay-capable path: each four-event virtual-key group is atomic, but
+        // consecutive characters are yielded to the target run loop. Repeated
+        // key-code-zero Unicode groups are otherwise collapsed by AppKit after
+        // the first character.
+        if event.kind() == TargetedKeyEventKind::FlagsChangedRestore && index + 1 < sequence.len() {
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
     }
     kinds
 }
@@ -891,6 +1050,38 @@ fn dispatch_unverified(
     mut fields: BTreeMap<String, Value>,
 ) -> NativeDispatch {
     fields.extend(focus_evidence(&target));
+    fields.insert("primitive".to_owned(), Value::String(primitive.to_owned()));
+    NativeDispatch {
+        verification: VerificationLevel::DispatchUnverified,
+        evidence: NativeEvidence {
+            fields,
+            interaction_scope: None,
+        },
+        warnings: Vec::new(),
+        menu: None,
+    }
+}
+
+fn dispatch_unverified_application(
+    primitive: &str,
+    target: MacApplicationKeyboardTarget,
+    mut fields: BTreeMap<String, Value>,
+) -> NativeDispatch {
+    fields.extend(BTreeMap::from([
+        (
+            "focus_ax_revision".to_owned(),
+            Value::String(target.ax_revision),
+        ),
+        (
+            "focus_observation_id".to_owned(),
+            Value::String(target.observation_id),
+        ),
+        ("focus_identity_revalidated".to_owned(), false.into()),
+        ("application_scoped_chord".to_owned(), true.into()),
+        ("application_pid".to_owned(), target.application_pid.into()),
+        ("dispatch_pid".to_owned(), target.application_pid.into()),
+        ("out_of_process_target".to_owned(), false.into()),
+    ]));
     fields.insert("primitive".to_owned(), Value::String(primitive.to_owned()));
     NativeDispatch {
         verification: VerificationLevel::DispatchUnverified,
@@ -1100,6 +1291,34 @@ mod tests {
 
         let error = apply_insertion(before, AxCfRange::from_utf16(3, 0).unwrap(), "x").unwrap_err();
         assert_eq!(error.code, ErrorCode::AxRevisionMismatch);
+    }
+
+    #[test]
+    fn type_text_uses_exact_focused_insertion_before_framework_exceptions() {
+        for framework in [Framework::Unknown, Framework::AppKit, Framework::WebKit] {
+            assert!(should_use_exact_focused_insertion(
+                &framework,
+                Some(true),
+                true
+            ));
+        }
+        for framework in [Framework::Chromium, Framework::Electron] {
+            assert!(!should_use_exact_focused_insertion(
+                &framework,
+                Some(true),
+                true
+            ));
+        }
+        assert!(!should_use_exact_focused_insertion(
+            &Framework::Unknown,
+            Some(false),
+            true
+        ));
+        assert!(!should_use_exact_focused_insertion(
+            &Framework::Unknown,
+            Some(true),
+            false
+        ));
     }
 
     #[test]

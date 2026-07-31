@@ -25,7 +25,8 @@ use interaction::MacInteractionProvider;
 use lifecycle::MacLifecycle;
 use observation::MacObservationProvider;
 use target::{
-    MacInvalidationHub, MacInvalidationSubscription, MacTargetFocusCoordinator, MacTargetState,
+    MacFocusStateRegistry, MacInvalidationHub, MacInvalidationSubscription,
+    MacTargetFocusCoordinator, MacTargetState,
 };
 use windows::MacWindowRegistry;
 
@@ -42,6 +43,7 @@ pub struct MacDriver {
     pointer: MacPointerActions,
     keyboard: MacKeyboardActions,
     invalidations: MacInvalidationHub,
+    focus_states: MacFocusStateRegistry,
 }
 
 impl MacDriver {
@@ -63,6 +65,7 @@ impl MacDriver {
             pointer,
             keyboard,
             invalidations,
+            focus_states: MacFocusStateRegistry::default(),
         }
     }
 }
@@ -98,7 +101,11 @@ impl PlatformDriver for MacDriver {
                 facts.cg_window_id,
                 self.invalidations.clone(),
             )?,
-            MacTargetFocusCoordinator::new(facts.pid, facts.cg_window_id)?,
+            MacTargetFocusCoordinator::new(
+                facts.pid,
+                self.focus_states
+                    .state_for(&window.process, facts.pid, facts.cg_window_id),
+            )?,
         ))
     }
 

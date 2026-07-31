@@ -166,24 +166,44 @@ pub(crate) fn chord_events(
     ]
 }
 
-pub(crate) fn unicode_events(text: &str) -> Vec<TargetedKeyEvent> {
+pub(crate) fn unicode_events(text: &str, restore_flags: CGEventFlags) -> Vec<TargetedKeyEvent> {
     text.chars()
         .flat_map(|character| {
             let text = character.to_string();
+            let (key_code, implied_shift) = printable_key_code(character).unwrap_or((0, false));
+            let requested_flags = if implied_shift {
+                CGEventFlags::CGEventFlagShift
+            } else {
+                CGEventFlags::CGEventFlagNull
+            };
             [
                 TargetedKeyEvent {
-                    kind: TargetedKeyEventKind::UnicodeDown,
+                    kind: TargetedKeyEventKind::FlagsChangedRequested,
                     key_code: 0,
+                    key_down: false,
+                    flags: requested_flags,
+                    text: None,
+                },
+                TargetedKeyEvent {
+                    kind: TargetedKeyEventKind::UnicodeDown,
+                    key_code,
                     key_down: true,
-                    flags: CGEventFlags::CGEventFlagNull,
+                    flags: requested_flags,
                     text: Some(text.clone()),
                 },
                 TargetedKeyEvent {
                     kind: TargetedKeyEventKind::UnicodeUp,
+                    key_code,
+                    key_down: false,
+                    flags: requested_flags,
+                    text: Some(text),
+                },
+                TargetedKeyEvent {
+                    kind: TargetedKeyEventKind::FlagsChangedRestore,
                     key_code: 0,
                     key_down: false,
-                    flags: CGEventFlags::CGEventFlagNull,
-                    text: Some(text),
+                    flags: restore_flags,
+                    text: None,
                 },
             ]
         })
@@ -249,7 +269,7 @@ pub(crate) fn prepare_chord_sequence(
 }
 
 pub(crate) fn prepare_unicode_sequence(text: &str) -> Result<PreparedKeySequence, NativeError> {
-    prepare_sequence(unicode_events(text))
+    prepare_sequence(unicode_events(text, combined_session_flags()))
 }
 
 fn prepare_sequence(

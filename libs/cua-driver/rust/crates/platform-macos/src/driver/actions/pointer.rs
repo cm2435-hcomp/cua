@@ -8,7 +8,6 @@ use std::{
 
 use async_trait::async_trait;
 use cua_driver_core::api::{
-    capabilities::Framework,
     contracts::{Modifier, MouseButton, Point, ScrollDirection, VerificationLevel},
     errors::{ErrorCode, ErrorPhase, NativeError},
     interaction::{InteractionScope, NativeEvidence, NativeSideEffectBoundary, TargetCursorHandle},
@@ -21,7 +20,6 @@ use cua_driver_core::api::{
 use serde_json::Value;
 
 use crate::{
-    browser::{CdpClient, CdpScrollDispatch, PreparedCdpScroll},
     driver::{
         menu::resolve_menu_identity,
         observation::discover_native_menu,
@@ -138,7 +136,7 @@ impl MacPointerActions {
                 "targeted pointer prepare requires a live targeted-pointer scope",
             ));
         }
-        let (sequence, final_cursor, route_name, transport) = match action {
+        let (sequence, final_cursor, route_name) = match action {
             ResolvedAction::PointClick { point, spec } => {
                 let point = self
                     .prepare_point(target.window.clone(), scope.owner.clone(), point)
@@ -149,12 +147,7 @@ impl MacPointerActions {
                     spec.click_count,
                     &spec.modifiers,
                 );
-                (
-                    sequence,
-                    point.logical,
-                    "macos_targeted_pointer_click",
-                    PreparedPointerTransport::Native,
-                )
+                (sequence, point.logical, "macos_targeted_pointer_click")
             }
             ResolvedAction::Drag(drag) => {
                 let start = self
@@ -171,12 +164,7 @@ impl MacPointerActions {
                     &drag.modifiers,
                     drag.duration_ms,
                 );
-                (
-                    sequence,
-                    end.logical,
-                    "macos_targeted_pointer_drag",
-                    PreparedPointerTransport::Native,
-                )
+                (sequence, end.logical, "macos_targeted_pointer_drag")
             }
             ResolvedAction::ElementScroll {
                 element,
@@ -196,39 +184,11 @@ impl MacPointerActions {
                 let (delta_x, delta_y) =
                     signed_page_scroll_delta(bounds, spec.direction, spec.pages)?;
                 let sequence = build_delta_scroll(point.clone(), delta_x, delta_y);
-                let (route_name, transport) = if scope.window.framework == Framework::Chromium {
-                    let title = scope.window.public.title.as_deref().ok_or_else(|| {
-                        unsupported_chromium_scroll(
-                            point.pid,
-                            None,
-                            "the exact native window has no title for CDP page binding",
-                        )
-                    })?;
-                    let cdp_target = CdpClient::bind_exact_page_for_pid(point.pid, title)
-                        .await
-                        .map_err(|error| {
-                            unsupported_chromium_scroll(point.pid, Some(title), error.to_string())
-                        })?;
-                    let prepared = CdpClient::prepare_scroll_gesture(
-                        &cdp_target,
-                        point.screen.x,
-                        point.screen.y,
-                    )
-                    .await
-                    .map_err(|error| {
-                        unsupported_chromium_scroll(point.pid, Some(title), error.to_string())
-                    })?;
-                    (
-                        "macos_signed_page_scroll_chromium_cdp",
-                        PreparedPointerTransport::ChromiumCdpScroll(Box::new(prepared)),
-                    )
-                } else {
-                    (
-                        "macos_signed_page_scroll_post_to_pid",
-                        PreparedPointerTransport::Native,
-                    )
-                };
-                (sequence, point.logical, route_name, transport)
+                (
+                    sequence,
+                    point.logical,
+                    "macos_signed_page_scroll_post_to_pid",
+                )
             }
             ResolvedAction::DeltaScroll(scroll) => {
                 let point = self
@@ -237,39 +197,11 @@ impl MacPointerActions {
                 validate_integral_scroll_delta(scroll.delta_x, "delta_x")?;
                 validate_integral_scroll_delta(scroll.delta_y, "delta_y")?;
                 let sequence = build_delta_scroll(point.clone(), scroll.delta_x, scroll.delta_y);
-                let (route_name, transport) = if scope.window.framework == Framework::Chromium {
-                    let title = scope.window.public.title.as_deref().ok_or_else(|| {
-                        unsupported_chromium_scroll(
-                            point.pid,
-                            None,
-                            "the exact native window has no title for CDP page binding",
-                        )
-                    })?;
-                    let cdp_target = CdpClient::bind_exact_page_for_pid(point.pid, title)
-                        .await
-                        .map_err(|error| {
-                            unsupported_chromium_scroll(point.pid, Some(title), error.to_string())
-                        })?;
-                    let prepared = CdpClient::prepare_scroll_gesture(
-                        &cdp_target,
-                        point.screen.x,
-                        point.screen.y,
-                    )
-                    .await
-                    .map_err(|error| {
-                        unsupported_chromium_scroll(point.pid, Some(title), error.to_string())
-                    })?;
-                    (
-                        "macos_targeted_pointer_chromium_cdp_pixel_scroll",
-                        PreparedPointerTransport::ChromiumCdpScroll(Box::new(prepared)),
-                    )
-                } else {
-                    (
-                        "macos_targeted_pointer_pixel_scroll",
-                        PreparedPointerTransport::Native,
-                    )
-                };
-                (sequence, point.logical, route_name, transport)
+                (
+                    sequence,
+                    point.logical,
+                    "macos_targeted_pointer_pixel_scroll",
+                )
             }
             _ => {
                 return Err(NativeError::new(
@@ -285,7 +217,6 @@ impl MacPointerActions {
             sequence,
             final_cursor,
             route_name,
-            transport,
         })
     }
 
@@ -306,7 +237,6 @@ impl MacPointerActions {
             sequence,
             final_cursor,
             route_name,
-            mut transport,
         } = action;
         self.revalidate_sequence_target(
             target.window.clone(),
@@ -328,60 +258,16 @@ impl MacPointerActions {
             journal: target.signals.clone(),
             expected: sequence.target.observation_epoch,
         };
-        if let PreparedPointerTransport::ChromiumCdpScroll(prepared) = &mut transport {
-            prepared
-                .revalidate(sequence.target.screen.x, sequence.target.screen.y)
-                .await
-                .map_err(|error| {
-                    NativeError::stale(
-                        ErrorCode::SurfaceStale,
-                        format!(
-                            "Chromium CDP page or viewport changed before exact scroll dispatch: {error}"
-                        ),
-                    )
-                })?;
-        }
-
         let mut evidence = PointerDispatchEvidence::new();
-        let mut cdp_dispatch = None;
-        let result = match transport {
-            PreparedPointerTransport::Native => dispatch_sequence(
-                self.sink.as_ref(),
-                &sequence,
-                scope.deadline.work,
-                &scope.logical_cursor,
-                &mut evidence,
-                boundary,
-                &epoch_witness,
-            ),
-            PreparedPointerTransport::ChromiumCdpScroll(prepared) => {
-                let (delta_x, delta_y) = prepared_scroll_deltas(&sequence)?;
-                epoch_witness.commit_first_post(|| boundary.begin())?;
-                match prepared.dispatch(delta_x, delta_y).await {
-                    Ok(dispatch) => {
-                        evidence.completed_events = 1;
-                        evidence.cleanup_succeeded = true;
-                        evidence.modifiers_cleared = true;
-                        cdp_dispatch = Some(dispatch);
-                        scope.logical_cursor.update(sequence.target.logical);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        evidence.may_have_partially_landed = true;
-                        Err(NativeError::new(
-                            ErrorCode::DispatchFailed,
-                            ErrorPhase::Dispatch,
-                            false,
-                            format!(
-                                "Chromium CDP scroll-gesture dispatch failed after the native side-effect boundary began: {error}"
-                            ),
-                        )
-                        .with_detail("cdp_method", "Input.synthesizeScrollGesture")
-                        .with_detail("possibly_partial_delivery", true))
-                    }
-                }
-            }
-        };
+        let result = dispatch_sequence(
+            self.sink.as_ref(),
+            &sequence,
+            scope.deadline.work,
+            &scope.logical_cursor,
+            &mut evidence,
+            boundary,
+            &epoch_witness,
+        );
         evidence.merge_into(&mut scope.native_evidence);
         if let Err(mut error) = result {
             if evidence.cleanup_attempted && !evidence.cleanup_succeeded {
@@ -395,7 +281,10 @@ impl MacPointerActions {
             );
             return Err(error);
         }
-        if let Some(intent) = &scope.menu_intent {
+        if let Some(
+            intent @ (MenuMutationIntent::Opening { .. } | MenuMutationIntent::Targeting { .. }),
+        ) = &scope.menu_intent
+        {
             if let Err(mut error) = target.arm_menu_suppression(&scope.action_id, intent.menu_id())
             {
                 target.invalidate();
@@ -455,11 +344,7 @@ impl MacPointerActions {
         // The helper's CGEventPostToPid transport is a void API. A completed
         // call proves only that the complete targeted sequence was attempted;
         // it is not a native delivery acknowledgement.
-        let verification = if cdp_dispatch.is_some() {
-            VerificationLevel::DispatchVerified
-        } else {
-            VerificationLevel::DispatchUnverified
-        };
+        let verification = VerificationLevel::DispatchUnverified;
         let mut native = NativeEvidence::default();
         native
             .fields
@@ -470,12 +355,7 @@ impl MacPointerActions {
         );
         native.fields.insert(
             "pointer_transport".to_owned(),
-            if cdp_dispatch.is_some() {
-                "chromium_cdp_input_synthesize_scroll_gesture"
-            } else {
-                "appkit_event_core_graphics_post_to_pid_once"
-            }
-            .into(),
+            "appkit_event_core_graphics_post_to_pid_once".into(),
         );
         native.fields.insert(
             "surface_id".to_owned(),
@@ -493,7 +373,7 @@ impl MacPointerActions {
             "observation_epoch".to_owned(),
             sequence.target.observation_epoch.into(),
         );
-        append_sequence_evidence(&sequence, cdp_dispatch.as_ref(), &mut native);
+        append_sequence_evidence(&sequence, &mut native);
         Ok(NativeDispatch {
             verification,
             evidence: native,
@@ -689,11 +569,23 @@ impl MacPointerActions {
     }
 }
 
-fn append_sequence_evidence(
-    sequence: &PreparedSequence,
-    cdp_dispatch: Option<&CdpScrollDispatch>,
-    evidence: &mut NativeEvidence,
-) {
+fn append_sequence_evidence(sequence: &PreparedSequence, evidence: &mut NativeEvidence) {
+    evidence.fields.insert(
+        "pointer_screen_x".to_owned(),
+        sequence.target.screen.x.into(),
+    );
+    evidence.fields.insert(
+        "pointer_screen_y".to_owned(),
+        sequence.target.screen.y.into(),
+    );
+    evidence.fields.insert(
+        "pointer_window_x".to_owned(),
+        sequence.target.window_local.x.into(),
+    );
+    evidence.fields.insert(
+        "pointer_window_y".to_owned(),
+        sequence.target.window_local.y.into(),
+    );
     let event_kinds: Vec<Value> = sequence
         .events
         .iter()
@@ -711,12 +603,7 @@ fn append_sequence_evidence(
         .insert("pointer_event_kinds".to_owned(), Value::Array(event_kinds));
     evidence.fields.insert(
         "pointer_native_post_count".to_owned(),
-        if cdp_dispatch.is_some() {
-            0
-        } else {
-            sequence.events.len()
-        }
-        .into(),
+        sequence.events.len().into(),
     );
     if let Some(PreparedPointerEvent::Mouse(mouse)) = sequence.events.first() {
         evidence.fields.insert(
@@ -751,16 +638,8 @@ fn append_sequence_evidence(
         evidence
             .fields
             .insert("scroll_requested_delta_y".to_owned(), scroll.delta_y.into());
-        let posted_delta_x = if cdp_dispatch.is_some() {
-            scroll.delta_x
-        } else {
-            -scroll.delta_x
-        };
-        let posted_delta_y = if cdp_dispatch.is_some() {
-            scroll.delta_y
-        } else {
-            -scroll.delta_y
-        };
+        let posted_delta_x = -scroll.delta_x;
+        let posted_delta_y = -scroll.delta_y;
         evidence
             .fields
             .insert("scroll_posted_delta_x".to_owned(), posted_delta_x.into());
@@ -772,53 +651,8 @@ fn append_sequence_evidence(
             .insert("scroll_units".to_owned(), "pixel".into());
         evidence.fields.insert(
             "scroll_native_primitive".to_owned(),
-            if cdp_dispatch.is_some() {
-                "Input.synthesizeScrollGesture"
-            } else {
-                "CGEventCreateScrollWheelEvent"
-            }
-            .into(),
+            "CGEventCreateScrollWheelEvent".into(),
         );
-        if let Some(dispatch) = cdp_dispatch {
-            evidence
-                .fields
-                .insert("cdp_command_count".to_owned(), 1.into());
-            evidence.fields.insert(
-                "cdp_gesture_distance_x".to_owned(),
-                (-scroll.delta_x).into(),
-            );
-            evidence.fields.insert(
-                "cdp_gesture_distance_y".to_owned(),
-                (-scroll.delta_y).into(),
-            );
-            evidence
-                .fields
-                .insert("cdp_prevent_fling".to_owned(), true.into());
-            evidence
-                .fields
-                .insert("cdp_port".to_owned(), dispatch.port.into());
-            evidence
-                .fields
-                .insert("cdp_page_title".to_owned(), dispatch.title.clone().into());
-            evidence.fields.insert(
-                "cdp_target_binding".to_owned(),
-                "pid_and_exact_window_title".into(),
-            );
-            evidence
-                .fields
-                .insert("cdp_viewport_x".to_owned(), dispatch.viewport_x.into());
-            evidence
-                .fields
-                .insert("cdp_viewport_y".to_owned(), dispatch.viewport_y.into());
-            evidence.fields.insert(
-                "cdp_viewport_origin_x".to_owned(),
-                dispatch.viewport_origin_x.into(),
-            );
-            evidence.fields.insert(
-                "cdp_viewport_origin_y".to_owned(),
-                dispatch.viewport_origin_y.into(),
-            );
-        }
     }
 }
 
@@ -852,12 +686,6 @@ pub struct MacPreparedPointerAction {
     sequence: PreparedSequence,
     final_cursor: Point,
     route_name: &'static str,
-    transport: PreparedPointerTransport,
-}
-
-enum PreparedPointerTransport {
-    Native,
-    ChromiumCdpScroll(Box<PreparedCdpScroll>),
 }
 
 #[derive(Debug, Clone)]
@@ -1220,38 +1048,6 @@ fn signed_page_scroll_delta(
     })
 }
 
-fn prepared_scroll_deltas(sequence: &PreparedSequence) -> Result<(f64, f64), NativeError> {
-    match sequence.events.as_slice() {
-        [PreparedPointerEvent::PixelScroll(scroll)] => Ok((scroll.delta_x, scroll.delta_y)),
-        _ => Err(NativeError::new(
-            ErrorCode::Internal,
-            ErrorPhase::Dispatch,
-            false,
-            "Chromium CDP scroll dispatch did not receive exactly one prepared pixel-scroll event",
-        )),
-    }
-}
-
-fn unsupported_chromium_scroll(
-    pid: i32,
-    window_title: Option<&str>,
-    reason: impl Into<String>,
-) -> NativeError {
-    let reason = reason.into();
-    let mut error = NativeError::unsupported(format!(
-        "Chromium exact-delta background scroll requires an exact PID-owned CDP page binding: {reason}"
-    ))
-    .with_detail("framework", "chromium")
-    .with_detail("pid", pid)
-    .with_detail("required_route", "chromium_cdp_input_synthesize_scroll_gesture")
-    .with_detail("binding", "pid_and_exact_window_title")
-    .with_detail("cause", reason);
-    if let Some(title) = window_title {
-        error = error.with_detail("window_title", title);
-    }
-    error
-}
-
 trait TargetedPointerSink: Send + Sync {
     fn post(
         &self,
@@ -1549,6 +1345,10 @@ mod tests {
             id: WindowId::parse("window").unwrap(),
             app,
             title: None,
+            usable: true,
+            is_standard: Some(true),
+            is_main: Some(true),
+            z_index: Some(1),
         };
         NativePoint {
             screen: Point { x, y },

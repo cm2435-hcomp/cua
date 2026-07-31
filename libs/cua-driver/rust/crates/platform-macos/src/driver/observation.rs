@@ -37,7 +37,7 @@ use crate::{
         copy_string_attr, copy_string_attr_exact, element_screen_rect, focused_element_of_pid,
         AXUIElementCreateApplication, AXUIElementRef,
     },
-    video_sckit::{capture_window_sample, WindowFrameSample},
+    video_sckit::{capture_window_sample, WindowFrameEvidence, WindowFrameSample},
 };
 
 use super::{
@@ -46,9 +46,9 @@ use super::{
 };
 
 const MAX_AX_ELEMENTS: usize = 2_000;
-const MAX_AX_DEPTH: usize = 25;
-const MAX_NOTIFICATION_ELEMENTS: usize = 32;
-const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_AX_DEPTH: usize = 64;
+const MAX_NOTIFICATION_ELEMENTS: usize = 8;
+const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const SCK_CAPTURE_TEARDOWN_RESERVE: Duration = Duration::from_millis(100);
 static SCK_CAPTURE_SLOTS: Semaphore = Semaphore::const_new(2);
 
@@ -66,67 +66,6 @@ impl MacObservationProvider {
                 std::env::temp_dir()
                     .join(format!("cua-driver-v2-observations-{}", std::process::id())),
             ),
-        }
-    }
-
-    /// Produce real FreshFrame settlement evidence without publishing an
-    /// observation artifact. Callers must pass the action's bounded deadline.
-    pub(crate) async fn record_fresh_frame_signal(
-        &self,
-        target: &mut MacTargetState,
-        deadline: Instant,
-    ) -> Result<CaptureFreshness, NativeError> {
-        let mut race_count = 0_u64;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(NativeError::stale(
-                    ErrorCode::ObservationRaced,
-                    "target did not hold a coherent FreshFrame bracket before settlement deadline",
-                )
-                .with_detail("race_count", race_count));
-            }
-            let epoch = target.signals.epoch();
-            let facts_a = self.windows.facts_for_identity(&target.window).await?;
-            validate_observable(&facts_a)?;
-            let pending = capture(&facts_a, SurfaceKind::Window, deadline).await?;
-            let facts_b = self.windows.facts_for_identity(&facts_a.stamp).await?;
-            if !same_stable_identity(&target.window, &facts_b.stamp) {
-                return Err(NativeError::stale(
-                    ErrorCode::WindowIdentityChanged,
-                    "target identity changed while producing FreshFrame evidence",
-                ));
-            }
-            if facts_a != facts_b {
-                race_count = race_count.saturating_add(1);
-                continue;
-            }
-            let journal = target.signals.clone();
-            let Some(freshness) = journal.commit_if_epoch(epoch, || {
-                target.frames.classify_and_commit(
-                    pending.cg_window_id,
-                    &pending.sample,
-                    pending.scale_factor,
-                )
-            })?
-            else {
-                // Target notifications during post-action capture are expected
-                // evidence that the UI is still moving. Discard the raced
-                // sample and immediately recapture inside the same owned
-                // deadline; do not turn normal settlement progress into a
-                // fatal observation race.
-                race_count = race_count.saturating_add(1);
-                continue;
-            };
-            if !freshness.action_safe() {
-                return Err(NativeError::stale(
-                    ErrorCode::SurfaceStale,
-                    "ScreenCaptureKit did not produce action-safe FreshFrame evidence",
-                ));
-            }
-            target
-                .signals
-                .record(cua_driver_core::api::settlement::SettlementSignal::FreshFrame);
-            return Ok(freshness);
         }
     }
 
@@ -166,13 +105,13 @@ impl MacObservationProvider {
             captures.push(
                 capture(&facts_a, SurfaceKind::Window, deadline)
                     .await
-                    .map_err(AttemptError::Fatal)?,
+                    .map_err(classify_capture_error)?,
             );
             for related_surface in related {
                 captures.push(
                     capture_related(related_surface, deadline)
                         .await
-                        .map_err(AttemptError::Fatal)?,
+                        .map_err(classify_capture_error)?,
                 );
             }
         }
@@ -183,9 +122,15 @@ impl MacObservationProvider {
         .await
         .map_err(|error| AttemptError::Fatal(join_error("related AX revalidation", error)))?
         .map_err(AttemptError::Fatal)?;
-        target
-            .replace_observed_elements(related_b_snapshot.notification_elements())
-            .map_err(AttemptError::Fatal)?;
+        if let Err(error) =
+            target.replace_observed_elements(related_b_snapshot.notification_elements())
+        {
+            // The signed helper's observer registration is internal,
+            // best-effort state. A slow AX descendant cannot turn an otherwise
+            // coherent app-state read into a caller-visible failure; action
+            // settlement and the next exact observation remain authoritative.
+            tracing::debug!(%error, "skipping slow AX descendant notification refresh");
+        }
         if !same_related_identities(
             &ax_snapshot.related_windows,
             &related_b_snapshot.related_windows,
@@ -368,22 +313,35 @@ impl ObservationProvider<MacTargetState> for MacObservationProvider {
         dirty: &DirtyState,
         deadline: std::time::Instant,
     ) -> Result<SettlementAttempt, NativeError> {
-        if let Err(fresh_frame_error) = self.record_fresh_frame_signal(target, deadline).await {
-            if !dirty.profile.target_may_disappear {
-                return Err(fresh_frame_error);
-            }
-            match self.windows.facts_for_identity(&target.window).await {
-                Err(missing_error)
-                    if matches!(
-                        missing_error.code,
-                        ErrorCode::WindowNotFound | ErrorCode::WindowIdentityChanged
-                    ) =>
-                {
-                    target.signals.record(
-                        cua_driver_core::api::settlement::SettlementSignal::WindowListChanged,
-                    );
+        if dirty.profile.target_may_disappear {
+            loop {
+                match self.windows.facts_for_identity(&target.window).await {
+                    Err(missing_error)
+                        if matches!(
+                            missing_error.code,
+                            ErrorCode::WindowNotFound | ErrorCode::WindowIdentityChanged
+                        ) =>
+                    {
+                        target.signals.record(
+                            cua_driver_core::api::settlement::SettlementSignal::WindowListChanged,
+                        );
+                        return Ok(target
+                            .signals
+                            .settle(dirty, &dirty.profile.relevant_signals, deadline)
+                            .await);
+                    }
+                    Ok(_) => {}
+                    Err(error) => return Err(error),
                 }
-                _ => return Err(fresh_frame_error),
+                let now = Instant::now();
+                let slice_deadline = (now + Duration::from_millis(20)).min(deadline);
+                let attempt = target
+                    .signals
+                    .settle(dirty, &dirty.profile.relevant_signals, slice_deadline)
+                    .await;
+                if matches!(attempt, SettlementAttempt::Settled(_)) || slice_deadline == deadline {
+                    return Ok(attempt);
+                }
             }
         }
         Ok(target
@@ -405,31 +363,41 @@ impl ObservationProvider<MacTargetState> for MacObservationProvider {
             ));
         }
         let deadline = Instant::now() + OBSERVATION_TIMEOUT;
-        for attempt_index in 0..2 {
+        let mut race_count = 0_u64;
+        let mut last_raced_stage = None;
+        loop {
+            if Instant::now() >= deadline {
+                let mut error = NativeError::new(
+                    ErrorCode::ObservationRaced,
+                    ErrorPhase::Verify,
+                    true,
+                    "window identity or geometry did not stabilize before the observation deadline",
+                )
+                .with_detail("race_count", race_count);
+                if let Some(stage) = last_raced_stage {
+                    error = error.with_detail("raced_stage", stage);
+                }
+                return Err(error);
+            }
             let result = match self.attempt(target, window, request, deadline).await {
                 Ok(attempt) => self.publish(target, window, attempt),
                 Err(error) => Err(error),
             };
             match result {
                 Ok(update) => return Ok(update),
-                Err(AttemptError::Raced { .. }) if attempt_index == 0 => continue,
                 Err(AttemptError::Raced { stage }) => {
-                    let mut error = NativeError::new(
-                        ErrorCode::ObservationRaced,
-                        ErrorPhase::Verify,
-                        true,
-                        "window identity or geometry changed twice during coherent observation",
-                    )
-                    .with_detail("raced_stage", stage);
-                    if let Some(signal) = target.signals.latest_signal() {
-                        error = error.with_detail("latest_signal", format!("{signal:?}"));
-                    }
-                    return Err(error);
+                    race_count = race_count.saturating_add(1);
+                    last_raced_stage = Some(stage);
+                    tracing::debug!(
+                        race_count,
+                        raced_stage = stage,
+                        "retrying coherent observation inside its bounded deadline"
+                    );
+                    continue;
                 }
                 Err(AttemptError::Fatal(error)) => return Err(error),
             }
         }
-        unreachable!("coherent observation loop has exactly two attempts")
     }
 }
 
@@ -449,6 +417,25 @@ fn classify_stamp_error(error: NativeError) -> AttemptError {
         AttemptError::Raced {
             stage: "window_registry_identity_revalidation",
         }
+    } else {
+        AttemptError::Fatal(error)
+    }
+}
+
+fn classify_capture_error(error: NativeError) -> AttemptError {
+    if error.code == ErrorCode::SurfaceStale {
+        let stage = if error.message.contains("source frame") {
+            "capture_surface_transform"
+        } else if error.message.contains("freshness metadata") {
+            "capture_freshness_metadata"
+        } else if error.message.contains("transiently unavailable")
+            || error.message.contains("bounded deadline")
+        {
+            "capture_sample_timeout"
+        } else {
+            "capture_geometry_revalidation"
+        };
+        AttemptError::Raced { stage }
     } else {
         AttemptError::Fatal(error)
     }
@@ -611,22 +598,19 @@ async fn capture_sample_until(
     if capture_timeout.is_zero() {
         return Err(capture_deadline_error(window_id));
     }
-    let worker = tokio::task::spawn_blocking(move || {
+    let capture = async move {
         let _permit = permit;
-        capture_window_sample(window_id, scale, capture_timeout)
-    });
-    tokio::time::timeout_at(deadline, worker)
+        capture_window_sample(window_id, scale, capture_timeout).await
+    };
+    tokio::time::timeout_at(deadline, capture)
         .await
         .map_err(|_| capture_deadline_error(window_id))?
-        .map_err(|error| join_error("ScreenCaptureKit capture", error))?
         .map_err(capture_error)
 }
 
 fn capture_deadline_error(window_id: u32) -> NativeError {
-    NativeError::new(
-        ErrorCode::UnsupportedInBackground,
-        ErrorPhase::Preflight,
-        true,
+    NativeError::stale(
+        ErrorCode::SurfaceStale,
         "ScreenCaptureKit observation exceeded its bounded deadline",
     )
     .with_detail("cg_window_id", window_id)
@@ -677,6 +661,48 @@ fn validated_surface_transform(
     target: Rect,
     expected_scale: f64,
 ) -> Result<SurfaceToWindowTransform, NativeError> {
+    if matches!(
+        sample.evidence,
+        WindowFrameEvidence::ScreenshotCompletion | WindowFrameEvidence::WindowServerFallback
+    ) {
+        let sampled = sample.source_frame;
+        let scale_x = f64::from(sample.pixel_width) / sampled.width;
+        let scale_y = f64::from(sample.pixel_height) / sampled.height;
+        let coherent = sample.pixel_width > 0
+            && sample.pixel_height > 0
+            && approximately(sampled.x, source.x)
+            && approximately(sampled.y, source.y)
+            && approximately(sampled.width, source.width)
+            && approximately(sampled.height, source.height)
+            && (scale_x - expected_scale).abs() <= 0.05
+            && (scale_y - expected_scale).abs() <= 0.05;
+        if !coherent {
+            return Err(NativeError::stale(
+                ErrorCode::SurfaceStale,
+                "ScreenCaptureKit screenshot geometry disagrees with the bracketed window",
+            )
+            .with_detail("expected_source_bounds", rect_detail(source))
+            .with_detail("sample_source_frame", frame_rect_detail(sampled))
+            .with_detail("target_bounds", rect_detail(target))
+            .with_detail(
+                "pixel_size",
+                serde_json::json!({
+                    "width": sample.pixel_width,
+                    "height": sample.pixel_height,
+                }),
+            )
+            .with_detail("expected_scale_factor", expected_scale)
+            .with_detail("sample_scale_x", scale_x)
+            .with_detail("sample_scale_y", scale_y));
+        }
+        return Ok(SurfaceToWindowTransform {
+            scale_x: 1.0 / scale_x,
+            scale_y: 1.0 / scale_y,
+            offset_x: source.x - target.x,
+            offset_y: source.y - target.y,
+        });
+    }
+
     let metadata = &sample.metadata;
     let scale = metadata
         .scale_factor
@@ -779,6 +805,35 @@ impl MacFrameHistory {
         expected_scale: f64,
     ) -> Result<CaptureFreshness, NativeError> {
         let metadata = &sample.metadata;
+        if matches!(
+            sample.evidence,
+            WindowFrameEvidence::ScreenshotCompletion | WindowFrameEvidence::WindowServerFallback
+        ) {
+            if metadata.completion_unix_ms == 0 {
+                return Err(NativeError::stale(
+                    ErrorCode::SurfaceStale,
+                    "ScreenCaptureKit screenshot has no completion timestamp",
+                ));
+            }
+            let freshness = match self.previous.get(&window_id) {
+                Some(previous) if metadata.completion_unix_ms <= previous.completion_unix_ms => {
+                    CaptureFreshness::Frozen
+                }
+                _ => CaptureFreshness::FreshSnapshot,
+            };
+            if freshness.action_safe() {
+                self.previous.insert(
+                    window_id,
+                    PreviousFrame {
+                        png: sample.png_bytes.clone(),
+                        completion_unix_ms: metadata.completion_unix_ms,
+                        display_time: metadata.completion_unix_ms,
+                    },
+                );
+            }
+            return Ok(freshness);
+        }
+
         let status = metadata
             .frame_status
             .ok_or_else(|| missing_frame_metadata(metadata))?;
@@ -809,7 +864,16 @@ impl MacFrameHistory {
         }
 
         let freshness = if status.has_content() {
-            CaptureFreshness::Fresh
+            match self.previous.get(&window_id) {
+                Some(previous)
+                    if metadata.completion_unix_ms > previous.completion_unix_ms
+                        && display_time >= previous.display_time =>
+                {
+                    CaptureFreshness::Fresh
+                }
+                Some(_) => CaptureFreshness::Frozen,
+                None => CaptureFreshness::Fresh,
+            }
         } else if status == SCFrameStatus::Idle {
             match self.previous.get(&window_id) {
                 Some(previous)
@@ -1161,14 +1225,10 @@ fn capture_ax_snapshot(
             .iter()
             .copied()
             .find(|window| bindings::ax_get_window_id(*window) == Some(target_window_id));
-        for window in windows
-            .iter()
-            .copied()
-            .filter(|window| Some(*window) != target)
-        {
-            CFRelease(window as CFTypeRef);
-        }
         let Some(target) = target else {
+            for window in windows {
+                CFRelease(window as CFTypeRef);
+            }
             CFRelease(application as CFTypeRef);
             return Err(ax_error("exact AX target window is unavailable"));
         };
@@ -1188,12 +1248,23 @@ fn capture_ax_snapshot(
             &mut visited,
             &mut truncated,
         );
+        replace_proxy_transient_trees(
+            &windows,
+            target,
+            target_window_id,
+            &mut nodes,
+            &mut related_windows,
+            &mut visited,
+            &mut truncated,
+        );
         if nodes.len() == 1
             && nodes[0].role == "AXWindow"
             && nodes[0].actions.is_empty()
             && nodes[0].value.is_none()
         {
-            CFRelease(target as CFTypeRef);
+            for window in windows {
+                CFRelease(window as CFTypeRef);
+            }
             CFRelease(application as CFTypeRef);
             return Err(ax_error(
                 "target AX tree is not materialized; Plan003 observation is read-only and will not durably enable application accessibility",
@@ -1218,7 +1289,9 @@ fn capture_ax_snapshot(
                 .collect::<Vec<_>>()
                 .join("\n")
         });
-        CFRelease(target as CFTypeRef);
+        for window in windows {
+            CFRelease(window as CFTypeRef);
+        }
         CFRelease(application as CFTypeRef);
         Ok(RawAxSnapshot {
             nodes,
@@ -1228,6 +1301,73 @@ fn capture_ax_snapshot(
             related_windows,
             truncated,
         })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn replace_proxy_transient_trees(
+    windows: &[AXUIElementRef],
+    target: AXUIElementRef,
+    target_window_id: u32,
+    nodes: &mut Vec<RawAxNode>,
+    related_windows: &mut Vec<RawRelatedWindow>,
+    visited: &mut HashSet<usize>,
+    truncated: &mut bool,
+) {
+    let proxy_related: HashMap<u32, SurfaceKind> = related_windows
+        .iter()
+        .map(|related| (related.window_id, related.kind))
+        .collect();
+    if proxy_related.is_empty() {
+        return;
+    }
+
+    let mut live_related_ids = HashSet::new();
+    for window in windows.iter().copied().filter(|window| *window != target) {
+        let Some(window_id) = bindings::ax_get_window_id(window) else {
+            continue;
+        };
+        let Some(kind) = proxy_related.get(&window_id).copied() else {
+            continue;
+        };
+        live_related_ids.insert(window_id);
+
+        // AppKit can expose an inert, zero-sized menu proxy beneath the
+        // originating window and the live menu as a separate AXWindow with
+        // the same WindowServer id. AXPress/AXPick can return success against
+        // the proxy without invoking the menu item. Replace that branch with
+        // the exact live related-window tree, matching the signed helper's
+        // menu-root observation posture.
+        nodes.retain(|node| node.owner_window_id != window_id);
+        related_windows.retain(|related| related.window_id != window_id);
+        let mut nested_related = Vec::new();
+        walk_ax(
+            window,
+            None,
+            0,
+            target_window_id,
+            window_id,
+            nodes,
+            &mut nested_related,
+            visited,
+            truncated,
+        );
+        related_windows.push(RawRelatedWindow {
+            window_id,
+            kind,
+            element: RetainedAxElement::retain(window),
+        });
+    }
+
+    for (window_id, kind) in proxy_related {
+        if kind == SurfaceKind::Menu && !live_related_ids.contains(&window_id) {
+            // Finder can retain the inert menu proxy beneath its originating
+            // window after the separate live menu AXWindow has disappeared.
+            // The signed helper no longer publishes that proxy as an open
+            // menu, so drop it once no live AXWindow backs the identity.
+            nodes.retain(|node| node.owner_window_id != window_id);
+            related_windows.retain(|related| related.window_id != window_id);
+        }
     }
 }
 
@@ -1379,7 +1519,10 @@ unsafe fn walk_ax(
             truncated,
         );
         CFRelease(child as CFTypeRef);
-        if *truncated {
+        // A depth-limited child truncates only that branch. Keep walking its
+        // siblings; abort the whole traversal only when the global node
+        // budget is exhausted.
+        if nodes.len() >= MAX_AX_ELEMENTS {
             break;
         }
     }
@@ -1632,6 +1775,9 @@ fn render_ax_line(depth: usize, id: &ElementId, node: &RawAxNode) -> String {
         id.as_str(),
         sanitize(&node.role)
     );
+    if let Some(subrole) = &node.subrole {
+        line.push_str(&format!(" subrole={:?}", sanitize(subrole)));
+    }
     if let Some(label) = &node.label {
         line.push_str(&format!(" label={:?}", sanitize(label)));
     }
@@ -1728,11 +1874,20 @@ fn now_unix_ms() -> u64 {
 }
 
 fn capture_error(error: anyhow::Error) -> NativeError {
+    let message = error.to_string();
+    if message.contains("sample deadline elapsed")
+        || message.contains("produced no sample before its deadline")
+    {
+        return NativeError::stale(
+            ErrorCode::SurfaceStale,
+            format!("ScreenCaptureKit sample was transiently unavailable: {message}"),
+        );
+    }
     NativeError::new(
         ErrorCode::UnsupportedInBackground,
         ErrorPhase::Preflight,
         true,
-        format!("native window capture unavailable: {error}"),
+        format!("native window capture unavailable: {message}"),
     )
 }
 
@@ -1784,6 +1939,7 @@ mod tests {
                 width: 100.0,
                 height: 50.0,
             },
+            evidence: WindowFrameEvidence::StreamAttachments,
             metadata: WindowFrameMetadata {
                 completion_unix_ms: completion,
                 display_time: Some(completion),
@@ -1815,6 +1971,30 @@ mod tests {
             history.classify_and_commit(1, &sample(SCFrameStatus::Idle, 11, b"same"), 2.0),
             Ok(CaptureFreshness::Frozen)
         );
+    }
+
+    #[test]
+    fn incoherent_capture_geometry_is_retried_inside_the_observation() {
+        let error = NativeError::stale(
+            ErrorCode::SurfaceStale,
+            "fixture ScreenCaptureKit geometry raced",
+        );
+        assert!(matches!(
+            classify_capture_error(error),
+            AttemptError::Raced {
+                stage: "capture_geometry_revalidation"
+            }
+        ));
+    }
+
+    #[test]
+    fn screen_capture_sample_deadline_is_retryable_surface_staleness() {
+        let error = capture_error(anyhow::anyhow!(
+            "ScreenCaptureKit window 42 sample deadline elapsed"
+        ));
+        assert_eq!(error.code, ErrorCode::SurfaceStale);
+        assert_eq!(error.phase, ErrorPhase::Preflight);
+        assert!(error.retryable);
     }
 
     #[test]
@@ -1924,6 +2104,25 @@ mod tests {
             related_windows: Vec::new(),
             truncated: false,
         }
+    }
+
+    #[test]
+    fn rendered_tree_exposes_exact_subrole_for_safe_model_targeting() {
+        let native = CFString::new("close-button");
+        let mut snapshot = raw_snapshot(&native, "");
+        snapshot.nodes[0].label = None;
+        snapshot.nodes[0].subrole = Some("AXCloseButton".to_owned());
+
+        let line = render_ax_line(
+            0,
+            &ElementId::parse("close-button").unwrap(),
+            &snapshot.nodes[0],
+        );
+
+        assert_eq!(
+            line,
+            r#"- [close-button] AXButton subrole="AXCloseButton" actions=["AXPress"]"#
+        );
     }
 
     #[test]

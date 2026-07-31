@@ -120,6 +120,7 @@ impl SurfaceToWindowTransform {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureFreshness {
     Fresh,
+    FreshSnapshot,
     ReusedWithFreshCompletion,
     Frozen,
     Unavailable,
@@ -133,7 +134,10 @@ pub struct NativeObservationEpoch(pub u64);
 
 impl CaptureFreshness {
     pub fn action_safe(self) -> bool {
-        matches!(self, Self::Fresh | Self::ReusedWithFreshCompletion)
+        matches!(
+            self,
+            Self::Fresh | Self::FreshSnapshot | Self::ReusedWithFreshCompletion
+        )
     }
 }
 
@@ -1133,6 +1137,10 @@ mod store_tests {
                 running: true,
             },
             title: Some("Fixture".to_owned()),
+            usable: true,
+            is_standard: Some(true),
+            is_main: Some(true),
+            z_index: Some(1),
         };
         ResolvedWindow {
             public,
@@ -1327,6 +1335,10 @@ mod store_tests {
             id: related.window_id.clone(),
             app: target.public.app.clone(),
             title: Some("Popover".to_owned()),
+            usable: false,
+            is_standard: Some(false),
+            is_main: Some(false),
+            z_index: Some(2),
         };
         let observation_id = ObservationId::parse("related-observation").unwrap();
         let element_id = ElementId::parse("related-element").unwrap();

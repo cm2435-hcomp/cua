@@ -241,6 +241,10 @@ fn fixture_window() -> anyhow::Result<WindowRef> {
             running: true,
         },
         title: Some("Fixture window".to_owned()),
+        usable: true,
+        is_standard: Some(true),
+        is_main: Some(true),
+        z_index: Some(1),
     })
 }
 

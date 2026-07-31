@@ -31,6 +31,7 @@ use std::{
 
 use cua_driver_core::video::{VideoBackend, VideoBackendFactory, VideoMetadata};
 
+use screencapturekit::async_api::{AsyncSCScreenshotManager, AsyncSCShareableContent};
 use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, SCFrameStatus};
 use screencapturekit::prelude::{
     CMSampleBuffer, SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration,
@@ -43,9 +44,10 @@ use screencapturekit::recording_output::{
 
 pub struct SckitVideoBackendFactory;
 
-/// Metadata read from the same `CMSampleBuffer` that produced the returned
-/// PNG. Keeping pixels and freshness evidence in one value prevents callers
-/// from accidentally pairing a new image with stale stream metadata.
+/// Metadata produced by the same completed one-shot ScreenCaptureKit request
+/// that returned the PNG. The normalized fields retain the existing
+/// observation contract while avoiding a short-lived `SCStream` per state
+/// call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowFrameMetadata {
     pub completion_unix_ms: u64,
@@ -71,7 +73,20 @@ pub struct WindowFrameSample {
     pub pixel_height: u32,
     /// ScreenCaptureKit's exact source-window frame at sample construction.
     pub source_frame: FrameRect,
+    pub evidence: WindowFrameEvidence,
     pub metadata: WindowFrameMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameEvidence {
+    /// One completed `SCScreenshotManager.captureImage` request. The exact
+    /// window and geometry are bracketed independently by the observation.
+    ScreenshotCompletion,
+    /// A same-sample SCStream image plus its native frame attachments.
+    StreamAttachments,
+    /// Exact-window WindowServer capture used only after both
+    /// ScreenCaptureKit routes fail within their bounded budgets.
+    WindowServerFallback,
 }
 
 struct TemporaryCapturePath(std::path::PathBuf);
@@ -82,16 +97,13 @@ impl Drop for TemporaryCapturePath {
     }
 }
 
-/// Capture exactly one desktop-independent window through ScreenCaptureKit.
+/// Capture one exact desktop-independent window with the same one-shot
+/// ScreenCaptureKit API used by the signed helper's Appshot path.
 ///
-/// This is intentionally separate from the long-lived recording stream. A
-/// v2 observation needs one bounded sample whose pixels, frame status,
-/// display timestamp and scale attachments are coherent. Apple's one-shot
-/// `SCScreenshotManager.captureSampleBuffer` returns pixels without
-/// `SCStreamFrameInfo` attachments on current macOS, so observations use one
-/// exact-window `SCStream` callback instead. The old `screencapture` CLI
-/// helper cannot provide this contract and is never called here.
-pub fn capture_window_sample(
+/// The caller independently brackets exact window identity and geometry.
+/// `timeout` is validated here and enforced by the async observation wrapper;
+/// ScreenCaptureKit's synchronous Rust bridge has no cancellation parameter.
+pub async fn capture_window_sample(
     window_id: u32,
     expected_scale_factor: f64,
     timeout: Duration,
@@ -102,10 +114,118 @@ pub fn capture_window_sample(
     if timeout.is_zero() {
         anyhow::bail!("ScreenCaptureKit window {window_id} sample deadline elapsed");
     }
+    let started_at = Instant::now();
+    let screenshot_budget = timeout
+        .checked_div(3)
+        .unwrap_or(timeout)
+        .min(Duration::from_secs(2));
+    let screenshot = tokio::time::timeout(
+        screenshot_budget,
+        capture_window_screenshot_sample(window_id, expected_scale_factor),
+    )
+    .await;
+    if let Ok(Ok(sample)) = screenshot {
+        return Ok(sample);
+    }
+
+    let remaining = timeout.saturating_sub(started_at.elapsed());
+    if remaining.is_zero() {
+        anyhow::bail!("ScreenCaptureKit window {window_id} sample deadline elapsed");
+    }
+    let stream_budget = remaining.min(Duration::from_secs(3));
+    let stream = tokio::task::spawn_blocking(move || {
+        capture_window_stream_sample(window_id, expected_scale_factor, stream_budget)
+    })
+    .await;
+    if let Ok(Ok(sample)) = stream {
+        return Ok(sample);
+    }
+
+    let remaining = timeout.saturating_sub(started_at.elapsed());
+    if remaining.is_zero() {
+        anyhow::bail!("window {window_id} capture routes exceeded their shared deadline");
+    }
+    tokio::time::timeout(
+        remaining,
+        tokio::task::spawn_blocking(move || capture_window_server_sample(window_id)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("WindowServer capture timed out for window {window_id}"))?
+    .map_err(|error| anyhow::anyhow!("WindowServer capture worker failed: {error}"))?
+}
+
+async fn capture_window_screenshot_sample(
+    window_id: u32,
+    expected_scale_factor: f64,
+) -> anyhow::Result<WindowFrameSample> {
+    let content = AsyncSCShareableContent::get()
+        .await
+        .map_err(|error| anyhow::anyhow!("SCShareableContent::get failed: {error}"))?;
+    let window = content
+        .windows()
+        .into_iter()
+        .find(|candidate| candidate.window_id() == window_id)
+        .ok_or_else(|| anyhow::anyhow!("ScreenCaptureKit window {window_id} is unavailable"))?;
+    let frame = frame_rect(window.frame());
+    let width = scaled_dimension(frame.width, expected_scale_factor, "width")?;
+    let height = scaled_dimension(frame.height, expected_scale_factor, "height")?;
+    let filter = SCContentFilter::create().with_window(&window).build();
+    let configuration = SCStreamConfiguration::new()
+        .with_width(width)
+        .with_height(height)
+        .with_ignores_shadows_single_window(true)
+        .with_shows_cursor(false)
+        .with_captures_audio(false);
+    let image = AsyncSCScreenshotManager::capture_image(&filter, &configuration)
+        .await
+        .map_err(|error| anyhow::anyhow!("ScreenCaptureKit screenshot failed: {error}"))?;
+    let completion_unix_ms = unix_ms_now();
+    let pixel_width = u32::try_from(image.width())
+        .map_err(|_| anyhow::anyhow!("captured image width exceeds u32"))?;
+    let pixel_height = u32::try_from(image.height())
+        .map_err(|_| anyhow::anyhow!("captured image height exceeds u32"))?;
+
+    let temporary_path = TemporaryCapturePath(std::env::temp_dir().join(format!(
+        "cua-v2-sck-sample-{}-{}.png",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    )));
+    image.save_png(&temporary_path.0).map_err(|error| {
+        anyhow::anyhow!("failed to encode ScreenCaptureKit sample for window {window_id}: {error}")
+    })?;
+    let png_bytes = std::fs::read(&temporary_path.0).map_err(|error| {
+        anyhow::anyhow!("failed to read encoded ScreenCaptureKit sample: {error}")
+    })?;
+    if png_bytes.is_empty() {
+        anyhow::bail!("ScreenCaptureKit produced an empty PNG for window {window_id}");
+    }
+
+    let metadata = WindowFrameMetadata {
+        completion_unix_ms,
+        display_time: None,
+        frame_status: None,
+        scale_factor: None,
+        content_scale: None,
+        content_rect: None,
+    };
+    Ok(WindowFrameSample {
+        png_bytes,
+        pixel_width,
+        pixel_height,
+        source_frame: frame,
+        evidence: WindowFrameEvidence::ScreenshotCompletion,
+        metadata,
+    })
+}
+
+fn capture_window_stream_sample(
+    window_id: u32,
+    expected_scale_factor: f64,
+    timeout: Duration,
+) -> anyhow::Result<WindowFrameSample> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| anyhow::anyhow!("invalid ScreenCaptureKit sample timeout"))?;
-
     let content = SCShareableContent::get()
         .map_err(|error| anyhow::anyhow!("SCShareableContent::get failed: {error}"))?;
     let window = content
@@ -172,7 +292,6 @@ pub fn capture_window_sample(
         .map_err(|_| anyhow::anyhow!("captured image width exceeds u32"))?;
     let pixel_height = u32::try_from(image.height())
         .map_err(|_| anyhow::anyhow!("captured image height exceeds u32"))?;
-
     let temporary_path = TemporaryCapturePath(std::env::temp_dir().join(format!(
         "cua-v2-sck-sample-{}-{}.png",
         std::process::id(),
@@ -187,14 +306,9 @@ pub fn capture_window_sample(
     if png_bytes.is_empty() {
         anyhow::bail!("ScreenCaptureKit produced an empty PNG for window {window_id}");
     }
-
     let metadata = WindowFrameMetadata {
         completion_unix_ms,
         display_time: frame_info.as_ref().and_then(|info| info.display_time),
-        // screencapturekit 6.0.1 casts the attachment's NSNumber directly to
-        // Swift's SCFrameStatus enum and silently loses it. Read the numeric
-        // attachment through CoreFoundation until the dependency fixes that
-        // bridge; never infer status from pixels or timestamps.
         frame_status: frame_info
             .as_ref()
             .and_then(|info| info.frame_status)
@@ -204,25 +318,52 @@ pub fn capture_window_sample(
         content_rect: frame_info
             .as_ref()
             .and_then(|info| info.content_rect)
-            .map(|rect| FrameRect {
-                x: rect.origin.x,
-                y: rect.origin.y,
-                width: rect.size.width,
-                height: rect.size.height,
-            }),
+            .map(frame_rect),
     };
     Ok(WindowFrameSample {
         png_bytes,
         pixel_width,
         pixel_height,
-        source_frame: FrameRect {
-            x: frame.origin.x,
-            y: frame.origin.y,
-            width: frame.size.width,
-            height: frame.size.height,
-        },
+        source_frame: frame_rect(frame),
+        evidence: WindowFrameEvidence::StreamAttachments,
         metadata,
     })
+}
+
+fn capture_window_server_sample(window_id: u32) -> anyhow::Result<WindowFrameSample> {
+    let bounds = crate::windows::window_bounds_by_id(window_id)
+        .ok_or_else(|| anyhow::anyhow!("WindowServer window {window_id} is unavailable"))?;
+    let png_bytes = crate::capture::screenshot_window_bytes(window_id)?;
+    let (pixel_width, pixel_height) = crate::capture::png_dimensions(&png_bytes)?;
+    Ok(WindowFrameSample {
+        png_bytes,
+        pixel_width,
+        pixel_height,
+        source_frame: FrameRect {
+            x: bounds.x,
+            y: bounds.y,
+            width: bounds.width,
+            height: bounds.height,
+        },
+        evidence: WindowFrameEvidence::WindowServerFallback,
+        metadata: WindowFrameMetadata {
+            completion_unix_ms: unix_ms_now(),
+            display_time: None,
+            frame_status: None,
+            scale_factor: None,
+            content_scale: None,
+            content_rect: None,
+        },
+    })
+}
+
+fn frame_rect(frame: screencapturekit::cg::CGRect) -> FrameRect {
+    FrameRect {
+        x: frame.origin.x,
+        y: frame.origin.y,
+        width: frame.size.width,
+        height: frame.size.height,
+    }
 }
 
 fn unix_ms_now() -> u64 {
@@ -233,10 +374,6 @@ fn unix_ms_now() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-/// Decode `SCStreamFrameInfoStatus` from the sample attachment dictionary.
-///
-/// ScreenCaptureKit stores the enum as a CFNumber/NSNumber. This deliberately
-/// uses Apple's exported key constant rather than copying its string value.
 fn frame_status_from_attachment(sample: &CMSampleBuffer) -> Option<SCFrameStatus> {
     type CFIndex = isize;
     type CFTypeId = usize;

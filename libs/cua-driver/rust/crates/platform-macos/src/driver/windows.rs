@@ -76,7 +76,8 @@ impl Clone for RetainedAxWindow {
 unsafe impl Send for RetainedAxWindow {}
 unsafe impl Sync for RetainedAxWindow {}
 
-type AxWindowMatches = HashMap<u32, Vec<(RetainedAxWindow, Option<bool>)>>;
+type AxWindowMatches =
+    HashMap<u32, Vec<(RetainedAxWindow, Option<bool>, Option<String>, Option<bool>)>>;
 
 impl Drop for RetainedAxWindow {
     fn drop(&mut self) {
@@ -97,6 +98,8 @@ struct NativeWindowSnapshot {
     on_current_space: Option<bool>,
     space_ids: Option<Vec<u64>>,
     minimized: Option<bool>,
+    subrole: Option<String>,
+    is_main: Option<bool>,
     scale_factor: Option<f64>,
     ax_identity: RetainedAxWindow,
 }
@@ -211,7 +214,7 @@ impl SystemWindowSnapshotSource {
                 );
                 continue;
             }
-            let (ax_identity, minimized) = &candidates[0];
+            let (ax_identity, minimized, subrole, is_main) = &candidates[0];
             let space = windows::space_facts(window.window_id);
             let scale_factor = windows::display_scale_for_bounds(&window.bounds);
             snapshots.push(NativeWindowSnapshot {
@@ -241,6 +244,8 @@ impl SystemWindowSnapshotSource {
                 on_current_space: space.as_ref().map(|facts| facts.on_current_space),
                 space_ids: space.map(|facts| facts.space_ids),
                 minimized: *minimized,
+                subrole: subrole.clone(),
+                is_main: *is_main,
                 scale_factor,
                 ax_identity: ax_identity.clone(),
             });
@@ -304,11 +309,13 @@ fn ax_windows_for_process(pid: i32) -> AxWindowMatches {
             continue;
         };
         let minimized = unsafe { bindings::copy_bool_attr(element, "AXMinimized") };
+        let subrole = unsafe { bindings::copy_string_attr(element, "AXSubrole") };
+        let is_main = unsafe { bindings::copy_bool_attr(element, "AXMain") };
         let retained = unsafe { RetainedAxWindow::from_owned(element) };
         result
             .entry(window_id)
             .or_default()
-            .push((retained, minimized));
+            .push((retained, minimized, subrole, is_main));
     }
     result
 }
@@ -468,6 +475,7 @@ impl MacWindowRegistry {
                         entry.geometry_revision = GeometryRevision::new();
                     }
                     entry.public.title = snapshot.title.clone();
+                    apply_selection_facts(&mut entry.public, &snapshot);
                     entry.snapshot = snapshot;
                     continue;
                 }
@@ -493,7 +501,13 @@ impl MacWindowRegistry {
                 id: id.clone(),
                 app,
                 title: snapshot.title.clone(),
+                usable: false,
+                is_standard: None,
+                is_main: None,
+                z_index: None,
             };
+            let mut public = public;
+            apply_selection_facts(&mut public, &snapshot);
             let process = NativeProcessHandle::new(format!(
                 "macos:{}:{:016x}",
                 snapshot.key.pid, snapshot.key.process_generation
@@ -803,6 +817,10 @@ impl MacWindowRegistry {
                     running: true,
                 },
                 title: snapshot.title,
+                usable: false,
+                is_standard: None,
+                is_main: None,
+                z_index: None,
             };
             let process = parent.stamp.process.clone();
             let native = NativeWindowHandle::new(format!(
@@ -1098,6 +1116,17 @@ fn window_state(snapshot: &NativeWindowSnapshot) -> WindowStateKind {
     }
 }
 
+fn apply_selection_facts(window: &mut WindowRef, snapshot: &NativeWindowSnapshot) {
+    window.usable =
+        snapshot.layer == 0 && matches!(window_state(snapshot), WindowStateKind::Visible);
+    window.is_standard = snapshot
+        .subrole
+        .as_deref()
+        .map(|subrole| subrole == "AXStandardWindow");
+    window.is_main = snapshot.is_main;
+    window.z_index = Some(snapshot.z_index);
+}
+
 fn facts_for_entry(entry: &RegistryEntry) -> MacWindowFacts {
     MacWindowFacts {
         stamp: ResolvedWindowStamp {
@@ -1250,6 +1279,8 @@ mod tests {
             on_current_space: Some(true),
             space_ids: Some(vec![7]),
             minimized: Some(false),
+            subrole: Some("AXStandardWindow".to_owned()),
+            is_main: Some(true),
             scale_factor: Some(2.0),
             ax_identity: ax_identity(ax_label),
         }

@@ -1,7 +1,7 @@
 //! Process-wide v2 controller and invariant-preserving action pipeline.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -21,7 +21,9 @@ use super::{
         TypeTextCommand, VerificationLevel, WindowRef, WindowState,
     },
     errors::{ErrorCode, ErrorPhase, NativeError, PartialEvidence, PartialNativeDispatch},
-    interaction::{MutationDeadline, NativeSideEffectBoundary, ScopePlan, ScopeRequirements},
+    interaction::{
+        MutationDeadline, NativeEvidence, NativeSideEffectBoundary, ScopePlan, ScopeRequirements,
+    },
     menu::{MenuLifecycle, MenuMutationIntent},
     observation::{
         revision_accessibility, ObservationRecord, ResolvedDrag, ResolvedScroll, ResolvedWindow,
@@ -516,6 +518,11 @@ impl<P: PlatformDriver> DriverController<P> {
     ) -> Result<ActionReceipt, NativeError> {
         command.request.validate().map_err(NativeError::invalid)?;
         let observation_id = command.request.observation_id.clone();
+        if command.request.text.is_empty() {
+            return self
+                .type_text_noop(client_id, command.window, observation_id)
+                .await;
+        }
         self.mutate(
             client_id,
             command.window,
@@ -533,6 +540,66 @@ impl<P: PlatformDriver> DriverController<P> {
             },
         )
         .await
+    }
+
+    async fn type_text_noop(
+        &self,
+        client_id: &ClientId,
+        public_window: WindowRef,
+        observation_id: ObservationId,
+    ) -> Result<ActionReceipt, NativeError> {
+        let resolved = self.platform.windows().resolve(&public_window).await?;
+        ensure_public_window_matches(&public_window, &resolved)?;
+        let key = TargetKey::from_window(client_id.clone(), &resolved);
+        let target = self.targets.get(&key).await?;
+        let _process_guard = tokio::time::timeout(
+            self.lock_timeout,
+            Arc::clone(&target.mutation_lock).lock_owned(),
+        )
+        .await
+        .map_err(|_| target_busy(&resolved))?;
+        target.ensure_valid()?;
+        let mut state = target.state.lock().await;
+        ensure_target_window_matches(&state.window, &resolved)?;
+        let settlement = state
+            .settlement
+            .settled_evidence()
+            .cloned()
+            .ok_or_else(|| {
+                let mut error = NativeError::new(
+                    ErrorCode::UiNotSettled,
+                    ErrorPhase::Settle,
+                    true,
+                    "target is still dirty; observe it to resume settlement before another mutation",
+                );
+                error.pending_settlement = state.settlement.pending_evidence().map(Box::new);
+                error
+            })?;
+        state
+            .observations
+            .validate_focus(&resolved, &observation_id)?;
+        let action_id = ActionId::new();
+        let native_evidence = NativeEvidence {
+            fields: BTreeMap::from([
+                ("route_detail".to_owned(), "empty_text_noop".into()),
+                ("primitive".to_owned(), "empty_text_noop".into()),
+                ("native_side_effect_started".to_owned(), false.into()),
+                ("hardware_cursor_warp_attempted".to_owned(), false.into()),
+            ]),
+            interaction_scope: None,
+        };
+        let receipt = ActionReceipt {
+            action_id,
+            window: resolved.public,
+            consumed_observation_id: observation_id,
+            route: Route::Semantic,
+            verification: VerificationLevel::EffectVerified,
+            settlement,
+            native_evidence,
+            warnings: Vec::new(),
+        };
+        target.touch();
+        Ok(receipt)
     }
 
     pub async fn set_value(
@@ -709,7 +776,7 @@ impl<P: PlatformDriver> DriverController<P> {
                         spec,
                     },
                     AddressingMode::Element,
-                    "semantic_ax_action".to_owned(),
+                    "semantic_element_click".to_owned(),
                 ),
                 Candidate::NotApplicable { reason } => {
                     let point = state
@@ -762,6 +829,25 @@ impl<P: PlatformDriver> DriverController<P> {
                     )
                 }
             },
+            ResolvedAction::TypeText { focus, text } => match self
+                .platform
+                .keyboard()
+                .semantic_type_text_candidate(&mut state.platform, &focus)
+                .await?
+            {
+                Candidate::Prepared(()) => (
+                    Route::Semantic,
+                    ResolvedAction::TypeText { focus, text },
+                    AddressingMode::ObservedFocus,
+                    "semantic_focused_text_insertion".to_owned(),
+                ),
+                Candidate::NotApplicable { reason } => (
+                    Route::TargetedKeyboard,
+                    ResolvedAction::TypeText { focus, text },
+                    AddressingMode::ObservedFocus,
+                    format!("semantic_not_applicable:{reason}"),
+                ),
+            },
             prepared => {
                 let route = route_for_live_action(&prepared);
                 (
@@ -810,7 +896,9 @@ impl<P: PlatformDriver> DriverController<P> {
             })?;
             state.menu.begin_target(&menu_id, action_id.clone())?;
             Some(MenuMutationIntent::Targeting { menu_id, identity })
-        } else if matches!(prepared, ResolvedAction::PointClick { .. }) {
+        } else if matches!(prepared, ResolvedAction::PointClick { .. })
+            || is_escape_key_action(&prepared)
+        {
             match state.menu.lifecycle() {
                 MenuLifecycle::Open { id, .. } => {
                     let menu_id = id.clone();
@@ -833,12 +921,7 @@ impl<P: PlatformDriver> DriverController<P> {
         } else {
             match state.menu.lifecycle() {
                 MenuLifecycle::Closed => None,
-                MenuLifecycle::Open { .. } => {
-                    return Err(NativeError::unsupported(
-                        "non-menu mutation is refused while an observed native menu is open",
-                    )
-                    .with_detail("recipe_status", "menu_target_required"))
-                }
+                MenuLifecycle::Open { .. } => None,
                 _ => {
                     return Err(NativeError::stale(
                         ErrorCode::MenuStateStale,
@@ -848,6 +931,13 @@ impl<P: PlatformDriver> DriverController<P> {
             }
         };
         let mut requirements = ScopeRequirements::for_route(route);
+        // The signed helper's element-click pipeline always passes through
+        // SyntheticAppFocusEnforcer before AXPress or pointer fallback. An
+        // inactive AppKit menu can acknowledge AXPress while doing nothing
+        // unless the target process first believes it has key focus.
+        if matches!(prepared, ResolvedAction::ElementClick { .. }) {
+            requirements.target_belief = true;
+        }
         requirements.menu_dismissal = menu_intent.is_some();
         let preflight_result = {
             let TargetControllerState {
@@ -1068,6 +1158,7 @@ impl<P: PlatformDriver> DriverController<P> {
             requires_effect_verification,
             action_allows_target_disappearance(&prepared),
         );
+        let retire_target_after_success = profile.target_may_disappear;
         // Refresh the store's current proof immediately before handing the
         // provider its explicit first-native-side-effect boundary. The target
         // lock prevents any concurrent core mutation of this record.
@@ -1228,6 +1319,13 @@ impl<P: PlatformDriver> DriverController<P> {
 
         let teardown = scope.release();
         let teardown_failed = !teardown.failures.is_empty();
+        let target_retired =
+            retire_target_after_success && dispatch.is_some() && settlement.is_some();
+        if target_retired {
+            // A successful exact close leaves no native object for this
+            // controller's observers or synthetic focus belief to own.
+            target.invalidate();
+        }
         let target_invalidated = target.ensure_valid().is_err();
         if teardown_failed {
             target.invalidate();
@@ -1263,6 +1361,10 @@ impl<P: PlatformDriver> DriverController<P> {
         native_evidence.fields.insert(
             "capability_evidence".to_owned(),
             capability_evidence_status(capability_evidence.as_ref(), route).into(),
+        );
+        native_evidence.fields.insert(
+            "target_controller_retired".to_owned(),
+            target_retired.into(),
         );
         let partial = PartialEvidence::Action {
             action_id: action_id.clone(),
@@ -1502,8 +1604,9 @@ fn route_for_live_action(action: &ResolvedAction) -> Route {
         ResolvedAction::PointClick { .. }
         | ResolvedAction::Drag(_)
         | ResolvedAction::DeltaScroll(_) => Route::TargetedPointer,
-        ResolvedAction::PressKey { .. } | ResolvedAction::TypeText { .. } => {
-            Route::TargetedKeyboard
+        ResolvedAction::PressKey { .. } => Route::TargetedKeyboard,
+        ResolvedAction::TypeText { .. } => {
+            unreachable!("type_text owns an exact semantic-to-targeted route ladder")
         }
         ResolvedAction::ElementClick { .. }
         | ResolvedAction::ElementScroll { .. }
@@ -1511,6 +1614,15 @@ fn route_for_live_action(action: &ResolvedAction) -> Route {
         | ResolvedAction::SelectText { .. }
         | ResolvedAction::Secondary { .. } => Route::Semantic,
     }
+}
+
+fn is_escape_key_action(action: &ResolvedAction) -> bool {
+    matches!(
+        action,
+        ResolvedAction::PressKey { stroke, .. }
+            if stroke.modifiers.is_empty()
+                && matches!(stroke.key.trim().to_ascii_lowercase().as_str(), "escape" | "esc")
+    )
 }
 
 fn capability_evidence_status(decision: Option<&RouteDecision>, selected: Route) -> &'static str {
@@ -1732,12 +1844,18 @@ fn settlement_profile(
     target_may_disappear: bool,
 ) -> SettlementProfile {
     if target_may_disappear {
-        return SettlementProfile::requiring(
+        let mut profile = SettlementProfile::requiring(
             "performsecondaryaction_target_close",
             [SettlementSignal::WindowListChanged],
         )
         .with_relevant_signals([SettlementSignal::WindowListChanged])
         .allowing_target_disappearance();
+        // Window disappearance is the terminal signal, but AppKit can still
+        // be completing its close transition after that signal arrives. Keep
+        // the signed helper's post-element-action interval before allowing a
+        // replacement target in the same process to begin.
+        profile.quiet_window_ms = 250;
+        return profile;
     }
     if exact_readback {
         return SettlementProfile::requiring(
@@ -1763,15 +1881,28 @@ fn settlement_profile(
         ]);
     }
     if matches!(menu_intent, Some(MenuMutationIntent::Dismissing { .. })) {
-        return SettlementProfile::requiring(
-            format!("{action:?}_menu_dismiss").to_lowercase(),
-            [SettlementSignal::MenuDismissed],
-        )
-        .with_relevant_signals([
-            SettlementSignal::MenuDismissed,
-            SettlementSignal::WindowListChanged,
-            SettlementSignal::FocusChanged,
-        ]);
+        return SettlementProfile::dispatch_only(format!("{action:?}_menu_dismiss").to_lowercase())
+            .with_relevant_signals([
+                SettlementSignal::MenuDismissed,
+                SettlementSignal::WindowListChanged,
+                SettlementSignal::FocusChanged,
+            ]);
+    }
+    if matches!(menu_intent, Some(MenuMutationIntent::Targeting { .. })) {
+        let mut profile =
+            SettlementProfile::dispatch_only(format!("{action:?}_menu_target").to_lowercase())
+                .with_relevant_signals([
+                    SettlementSignal::AxValueChanged,
+                    SettlementSignal::MenuDismissed,
+                    SettlementSignal::WindowListChanged,
+                    SettlementSignal::FocusChanged,
+                ]);
+        // The signed helper leaves a 250 ms post-click settling interval before
+        // returning refreshed state. Finder applies AXSelected + AXPress
+        // asynchronously; the ordinary 30 ms quiet window can otherwise
+        // publish the menu's disappearing AXWindow as though it were live.
+        profile.quiet_window_ms = 250;
+        return profile;
     }
     let relevant = match action {
         ActionKind::Click => vec![
@@ -1810,12 +1941,19 @@ fn settlement_profile(
         ],
     };
     let name = format!("{action:?}").to_lowercase();
-    if route == Route::TargetedPointer {
+    let mut profile = if route == Route::TargetedPointer {
         SettlementProfile::requiring(name, [SettlementSignal::PointerSequenceComplete])
             .with_relevant_signals(relevant)
     } else {
         SettlementProfile::dispatch_only(name).with_relevant_signals(relevant)
+    };
+    if matches!(action, ActionKind::Click) {
+        // The signed helper keeps a 250 ms post-click interval before it
+        // publishes refreshed state. This covers delayed native selection and
+        // menu transitions without app-specific sleeps in the public harness.
+        profile.quiet_window_ms = 250;
     }
+    profile
 }
 
 fn action_allows_target_disappearance(action: &ResolvedAction) -> bool {
@@ -1851,6 +1989,7 @@ fn _type_assertions(_: Framework, _: WindowStateKind, _: AxTreeMode) {}
 #[cfg(test)]
 mod target_disappearance_tests {
     use super::*;
+    use crate::api::{MenuId, NativeMenuIdentity, NativeProcessHandle, NativeWindowHandle};
 
     #[test]
     fn only_exact_close_button_press_allows_target_disappearance() {
@@ -1885,5 +2024,40 @@ mod target_disappearance_tests {
             profile.required_terminal_signals,
             [SettlementSignal::WindowListChanged].into()
         );
+        assert_eq!(profile.quiet_window_ms, 250);
+    }
+
+    #[test]
+    fn menu_target_profile_waits_for_signed_helper_quiet_interval() {
+        let menu_id = MenuId::new();
+        let profile = settlement_profile(
+            &ActionKind::Click,
+            Route::Semantic,
+            Some(&MenuMutationIntent::Targeting {
+                menu_id,
+                identity: NativeMenuIdentity {
+                    process: NativeProcessHandle::new("menu-process").unwrap(),
+                    window: NativeWindowHandle::new("menu-window").unwrap(),
+                    generation: super::super::contracts::WindowGeneration(1),
+                },
+            }),
+            false,
+            false,
+        );
+        assert_eq!(profile.name, "click_menu_target");
+        assert_eq!(profile.quiet_window_ms, 250);
+    }
+
+    #[test]
+    fn ordinary_click_profile_waits_for_signed_helper_quiet_interval() {
+        let profile = settlement_profile(
+            &ActionKind::Click,
+            Route::TargetedPointer,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(profile.name, "click");
+        assert_eq!(profile.quiet_window_ms, 250);
     }
 }

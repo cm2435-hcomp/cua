@@ -40,6 +40,10 @@ fn window_ref() -> WindowRef {
         id: id("window-1", WindowId::parse),
         app: app_ref(),
         title: Some("Fixture window".to_owned()),
+        usable: true,
+        is_standard: Some(true),
+        is_main: Some(true),
+        z_index: Some(1),
     }
 }
 
@@ -1105,15 +1109,56 @@ async fn keyboard_actions_reject_unknown_observations_before_provider_prepare() 
 }
 
 #[tokio::test]
+async fn empty_type_text_is_a_signed_compatible_noop_without_native_dispatch() {
+    let platform = Arc::new(FakePlatform::default());
+    let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
+    let client = id("empty-type-text-client", ClientId::parse);
+    let state = controller
+        .get_window_state(
+            &client,
+            GetWindowStateRequest {
+                window: window_ref(),
+                include_text: true,
+                include_screenshots: false,
+                ax_tree_mode: AxTreeMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+
+    let receipt = controller
+        .type_text(
+            &client,
+            TypeTextCommand {
+                window: window_ref(),
+                request: TypeTextRequest {
+                    observation_id: state.observation_id.clone(),
+                    text: String::new(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.consumed_observation_id, state.observation_id);
+    assert_eq!(receipt.verification, VerificationLevel::EffectVerified);
+    assert_eq!(
+        receipt.native_evidence.fields.get("route_detail"),
+        Some(&serde_json::json!("empty_text_noop"))
+    );
+    assert_eq!(platform.ordering.lock().unwrap().as_slice(), ["observe"]);
+}
+
+#[tokio::test]
 async fn controller_preserves_target_state_and_consumes_at_dispatch_boundary() {
     let platform = Arc::new(FakePlatform::default());
     let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
     let manifest = controller.get_capabilities().await.unwrap();
     assert_eq!(manifest.cells.len(), 4);
-    assert!(manifest.cells.iter().any(|cell| matches!(
-        cell.decision,
-        RouteDecision::Unsupported { .. }
-    )));
+    assert!(manifest
+        .cells
+        .iter()
+        .any(|cell| matches!(cell.decision, RouteDecision::Unsupported { .. })));
     assert!(manifest.cells.iter().any(|cell| matches!(
         cell.decision,
         RouteDecision::Supported {
@@ -1348,7 +1393,7 @@ async fn controller_preserves_target_state_and_consumes_at_dispatch_boundary() {
 }
 
 #[tokio::test]
-async fn semantic_element_dispatch_uses_the_locked_target_and_interaction_scope() {
+async fn indexed_element_click_prefers_exact_semantic_delivery() {
     let platform = Arc::new(FakePlatform::default());
     let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
     let client = id("semantic-client", ClientId::parse);
@@ -1390,10 +1435,24 @@ async fn semantic_element_dispatch_uses_the_locked_target_and_interaction_scope(
         .unwrap();
 
     assert_eq!(receipt.route, Route::Semantic);
+    assert_eq!(
+        receipt.native_evidence.fields["route_detail"],
+        "semantic_element_click"
+    );
     assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 1);
     let key = TargetKey::from_window(client.clone(), &resolved_window());
     let target = controller.targets.get(&key).await.unwrap();
     assert_eq!(target.state.lock().await.platform.semantic_dispatches, 1);
+    assert_eq!(
+        receipt
+            .native_evidence
+            .interaction_scope
+            .as_ref()
+            .expect("element click carries typed scope evidence")
+            .acquisition
+            .target_belief,
+        LeaseDecision::Acquired
+    );
     assert_eq!(
         platform.ordering.lock().unwrap().as_slice(),
         [
@@ -1409,20 +1468,20 @@ async fn semantic_element_dispatch_uses_the_locked_target_and_interaction_scope(
 }
 
 #[tokio::test]
-async fn element_click_without_exact_semantic_candidate_uses_current_observation_point_route() {
+async fn indexed_element_click_falls_back_before_dispatch_when_semantic_is_not_applicable() {
     let platform = Arc::new(FakePlatform::default());
     platform
         .semantic_candidate_unusable
         .store(true, Ordering::SeqCst);
     let controller = DriverController::new(Arc::clone(&platform), PlatformName::Macos, "test-os");
-    let client = id("element-point-fallback-client", ClientId::parse);
+    let client = id("pointer-fallback-client", ClientId::parse);
     let observed = controller
         .get_window_state(
             &client,
             GetWindowStateRequest {
                 window: window_ref(),
                 include_text: true,
-                include_screenshots: true,
+                include_screenshots: false,
                 ax_tree_mode: AxTreeMode::Full,
             },
         )
@@ -1450,29 +1509,24 @@ async fn element_click_without_exact_semantic_candidate_uses_current_observation
 
     assert_eq!(receipt.route, Route::TargetedPointer);
     assert_eq!(
-        receipt.native_evidence.fields["capability_evidence"],
-        "published_unsupported_nonblocking"
+        receipt.native_evidence.fields["route_detail"],
+        "semantic_not_applicable:fake semantic click unavailable"
     );
-    assert!(receipt.native_evidence.fields["route_detail"]
-        .as_str()
-        .is_some_and(|detail| detail.starts_with("semantic_not_applicable:")));
-    assert!(platform
-        .ordering
-        .lock()
-        .unwrap()
-        .contains(&"pointer_prepare"));
+    assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 1);
+    let key = TargetKey::from_window(client.clone(), &resolved_window());
+    let target = controller.targets.get(&key).await.unwrap();
+    assert_eq!(target.state.lock().await.platform.semantic_dispatches, 0);
     assert_eq!(
-        controller
-            .targets
-            .get(&TargetKey::from_window(client, &resolved_window()))
-            .await
-            .unwrap()
-            .state
-            .lock()
-            .await
-            .platform
-            .semantic_dispatches,
-        0
+        platform.ordering.lock().unwrap().as_slice(),
+        [
+            "observe",
+            "preflight",
+            "scope_acquired",
+            "pointer_prepare",
+            "dispatch",
+            "settle",
+            "scope_released"
+        ]
     );
 }
 

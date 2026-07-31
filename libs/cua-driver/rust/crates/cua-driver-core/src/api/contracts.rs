@@ -128,6 +128,16 @@ pub struct WindowRef {
     pub app: AppRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Exact native facts used by the app-addressed facade to choose a
+    /// working window without guessing from its title.
+    #[serde(default)]
+    pub usable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_standard: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_main: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -504,11 +514,7 @@ pub struct TypeTextRequest {
 
 impl TypeTextRequest {
     pub fn validate(&self) -> Result<(), String> {
-        if self.text.is_empty() {
-            Err("text cannot be empty".to_owned())
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 }
 

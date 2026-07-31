@@ -1214,7 +1214,6 @@ mod tests {
     #[test]
     fn real_active_transitions_reconcile_belief_without_revoking_synthetic_state() {
         let state = Arc::new(Mutex::new(crate::driver::target::MacFocusState {
-            shutdown: false,
             pid: 42,
             cg_window_id: 7,
             application_is_active: false,

@@ -20,10 +20,10 @@ use serde_json::Value;
 
 use crate::{
     ax::bindings::{
-        self, copy_action_names_exact, copy_attr_value, copy_ax_windows, copy_children,
-        copy_element_attr, copy_string_attr, copy_string_attr_exact, is_attribute_settable,
-        kAXErrorAttributeUnsupported, kAXErrorSuccess, AXUIElementCreateApplication,
-        AXUIElementRef, AxCfRange,
+        self, copy_action_names_exact, copy_attr_value, copy_ax_windows, copy_bool_attr_exact,
+        copy_children, copy_element_attr, copy_string_attr, copy_string_attr_exact,
+        is_attribute_settable, kAXErrorAttributeUnsupported, kAXErrorSuccess,
+        AXUIElementCreateApplication, AXUIElementRef, AxCfRange,
     },
     driver::{
         menu::resolve_menu_identity,
@@ -56,23 +56,28 @@ pub struct MacPreparedSemanticAction {
 
 enum PreparedKind {
     AxAction {
-        element: LiveAxElement,
+        element: Box<LiveAxElement>,
         action: String,
         primitive: &'static str,
+        select_before_action: bool,
         opens_menu: bool,
         open_verification: Option<AxOpenVerification>,
     },
+    SelectAncestor {
+        requested: Box<LiveAxElement>,
+        selection: Box<LiveAxElement>,
+    },
     PageScroll {
-        route: PageRoute,
+        route: Box<PageRoute>,
         direction: ScrollDirection,
         pages: u16,
     },
     SetValue {
-        element: LiveAxElement,
+        element: Box<LiveAxElement>,
         value: String,
     },
     SelectText {
-        element: LiveAxElement,
+        element: Box<LiveAxElement>,
         range: AxCfRange,
         expected_text: String,
     },
@@ -103,17 +108,24 @@ impl MacSemanticActions {
                 "element click shape has no exact semantic primitive",
             ));
         };
-        if action == AX_PRESS
+        let has_exact_action = matches!(action, AX_PRESS | AX_OPEN)
             && live
                 .snapshot
                 .actions
                 .iter()
-                .any(|candidate| candidate == AX_PRESS)
-        {
+                .any(|candidate| candidate == action);
+        let has_selection_ancestor = if !has_exact_action && action == AX_PRESS {
+            self.selection_ancestor(target, &live.snapshot)
+                .await?
+                .is_some()
+        } else {
+            false
+        };
+        if has_exact_action || has_selection_ancestor {
             Ok(Candidate::Prepared(()))
         } else {
             Ok(Candidate::not_applicable(
-                "element does not retain an exact usable AXPress action",
+                "element has neither an exact role-aware semantic click action nor a writable AX selection ancestor",
             ))
         }
     }
@@ -165,17 +177,71 @@ impl MacSemanticActions {
                 let live = self.refetch_exact(target, element).await?;
                 let action =
                     click_action(&live.snapshot.role, live.snapshot.subrole.as_deref(), spec)?;
-                require_exact_action(&live.snapshot.actions, action)?;
-                PreparedKind::AxAction {
-                    element: live,
-                    action: action.to_owned(),
-                    primitive: if action == AX_SHOW_MENU {
-                        "macos_ax_show_menu"
+                if !live
+                    .snapshot
+                    .actions
+                    .iter()
+                    .any(|candidate| candidate == action)
+                {
+                    if action == AX_PRESS {
+                        if let Some(selection) =
+                            self.selection_ancestor(target, &live.snapshot).await?
+                        {
+                            PreparedKind::SelectAncestor {
+                                requested: Box::new(live),
+                                selection: Box::new(selection),
+                            }
+                        } else {
+                            return Err(NativeError::unsupported(
+                                "macOS element has neither AXPress nor a writable AX selection ancestor",
+                            ));
+                        }
                     } else {
-                        "macos_ax_press"
-                    },
-                    opens_menu: action == AX_SHOW_MENU,
-                    open_verification: None,
+                        return Err(NativeError::unsupported(format!(
+                            "live macOS AX element does not expose exact action {action}"
+                        )));
+                    }
+                } else {
+                    let select_before_action =
+                        requires_selection_before_click(&live.snapshot.role, action);
+                    if select_before_action
+                        && !unsafe { is_attribute_settable(live.as_ptr(), "AXSelected") }
+                            .map_err(|error| ax_stale_error("AXSelected settable", error))?
+                    {
+                        return Err(NativeError::unsupported(
+                            "macOS menu item has no exact writable AXSelected route",
+                        ));
+                    }
+                    let open_verification = if action == AX_OPEN {
+                        self.prepare_ax_open_verification(
+                            target.window.clone(),
+                            live.snapshot.owner.clone(),
+                            live.snapshot.owner_window_id,
+                            live.snapshot
+                                .label
+                                .clone()
+                                .or_else(|| live.snapshot.string_value.clone()),
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+                    PreparedKind::AxAction {
+                        element: Box::new(live),
+                        action: action.to_owned(),
+                        primitive: if action == AX_SHOW_MENU {
+                            "macos_ax_show_menu"
+                        } else if action == AX_OPEN {
+                            "macos_ax_open"
+                        } else if select_before_action {
+                            "macos_ax_select_then_press"
+                        } else {
+                            "macos_ax_press"
+                        },
+                        select_before_action,
+                        opens_menu: action == AX_SHOW_MENU,
+                        open_verification,
+                    }
                 }
             }
             ResolvedAction::ElementScroll { element, spec, .. } => {
@@ -186,7 +252,7 @@ impl MacSemanticActions {
                     )
                 })?;
                 PreparedKind::PageScroll {
-                    route: self.prepare_scroll_route(target, element, spec).await?,
+                    route: Box::new(self.prepare_scroll_route(target, element, spec).await?),
                     direction: spec.direction,
                     pages,
                 }
@@ -202,7 +268,7 @@ impl MacSemanticActions {
                     ));
                 }
                 PreparedKind::SetValue {
-                    element: live,
+                    element: Box::new(live),
                     value: value.clone(),
                 }
             }
@@ -227,7 +293,7 @@ impl MacSemanticActions {
                     SelectionType::CursorBefore | SelectionType::CursorAfter => String::new(),
                 };
                 PreparedKind::SelectText {
-                    element: live,
+                    element: Box::new(live),
                     range,
                     expected_text,
                 }
@@ -248,13 +314,14 @@ impl MacSemanticActions {
                     None
                 };
                 PreparedKind::AxAction {
-                    element: live,
+                    element: Box::new(live),
                     action: action.clone(),
                     primitive: if action == AX_SHOW_MENU {
                         "macos_ax_show_menu"
                     } else {
                         "macos_ax_secondary_action"
                     },
+                    select_before_action: false,
                     opens_menu: action == AX_SHOW_MENU,
                     open_verification,
                 }
@@ -376,10 +443,21 @@ impl MacSemanticActions {
                 element,
                 action,
                 primitive,
+                select_before_action,
                 opens_menu,
                 open_verification,
             } => {
                 boundary.begin()?;
+                let selection_result = if select_before_action {
+                    let result =
+                        unsafe { bindings::set_bool_attr_true(element.as_ptr(), "AXSelected") };
+                    if result != kAXErrorSuccess {
+                        return Err(ax_dispatch_error("AXSelected menu-item write", result));
+                    }
+                    Some(result)
+                } else {
+                    None
+                };
                 let result = unsafe { bindings::perform_action(element.as_ptr(), &action) };
                 let post_error_readback_attempts = if result == kAXErrorAttributeUnsupported {
                     match open_verification.as_ref() {
@@ -407,6 +485,10 @@ impl MacSemanticActions {
                         ("ax_action", Value::String(action.clone())),
                         ("ax_return_code", Value::from(result)),
                         (
+                            "ax_selected_return_code",
+                            selection_result.map_or(Value::Null, Value::from),
+                        ),
+                        (
                             "post_error_effect_verified",
                             Value::Bool(post_error_effect_verified),
                         ),
@@ -428,7 +510,11 @@ impl MacSemanticActions {
                         ("destination_title_matched".to_owned(), Value::Bool(true)),
                     ]);
                 }
-                if let Some(intent) = &scope.menu_intent {
+                if let Some(
+                    intent @ (MenuMutationIntent::Opening { .. }
+                    | MenuMutationIntent::Targeting { .. }),
+                ) = &scope.menu_intent
+                {
                     if let Err(mut error) =
                         target.arm_menu_suppression(&scope.action_id, intent.menu_id())
                     {
@@ -451,15 +537,21 @@ impl MacSemanticActions {
                         .await?,
                     ),
                     Some(MenuMutationIntent::Targeting { menu_id, identity }) if !opens_menu => {
-                        Some(
-                            self.menu_outcome_after_target(
-                                scope.owner.clone(),
-                                scope.action_id.clone(),
-                                menu_id.clone(),
-                                identity.clone(),
-                            )
-                            .await?,
-                        )
+                        // Selecting and AXPressing the live menu item proves
+                        // that the exact menu item was targeted, not that a leaf dismissed the
+                        // item was targeted, not that a leaf dismissed the
+                        // menu. Do not synchronously recapture the entire AX
+                        // tree here: the signed helper settles first and
+                        // folds menu closure into its post-action observation,
+                        // and a Finder navigation can make that recursive
+                        // re-walk block. The mandatory next observation owns
+                        // the truthful Open/Closed transition.
+                        Some(NativeMenuEvidence::Targeted {
+                            menu_id: menu_id.clone(),
+                            action_id: scope.action_id.clone(),
+                            owner: scope.owner.clone(),
+                            identity: identity.clone(),
+                        })
                     }
                     Some(MenuMutationIntent::Dismissing { .. }) => {
                         return Err(NativeError::new(
@@ -489,12 +581,48 @@ impl MacSemanticActions {
                 }
                 Ok(native_dispatch)
             }
+            PreparedKind::SelectAncestor {
+                requested: _,
+                selection,
+            } => {
+                boundary.begin()?;
+                let result =
+                    unsafe { bindings::set_bool_attr_true(selection.as_ptr(), "AXSelected") };
+                if result != kAXErrorSuccess {
+                    return Err(ax_dispatch_error("AXSelected ancestor write", result));
+                }
+                let selected = unsafe {
+                    copy_bool_attr_exact(selection.as_ptr(), "AXSelected")
+                        .map_err(|error| ax_verification_error("AXSelected readback", error))?
+                };
+                target
+                    .signals
+                    .record(SettlementSignal::VerificationReadbackComplete);
+                if selected != Some(true) {
+                    return Err(verification_error(
+                        "macOS AX selection ancestor did not read back selected",
+                    ));
+                }
+                target.deactivate_focus_belief_after_selection()?;
+                Ok(dispatch(
+                    VerificationLevel::EffectVerified,
+                    "macos_ax_select_ancestor",
+                    [
+                        (
+                            "selection_ancestor_role",
+                            Value::String(selection.snapshot.role.clone()),
+                        ),
+                        ("exact_selected_readback", Value::Bool(true)),
+                        ("target_focus_belief_deactivated", Value::Bool(true)),
+                    ],
+                ))
+            }
             PreparedKind::PageScroll {
                 route,
                 direction,
                 pages,
             } => {
-                let (native, action, route_name) = match &route {
+                let (native, action, route_name) = match route.as_ref() {
                     PageRoute::Direct { element, action } => {
                         (element.as_ptr(), *action, "nearest_direct_page_action")
                     }
@@ -651,30 +779,6 @@ impl MacSemanticActions {
         }
     }
 
-    async fn menu_outcome_after_target(
-        &self,
-        owner: cua_driver_core::api::observation::ResolvedWindowStamp,
-        action_id: cua_driver_core::api::contracts::ActionId,
-        menu_id: cua_driver_core::api::contracts::MenuId,
-        prior_identity: NativeMenuIdentity,
-    ) -> Result<NativeMenuEvidence, NativeError> {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Some(identity) = self.discover_menu_identity(owner.clone()).await? {
-            return Ok(NativeMenuEvidence::Targeted {
-                menu_id,
-                action_id,
-                owner,
-                identity,
-            });
-        }
-        Ok(NativeMenuEvidence::Dismissed {
-            menu_id,
-            action_id,
-            owner,
-            identity: prior_identity,
-        })
-    }
-
     async fn discover_menu_identity(
         &self,
         owner: cua_driver_core::api::observation::ResolvedWindowStamp,
@@ -724,7 +828,11 @@ impl MacSemanticActions {
             PreparedKind::AxAction { element, .. }
             | PreparedKind::SetValue { element, .. }
             | PreparedKind::SelectText { element, .. } => vec![element.snapshot.clone()],
-            PreparedKind::PageScroll { route, .. } => match route {
+            PreparedKind::SelectAncestor {
+                requested,
+                selection,
+            } => vec![requested.snapshot.clone(), selection.snapshot.clone()],
+            PreparedKind::PageScroll { route, .. } => match route.as_ref() {
                 PageRoute::Direct { element, .. }
                 | PageRoute::ScrollbarPageChild { element, .. } => {
                     vec![element.snapshot.clone()]
@@ -785,6 +893,29 @@ impl MacSemanticActions {
     ) -> Result<LiveAxElement, NativeError> {
         let snapshot = self.registered_exact(target, element)?;
         self.refetch_registered_exact(target, snapshot).await
+    }
+
+    async fn selection_ancestor(
+        &self,
+        target: &mut MacTargetState,
+        requested: &RegisteredElementSnapshot,
+    ) -> Result<Option<LiveAxElement>, NativeError> {
+        let snapshots = target.elements.registered_snapshots();
+        for candidate in retained_ancestor_chain(requested, &snapshots)?
+            .into_iter()
+            .skip(1)
+        {
+            let live = self.refetch_registered_exact(target, candidate).await?;
+            let selected = unsafe { copy_bool_attr_exact(live.as_ptr(), "AXSelected") }
+                .map_err(|error| ax_stale_error("AXSelected ancestor refetch", error))?;
+            if selected.is_some()
+                && unsafe { is_attribute_settable(live.as_ptr(), "AXSelected") }
+                    .map_err(|error| ax_stale_error("AXSelected ancestor settable", error))?
+            {
+                return Ok(Some(live));
+            }
+        }
+        Ok(None)
     }
 
     async fn refetch_registered_exact(
@@ -947,18 +1078,26 @@ fn click_action(
     _subrole: Option<&str>,
     click: &ClickSpec,
 ) -> Result<&'static str, NativeError> {
-    if click.click_count != 1 || !click.modifiers.is_empty() {
+    if !click.modifiers.is_empty() {
         return Err(NativeError::unsupported(
-            "semantic macOS click supports exactly one click with no modifiers",
+            "semantic macOS click supports no modifiers",
         ));
     }
-    match click.button {
-        MouseButton::Left => Ok(AX_PRESS),
-        MouseButton::Right => Ok(AX_SHOW_MENU),
-        MouseButton::Middle => Err(NativeError::unsupported(
+    match (click.button, click.click_count) {
+        (MouseButton::Left, 1) => Ok(AX_PRESS),
+        (MouseButton::Left, 2) => Ok(AX_OPEN),
+        (MouseButton::Right, 1) => Ok(AX_SHOW_MENU),
+        (MouseButton::Middle, _) => Err(NativeError::unsupported(
             "semantic macOS click has no exact middle-button route",
         )),
+        _ => Err(NativeError::unsupported(
+            "semantic macOS click shape has no exact AX action",
+        )),
     }
+}
+
+fn requires_selection_before_click(role: &str, action: &str) -> bool {
+    role == "AXMenuItem" && action == AX_PRESS
 }
 
 fn is_scroll_container_role(role: &str) -> bool {
@@ -1397,11 +1536,23 @@ mod tests {
             .unwrap(),
             AX_SHOW_MENU
         );
+        assert_eq!(
+            click_action(
+                "AXTextField",
+                None,
+                &ClickSpec {
+                    button: MouseButton::Left,
+                    click_count: 2,
+                    modifiers: vec![],
+                },
+            )
+            .unwrap(),
+            AX_OPEN
+        );
         for (role, subrole) in [
             ("AXPopUpButton", None),
             ("AXMenuButton", None),
             ("AXMenu", None),
-            ("AXMenuItem", None),
             ("AXMenuBar", None),
             ("AXMenuBarItem", None),
             ("AXButton", Some("AXMenuButton")),
@@ -1420,6 +1571,8 @@ mod tests {
                 AX_PRESS
             );
         }
+        assert!(requires_selection_before_click("AXMenuItem", AX_PRESS));
+        assert!(!requires_selection_before_click("AXButton", AX_PRESS));
         for click in [
             ClickSpec {
                 button: MouseButton::Middle,
@@ -1428,7 +1581,7 @@ mod tests {
             },
             ClickSpec {
                 button: MouseButton::Left,
-                click_count: 2,
+                click_count: 3,
                 modifiers: vec![],
             },
             ClickSpec {

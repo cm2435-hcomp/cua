@@ -124,7 +124,7 @@ pub(crate) fn post_pixel_scroll_event(spec: &PixelScrollEventSpec) -> Result<(),
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| construction_failed("CGEventSourceCreate"))?;
     let event =
-        OwnedCGEvent::new_scroll_event(source, ScrollEventUnit::PIXEL, 2, delta_y, delta_x, 0)
+        OwnedCGEvent::new_scroll_event(source, ScrollEventUnit::PIXEL, 1, delta_y, delta_x, 0)
             .map_err(|_| construction_failed("CGEventCreateScrollWheelEvent"))?;
     let event_ref = event.as_ptr().cast::<CGEvent>();
     unsafe {

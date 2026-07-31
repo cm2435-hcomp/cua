@@ -1,6 +1,9 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use async_trait::async_trait;
@@ -204,6 +207,32 @@ impl MacTargetState {
         self.menu_focus_state = Some(state);
     }
 
+    pub(crate) fn deactivate_focus_belief_after_selection(&self) -> Result<(), NativeError> {
+        let state = self.menu_focus_state.as_ref().ok_or_else(|| {
+            NativeError::new(
+                ErrorCode::Internal,
+                ErrorPhase::Dispatch,
+                false,
+                "selection dispatch has no application focus-state binding",
+            )
+        })?;
+        let mut state = state.lock().map_err(|_| {
+            NativeError::new(
+                ErrorCode::Internal,
+                ErrorPhase::Dispatch,
+                false,
+                "selection dispatch focus-state lock was poisoned",
+            )
+        })?;
+        // Codex's selection-bearing sendClick path deactivates its
+        // per-application SyntheticAppFocusEnforcer. The next pointer action
+        // must therefore rebuild the target application's synthetic active
+        // and key-focus belief even though the process itself is unchanged.
+        state.application_believes_it_is_active = state.application_is_active;
+        state.application_believes_it_has_focus = state.application_is_active;
+        Ok(())
+    }
+
     pub(crate) fn arm_menu_suppression(
         &self,
         action_id: &ActionId,
@@ -255,7 +284,6 @@ impl Drop for MacTargetState {
 
 #[derive(Debug)]
 pub(crate) struct MacFocusState {
-    pub shutdown: bool,
     pub pid: i32,
     pub cg_window_id: u32,
     pub application_is_active: bool,
@@ -274,7 +302,6 @@ impl MacFocusState {
     pub(crate) fn new(pid: i32, cg_window_id: u32) -> Self {
         let application_is_active = crate::apps::frontmost_pid() == Some(pid);
         Self {
-            shutdown: false,
             pid,
             cg_window_id,
             application_is_active,
@@ -291,19 +318,41 @@ impl MacFocusState {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct MacFocusStateRegistry {
+    states: Arc<Mutex<HashMap<NativeProcessHandle, Arc<Mutex<MacFocusState>>>>>,
+}
+
+impl MacFocusStateRegistry {
+    pub(crate) fn state_for(
+        &self,
+        process: &NativeProcessHandle,
+        pid: i32,
+        cg_window_id: u32,
+    ) -> Arc<Mutex<MacFocusState>> {
+        let mut states = self.states.lock().expect("macOS focus registry poisoned");
+        Arc::clone(
+            states
+                .entry(process.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(MacFocusState::new(pid, cg_window_id)))),
+        )
+    }
+}
+
 pub struct MacTargetFocusCoordinator {
     state: Arc<Mutex<MacFocusState>>,
     focus_taps: Option<crate::focus_steal::TargetFocusTapRegistration>,
+    shutdown: bool,
 }
 
 impl MacTargetFocusCoordinator {
-    pub(crate) fn new(pid: i32, cg_window_id: u32) -> Result<Self, NativeError> {
-        let state = Arc::new(Mutex::new(MacFocusState::new(pid, cg_window_id)));
+    pub(crate) fn new(pid: i32, state: Arc<Mutex<MacFocusState>>) -> Result<Self, NativeError> {
         let focus_taps =
             crate::focus_steal::TargetFocusTapRegistration::start(pid, Arc::downgrade(&state));
         Ok(Self {
             state,
             focus_taps: Some(focus_taps),
+            shutdown: false,
         })
     }
 
@@ -312,10 +361,7 @@ impl MacTargetFocusCoordinator {
     }
 
     pub(crate) fn is_shutdown(&self) -> bool {
-        self.state
-            .lock()
-            .expect("macOS focus coordinator poisoned")
-            .shutdown
+        self.shutdown
     }
 }
 
@@ -325,10 +371,7 @@ impl TargetFocusCoordinator for MacTargetFocusCoordinator {
         if let Some(mut focus_taps) = self.focus_taps.take() {
             focus_taps.close();
         }
-        let mut state = self.state.lock().expect("macOS focus coordinator poisoned");
-        state.shutdown = true;
-        state.application_believes_it_is_active = false;
-        state.application_believes_it_has_focus = false;
+        self.shutdown = true;
         Ok(())
     }
 }
@@ -338,12 +381,25 @@ impl Drop for MacTargetFocusCoordinator {
         if let Some(mut focus_taps) = self.focus_taps.take() {
             focus_taps.close();
         }
-        let Ok(mut state) = self.state.lock() else {
-            tracing::error!("macOS focus coordinator lock was poisoned during final drop");
-            return;
-        };
-        state.shutdown = true;
-        state.application_believes_it_is_active = false;
-        state.application_believes_it_has_focus = false;
+        self.shutdown = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_registry_reuses_state_per_process_across_exact_windows() {
+        let registry = MacFocusStateRegistry::default();
+        let first_process = NativeProcessHandle::new("process-1").unwrap();
+        let other_process = NativeProcessHandle::new("process-2").unwrap();
+
+        let first_window = registry.state_for(&first_process, 44, 99);
+        let replacement_window = registry.state_for(&first_process, 44, 100);
+        let other = registry.state_for(&other_process, 45, 101);
+
+        assert!(Arc::ptr_eq(&first_window, &replacement_window));
+        assert!(!Arc::ptr_eq(&first_window, &other));
     }
 }

@@ -327,6 +327,20 @@ pub trait PointerActionProvider<TargetState>: Send + Sync {
 pub trait KeyboardActionProvider<TargetState>: Send + Sync {
     type PreparedAction: Send;
 
+    /// Determines whether the exact currently focused control has a verified
+    /// semantic insertion primitive. `NotApplicable` advances to the generic
+    /// targeted-keyboard recipe; stale identity failures must never be
+    /// converted into fallback.
+    async fn semantic_type_text_candidate(
+        &self,
+        _target: &mut TargetState,
+        _focus: &ResolvedFocus,
+    ) -> Result<Candidate<()>, NativeError> {
+        Ok(Candidate::not_applicable(
+            "platform has no exact semantic focused-text insertion candidate",
+        ))
+    }
+
     async fn prepare(
         &self,
         target: &mut TargetState,

@@ -61,6 +61,7 @@ impl HostRecipeContext {
 pub enum AccessibilityRecipe {
     NotApplicable,
     ChromiumPriorStatePreserving,
+    PriorStatePreservingIfSupported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +74,7 @@ pub enum MenuSuppressionRecipe {
 pub enum TargetBeliefRecipe {
     NotApplicable,
     SwiftCoordinateClick,
+    SwiftElementClick,
     SwiftKeyboard,
 }
 
@@ -90,6 +92,9 @@ impl MacScopeRecipe {
             TargetBeliefRecipe::SwiftCoordinateClick => {
                 "swift_coordinate_click_cps_key_focus_returned_macos_26_5_1_arm64"
             }
+            TargetBeliefRecipe::SwiftElementClick => {
+                "swift_element_click_cps_key_focus_returned_macos_26_5_1_arm64"
+            }
             TargetBeliefRecipe::SwiftKeyboard => {
                 "swift_keyboard_cps_key_focus_returned_macos_26_5_1_arm64"
             }
@@ -104,17 +109,29 @@ pub fn select_scope_recipe(
     action: &ResolvedAction,
     requirements: &ScopeRequirements,
 ) -> Result<MacScopeRecipe, NativeError> {
-    let accessibility = if requirements.accessibility
-        && *framework == Framework::Chromium
-        && requires_action_time_chromium_enablement(route, action)
-    {
-        AccessibilityRecipe::ChromiumPriorStatePreserving
-    } else {
-        AccessibilityRecipe::NotApplicable
+    let accessibility = match (route, action) {
+        (Route::Semantic, ResolvedAction::ElementClick { .. }) if requirements.accessibility => {
+            AccessibilityRecipe::PriorStatePreservingIfSupported
+        }
+        _ if requirements.accessibility
+            && *framework == Framework::Chromium
+            && requires_action_time_chromium_enablement(route, action) =>
+        {
+            AccessibilityRecipe::ChromiumPriorStatePreserving
+        }
+        _ => AccessibilityRecipe::NotApplicable,
     };
 
     let target_belief = match route {
         Route::Semantic if !requirements.target_belief => TargetBeliefRecipe::NotApplicable,
+        Route::Semantic
+            if requirements.target_belief
+                && host.os_version == PROVEN_OS_VERSION
+                && host.architecture == PROVEN_ARCHITECTURE
+                && matches!(action, ResolvedAction::ElementClick { .. }) =>
+        {
+            TargetBeliefRecipe::SwiftElementClick
+        }
         Route::TargetedPointer
             if requirements.target_belief
                 && host.os_version == PROVEN_OS_VERSION
@@ -296,6 +313,16 @@ pub(crate) fn prepare_target_focus(
             deadline,
             &SystemTargetFocusPoster,
             &SystemTargetFocusReader,
+            false,
+        )
+        .map(Some),
+        TargetBeliefRecipe::SwiftElementClick => prepare_target_focus_with(
+            facts,
+            state,
+            deadline,
+            &SystemTargetFocusPoster,
+            &SystemTargetFocusReader,
+            false,
         )
         .map(Some),
         TargetBeliefRecipe::SwiftKeyboard => prepare_target_focus_with(
@@ -304,6 +331,7 @@ pub(crate) fn prepare_target_focus(
             deadline,
             &SystemTargetFocusPoster,
             &SystemTargetFocusReader,
+            true,
         )
         .map(Some),
     }
@@ -315,31 +343,33 @@ fn prepare_target_focus_with(
     deadline: Instant,
     poster: &dyn TargetFocusPoster,
     reader: &dyn TargetFocusReader,
+    refresh_key_focus: bool,
 ) -> Result<NativeEvidence, NativeError> {
     let pid = facts.pid;
     let cg_window_id = facts.cg_window_id;
     let application_is_active = reader.application_is_active(pid);
+    let application_believed_frontmost_before =
+        reader.application_believes_frontmost(pid) == Some(true);
     let (should_post_key_focus_returned, should_post_app_activated) = {
         let mut state = state.lock().expect("macOS focus coordinator poisoned");
-        if state.shutdown {
+        if state.pid != pid {
             return Err(NativeError::stale(
                 ErrorCode::WindowIdentityChanged,
-                "target focus coordinator is shut down",
+                "target focus coordinator process no longer matches the interaction target",
             ));
         }
-        if state.pid != pid || state.cg_window_id != cg_window_id {
-            return Err(NativeError::stale(
-                ErrorCode::WindowIdentityChanged,
-                "target focus coordinator identity no longer matches the interaction target",
-            ));
-        }
+        // The signed helper caches one focus enforcer on its per-application
+        // controller. Its belief survives exact-window replacement, while the
+        // current window id is supplied anew to each activation recipe.
+        state.cg_window_id = cg_window_id;
         state.application_is_active = application_is_active;
         if application_is_active {
             state.application_believes_it_is_active = true;
             state.application_believes_it_has_focus = true;
         }
         (
-            !state.application_is_active && !state.application_believes_it_has_focus,
+            !state.application_is_active
+                && (refresh_key_focus || !state.application_believes_it_has_focus),
             !state.application_is_active && !state.application_believes_it_is_active,
         )
     };
@@ -360,7 +390,8 @@ fn prepare_target_focus_with(
     };
 
     let ack_deadline = deadline.min(Instant::now() + BELIEF_ACK_TIMEOUT);
-    let mut ax_frontmost_acknowledged = application_is_active;
+    let mut ax_frontmost_acknowledged =
+        application_is_active || application_believed_frontmost_before;
     while !ax_frontmost_acknowledged && Instant::now() <= ack_deadline {
         ax_frontmost_acknowledged = reader.application_believes_frontmost(pid) == Some(true);
         if !ax_frontmost_acknowledged {
@@ -417,8 +448,12 @@ fn prepare_target_focus_with(
         ax_frontmost_acknowledged.into(),
     );
     evidence.fields.insert(
+        "target_ax_frontmost_before".to_owned(),
+        application_believed_frontmost_before.into(),
+    );
+    evidence.fields.insert(
         "target_focus_lifetime".to_owned(),
-        "target_controller".into(),
+        "application_controller_process".into(),
     );
     evidence.fields.insert(
         "target_focus_event_taps".to_owned(),
@@ -501,6 +536,10 @@ mod tests {
             id: cua_driver_core::api::contracts::WindowId::parse("window").unwrap(),
             app,
             title: None,
+            usable: true,
+            is_standard: Some(true),
+            is_main: Some(true),
+            z_index: Some(1),
         };
         let window = ResolvedWindow {
             public,
@@ -669,8 +708,10 @@ mod tests {
     }
 
     #[test]
-    fn focus_belief_posts_once_and_remains_owned_by_the_target_controller() {
+    fn focus_belief_survives_replacement_window_within_one_application_process() {
         let facts = focus_facts();
+        let mut replacement = facts.clone();
+        replacement.cg_window_id = 100;
         let state = Arc::new(Mutex::new(MacFocusState::new(44, 99)));
         let poster = FakePoster {
             posts: Mutex::new(Vec::new()),
@@ -685,14 +726,16 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             &poster,
             &reader,
+            false,
         )
         .unwrap();
         prepare_target_focus_with(
-            &facts,
+            &replacement,
             Arc::clone(&state),
             Instant::now() + Duration::from_secs(1),
             &poster,
             &reader,
+            false,
         )
         .unwrap();
 
@@ -704,5 +747,72 @@ mod tests {
         assert!(state.application_believes_it_is_active);
         assert!(state.application_believes_it_has_focus);
         assert!(!state.application_is_active);
+        assert_eq!(state.cg_window_id, 100);
+    }
+
+    #[test]
+    fn fresh_application_state_establishes_target_belief_even_when_ax_frontmost_is_stale() {
+        let facts = focus_facts();
+        let state = Arc::new(Mutex::new(MacFocusState::new(44, 99)));
+        let poster = FakePoster {
+            posts: Mutex::new(Vec::new()),
+        };
+        let reader = FakeReader {
+            active: false,
+            frontmost: Mutex::new(VecDeque::from([Some(true)])),
+        };
+
+        let evidence = prepare_target_focus_with(
+            &facts,
+            state,
+            Instant::now() + Duration::from_secs(1),
+            &poster,
+            &reader,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *poster.posts.lock().unwrap(),
+            [("key_focus_returned", 44), ("app_activated", 44)]
+        );
+        assert_eq!(
+            evidence.fields.get("target_ax_frontmost_before"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            evidence.fields.get("target_app_activation_posted"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn keyboard_recipe_refreshes_key_focus_for_an_inactive_target() {
+        let facts = focus_facts();
+        let state = Arc::new(Mutex::new(MacFocusState::new(44, 99)));
+        {
+            let mut state = state.lock().unwrap();
+            state.application_believes_it_is_active = true;
+            state.application_believes_it_has_focus = true;
+        }
+        let poster = FakePoster {
+            posts: Mutex::new(Vec::new()),
+        };
+        let reader = FakeReader {
+            active: false,
+            frontmost: Mutex::new(VecDeque::from([Some(true)])),
+        };
+
+        prepare_target_focus_with(
+            &facts,
+            state,
+            Instant::now() + Duration::from_secs(1),
+            &poster,
+            &reader,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(*poster.posts.lock().unwrap(), [("key_focus_returned", 44)]);
     }
 }

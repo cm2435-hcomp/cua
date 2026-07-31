@@ -488,6 +488,13 @@ fn main() {
 
     let enabled = cursor_cfg.enabled;
 
+    // Driver v2 performs one-shot ScreenCaptureKit observations from the
+    // protocol worker. Establish NSApplication on the main thread before that
+    // worker can accept its first request; the main loop is entered below.
+    if driver_v2 && platform_macos::session::has_graphic_access() {
+        platform_macos::pip::initialize_appkit_main_loop();
+    }
+
     // Initialise overlay channel synchronously BEFORE spawning background
     // thread.  This eliminates a race where run_on_main_thread() could be
     // called before init() and find an empty channel.

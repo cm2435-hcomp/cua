@@ -92,6 +92,10 @@ impl MacInteractionHooks for SystemInteractionHooks {
                 let lease = AxEnablementLease::acquire(pid)?;
                 Ok(Some(Box::new(AxLeaseResource(lease))))
             }
+            AccessibilityRecipe::PriorStatePreservingIfSupported => {
+                Ok(AxEnablementLease::acquire_optional(pid)?
+                    .map(|lease| Box::new(AxLeaseResource(lease)) as Box<dyn LeaseResource>))
+            }
         }
     }
 
@@ -233,11 +237,16 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
         }
         ensure_native_facts_match(&live_facts, target, &plan.window)?;
         plan.native.menu = match &plan.menu_intent {
+            Some(MenuMutationIntent::Dismissing { .. }) => {
+                // An explicit outside click or Escape is the dismissal event;
+                // arming the menu-dismissal tap here would suppress the exact
+                // effect the caller requested.
+                MenuSuppressionPlan::NotApplicable
+            }
             Some(intent) => {
                 let menu_pid = match intent {
                     MenuMutationIntent::Opening { .. } => None,
-                    MenuMutationIntent::Targeting { identity, .. }
-                    | MenuMutationIntent::Dismissing { identity, .. } => {
+                    MenuMutationIntent::Targeting { identity, .. } => {
                         if identity.process != live_facts.stamp.process {
                             return Err(NativeError::unsupported(
                                 "cross-process native menu suppression requires a second exact per-menu PID tap",
@@ -246,6 +255,7 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
                         }
                         Some(live_facts.pid)
                     }
+                    MenuMutationIntent::Dismissing { .. } => unreachable!(),
                 };
                 MenuSuppressionPlan::ExactSourcePidPredicate {
                     target_pid: live_facts.pid,
@@ -694,6 +704,10 @@ mod tests {
             id: WindowId::parse("window").unwrap(),
             app,
             title: None,
+            usable: true,
+            is_standard: Some(true),
+            is_main: Some(true),
+            z_index: Some(1),
         };
         let window = ResolvedWindow {
             public,

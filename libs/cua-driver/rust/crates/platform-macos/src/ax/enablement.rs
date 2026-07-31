@@ -1,4 +1,4 @@
-//! Prior-state-preserving scoped AX enablement for Chromium accessibility.
+//! Prior-state-preserving scoped AX enablement.
 
 use std::sync::Arc;
 
@@ -145,10 +145,32 @@ pub struct AxEnablementLease {
 
 impl AxEnablementLease {
     pub fn acquire(pid: i32) -> Result<Self, NativeError> {
-        Self::acquire_with(pid, Arc::new(SystemAxBooleanAccess))
+        Self::acquire_optional(pid)?.ok_or_else(|| {
+            NativeError::unsupported(
+                "accessibility_enablement_unavailable: neither reversible AX enablement attribute is readable",
+            )
+            .with_detail("pid", pid)
+        })
     }
 
+    pub fn acquire_optional(pid: i32) -> Result<Option<Self>, NativeError> {
+        Self::acquire_optional_with(pid, Arc::new(SystemAxBooleanAccess))
+    }
+
+    #[cfg(test)]
     fn acquire_with(pid: i32, access: Arc<dyn AxBooleanAccess>) -> Result<Self, NativeError> {
+        Self::acquire_optional_with(pid, access)?.ok_or_else(|| {
+            NativeError::unsupported(
+                "accessibility_enablement_unavailable: neither reversible AX enablement attribute is readable",
+            )
+            .with_detail("pid", pid)
+        })
+    }
+
+    fn acquire_optional_with(
+        pid: i32,
+        access: Arc<dyn AxBooleanAccess>,
+    ) -> Result<Option<Self>, NativeError> {
         for attribute in ATTRIBUTES {
             let Some(prior) = access.read(pid, attribute)? else {
                 continue;
@@ -157,19 +179,16 @@ impl AxEnablementLease {
             if changed {
                 access.write(pid, attribute, true, ErrorPhase::Preflight)?;
             }
-            return Ok(Self {
+            return Ok(Some(Self {
                 pid,
                 attribute,
                 prior,
                 changed,
                 access,
                 released: false,
-            });
+            }));
         }
-        Err(NativeError::unsupported(
-            "accessibility_enablement_unavailable: neither reversible Chromium AX enablement attribute is readable",
-        )
-        .with_detail("pid", pid))
+        Ok(None)
     }
 
     pub fn attribute(&self) -> &'static str {
@@ -301,5 +320,13 @@ mod tests {
         assert!(!lease.changed());
         lease.release().unwrap();
         assert!(access.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn optional_enablement_is_not_applicable_when_the_app_exposes_no_attribute() {
+        let access = Arc::new(FakeAccess::default());
+        assert!(AxEnablementLease::acquire_optional_with(42, access)
+            .unwrap()
+            .is_none());
     }
 }
