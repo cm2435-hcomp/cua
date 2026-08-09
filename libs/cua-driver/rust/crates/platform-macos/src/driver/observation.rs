@@ -963,7 +963,7 @@ fn missing_frame_metadata(metadata: &crate::video_sckit::WindowFrameMetadata) ->
 pub struct RetainedAxElement(usize);
 
 impl RetainedAxElement {
-    unsafe fn retain(element: AXUIElementRef) -> Self {
+    pub(crate) unsafe fn retain(element: AXUIElementRef) -> Self {
         CFRetain(element as CFTypeRef);
         Self(element as usize)
     }

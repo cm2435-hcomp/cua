@@ -85,6 +85,12 @@ extern "C" {
         settable: *mut u8,
     ) -> AXError;
     pub fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> AXError;
+    pub fn AXUIElementCopyElementAtPosition(
+        application: AXUIElementRef,
+        x: f32,
+        y: f32,
+        element: *mut AXUIElementRef,
+    ) -> AXError;
     pub fn AXUIElementGetTypeID() -> CFTypeID;
     pub fn AXObserverCreate(
         application: i32,
@@ -351,6 +357,43 @@ pub unsafe fn copy_element_attr(
     Ok(Some(value as AXUIElementRef))
 }
 
+/// Copy the AX element at a finite screen point under Core Foundation's
+/// create rule. A successful null result is a truthful absence; any returned
+/// non-AX object is released and reported as an AX failure.
+///
+/// # Safety
+///
+/// `application` must be a live AX application element for the duration of
+/// the call. The caller owns any returned element under the create rule.
+pub unsafe fn copy_element_at_position(
+    application: AXUIElementRef,
+    x: f64,
+    y: f64,
+) -> Result<Option<AXUIElementRef>, AXError> {
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < f64::from(f32::MIN)
+        || x > f64::from(f32::MAX)
+        || y < f64::from(f32::MIN)
+        || y > f64::from(f32::MAX)
+    {
+        return Err(kAXErrorFailure);
+    }
+    let mut element: AXUIElementRef = std::ptr::null_mut();
+    let error = AXUIElementCopyElementAtPosition(application, x as f32, y as f32, &mut element);
+    if error != kAXErrorSuccess {
+        return Err(error);
+    }
+    if element.is_null() {
+        return Ok(None);
+    }
+    if core_foundation::base::CFGetTypeID(element as CFTypeRef) != AXUIElementGetTypeID() {
+        CFRelease(element as CFTypeRef);
+        return Err(kAXErrorFailure);
+    }
+    Ok(Some(element))
+}
+
 /// Copy a `kAXValueCFRangeType` attribute.
 pub unsafe fn copy_cf_range_attr(
     element: AXUIElementRef,
@@ -436,6 +479,59 @@ pub unsafe fn copy_point_attr(
     CFRelease(value as CFTypeRef);
     if copied {
         Ok(Some((point.x, point.y)))
+    } else {
+        Err(kAXErrorFailure)
+    }
+}
+
+/// Copy a `kAXValueCGSizeType` attribute without collapsing query or type
+/// failures into a missing value.
+///
+/// # Safety
+///
+/// `element` must be a live AX element for the duration of the call.
+pub unsafe fn copy_size_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Result<Option<(f64, f64)>, AXError> {
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err == kAXErrorNoValue || err == kAXErrorAttributeUnsupported {
+        return Ok(None);
+    }
+    if err != kAXErrorSuccess {
+        return Err(err);
+    }
+    if value.is_null() {
+        return Ok(None);
+    }
+    if core_foundation::base::CFGetTypeID(value) != AXValueGetTypeID() {
+        CFRelease(value);
+        return Err(kAXErrorFailure);
+    }
+    let value = value as AXValueRef;
+    if AXValueGetType(value) != kAXValueCGSizeType {
+        CFRelease(value as CFTypeRef);
+        return Err(kAXErrorFailure);
+    }
+    #[repr(C)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
+    let mut size = CGSize {
+        width: 0.0,
+        height: 0.0,
+    };
+    let copied = AXValueGetValue(
+        value,
+        kAXValueCGSizeType,
+        &mut size as *mut _ as *mut c_void,
+    );
+    CFRelease(value as CFTypeRef);
+    if copied {
+        Ok(Some((size.width, size.height)))
     } else {
         Err(kAXErrorFailure)
     }

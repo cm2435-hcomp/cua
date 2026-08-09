@@ -408,6 +408,7 @@ struct FakePlatform {
     cleanup_count: Arc<AtomicUsize>,
     preflight_action_ids: Arc<Mutex<Vec<ActionId>>>,
     acquired_action_ids: Arc<Mutex<Vec<ActionId>>>,
+    pointer_screen_points: Arc<Mutex<Vec<Point>>>,
     block_dispatch: std::sync::atomic::AtomicBool,
     block_before_boundary: std::sync::atomic::AtomicBool,
     dispatch_fail: std::sync::atomic::AtomicBool,
@@ -755,16 +756,21 @@ impl SemanticActionProvider<FakeTargetState> for FakePlatform {
         _target: &mut FakeTargetState,
         element: &ResolvedElement,
         spec: &ClickSpec,
-    ) -> Result<Candidate<()>, NativeError> {
+    ) -> Result<ElementClickCandidate, NativeError> {
         let usable = !self.semantic_candidate_unusable.load(Ordering::SeqCst)
             && spec.button == MouseButton::Left
             && spec.click_count == 1
             && spec.modifiers.is_empty()
             && element.actions.iter().any(|action| action == "AXPress");
         Ok(if usable {
-            Candidate::Prepared(())
+            ElementClickCandidate::Semantic {
+                reason: "semantic_element_click".to_owned(),
+            }
         } else {
-            Candidate::not_applicable("fake semantic click unavailable")
+            ElementClickCandidate::TargetedPointer {
+                screen_point: Point { x: 175.0, y: 235.0 },
+                reason: "semantic_not_applicable:fake semantic click unavailable".to_owned(),
+            }
         })
     }
 
@@ -859,6 +865,12 @@ impl PointerActionProvider<FakeTargetState> for FakePlatform {
         action: &ResolvedAction,
     ) -> Result<Self::PreparedAction, NativeError> {
         self.record("pointer_prepare");
+        if let ResolvedAction::PointClick { point, .. } = action {
+            self.pointer_screen_points
+                .lock()
+                .unwrap()
+                .push(point.screen_point);
+        }
         Ok(action.clone())
     }
 
@@ -1356,7 +1368,6 @@ async fn controller_preserves_target_state_and_consumes_at_dispatch_boundary() {
         .unwrap_err();
     assert_eq!(cross_error.code, ErrorCode::WindowIdentityChanged);
     assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 1);
-
     let stale = controller.click(&client_one, command).await.unwrap_err();
     assert_eq!(stale.code, ErrorCode::ObservationStale);
     assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 1);
@@ -1585,7 +1596,15 @@ async fn indexed_element_click_falls_back_before_dispatch_when_semantic_is_not_a
         receipt.native_evidence.fields["route_detail"],
         "semantic_not_applicable:fake semantic click unavailable"
     );
+    assert_eq!(
+        receipt.native_evidence.fields["route_selection_detail"],
+        "semantic_not_applicable:fake semantic click unavailable"
+    );
     assert_eq!(platform.dispatch_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        platform.pointer_screen_points.lock().unwrap().as_slice(),
+        [Point { x: 175.0, y: 235.0 }]
+    );
     let key = TargetKey::from_window(client.clone(), &resolved_window());
     let target = controller.targets.get(&key).await.unwrap();
     assert_eq!(target.state.lock().await.platform.semantic_dispatches, 0);

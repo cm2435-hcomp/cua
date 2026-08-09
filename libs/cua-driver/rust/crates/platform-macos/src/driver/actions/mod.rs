@@ -1,5 +1,6 @@
 //! Exact, background-safe macOS semantic action routes.
 
+mod click;
 mod keyboard;
 mod pointer;
 mod scroll;

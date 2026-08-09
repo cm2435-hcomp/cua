@@ -207,32 +207,6 @@ impl MacTargetState {
         self.menu_focus_state = Some(state);
     }
 
-    pub(crate) fn deactivate_focus_belief_after_selection(&self) -> Result<(), NativeError> {
-        let state = self.menu_focus_state.as_ref().ok_or_else(|| {
-            NativeError::new(
-                ErrorCode::Internal,
-                ErrorPhase::Dispatch,
-                false,
-                "selection dispatch has no application focus-state binding",
-            )
-        })?;
-        let mut state = state.lock().map_err(|_| {
-            NativeError::new(
-                ErrorCode::Internal,
-                ErrorPhase::Dispatch,
-                false,
-                "selection dispatch focus-state lock was poisoned",
-            )
-        })?;
-        // Codex's selection-bearing sendClick path deactivates its
-        // per-application SyntheticAppFocusEnforcer. The next pointer action
-        // must therefore rebuild the target application's synthetic active
-        // and key-focus belief even though the process itself is unchanged.
-        state.application_believes_it_is_active = state.application_is_active;
-        state.application_believes_it_has_focus = state.application_is_active;
-        Ok(())
-    }
-
     pub(crate) fn arm_menu_suppression(
         &self,
         action_id: &ActionId,

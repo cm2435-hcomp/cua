@@ -19,6 +19,8 @@ use super::{
     settlement::SettlementEvidence,
 };
 
+const POINT_ROUND_TRIP_EPSILON: f64 = 0.001;
+
 macro_rules! native_handle {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -704,6 +706,107 @@ impl ObservationStore {
         self.resolve_point(window, &element.observation_id, &surface_id, surface_point)
     }
 
+    /// Bind a platform-selected live screen point to the exact current
+    /// observation surface that owns the element.
+    ///
+    /// This is deliberately separate from `resolve_element_point`: callers
+    /// that have already proved a live native point may not silently replace
+    /// it with the observed element-bounds center.
+    pub fn resolve_element_screen_point(
+        &mut self,
+        window: &ResolvedWindow,
+        element: &ElementRef,
+        screen_point: Point,
+    ) -> Result<ResolvedPoint, NativeError> {
+        if !screen_point.x.is_finite() || !screen_point.y.is_finite() {
+            return Err(NativeError::stale(
+                ErrorCode::ElementStale,
+                "platform-selected element point is not finite",
+            ));
+        }
+        let resolved = self.resolve_element(window, element)?;
+        let record = self.current(&element.observation_id, window)?;
+        let surface = record
+            .surfaces
+            .values()
+            .find(|surface| {
+                surface_owner_stamp(surface) == &resolved.owner && surface.freshness.action_safe()
+            })
+            .cloned()
+            .ok_or_else(|| {
+                NativeError::stale(
+                    ErrorCode::SurfaceStale,
+                    "observation has no fresh surface for the element's exact owning window",
+                )
+            })?;
+        validate_surface_owner(&surface, window)?;
+        if surface.transform.scale_x == 0.0 || surface.transform.scale_y == 0.0 {
+            return Err(NativeError::stale(
+                ErrorCode::SurfaceStale,
+                "surface transform is not invertible",
+            ));
+        }
+        let owner_bounds = surface.window_bounds.ok_or_else(|| {
+            NativeError::stale(
+                ErrorCode::SurfaceStale,
+                "captured element surface has no exact owner bounds",
+            )
+        })?;
+        if !owner_bounds.contains(screen_point) {
+            return Err(NativeError::stale(
+                ErrorCode::SurfaceStale,
+                "platform-selected element point lies outside its captured native owner",
+            ));
+        }
+        // Surface transforms always produce target-window coordinates. A
+        // related transient uses its own screen bounds for containment, but
+        // its transform offset places the raster into the parent target's
+        // coordinate system.
+        let window_point = Point {
+            x: screen_point.x - window.geometry.bounds.x,
+            y: screen_point.y - window.geometry.bounds.y,
+        };
+        let surface_point = Point {
+            x: (window_point.x - surface.transform.offset_x) / surface.transform.scale_x,
+            y: (window_point.y - surface.transform.offset_y) / surface.transform.scale_y,
+        };
+        if surface_point.x < 0.0
+            || surface_point.y < 0.0
+            || surface_point.x >= f64::from(surface.raster_size.width)
+            || surface_point.y >= f64::from(surface.raster_size.height)
+        {
+            return Err(NativeError::stale(
+                ErrorCode::SurfaceStale,
+                "platform-selected element point lies outside its captured surface raster",
+            ));
+        }
+        let round_trip_window = surface.transform.transform(surface_point);
+        let round_trip_screen = Point {
+            x: window.geometry.bounds.x + round_trip_window.x,
+            y: window.geometry.bounds.y + round_trip_window.y,
+        };
+        if (round_trip_screen.x - screen_point.x).abs() > POINT_ROUND_TRIP_EPSILON
+            || (round_trip_screen.y - screen_point.y).abs() > POINT_ROUND_TRIP_EPSILON
+        {
+            return Err(NativeError::stale(
+                ErrorCode::SurfaceStale,
+                "surface transform does not preserve the platform-selected element point",
+            ));
+        }
+        Ok(ResolvedPoint {
+            window: window.clone(),
+            surface_id: surface.id,
+            surface_owner: surface.owner,
+            capture_revision: surface.capture_revision,
+            observation_epoch: surface.observation_epoch,
+            surface_point,
+            window_point,
+            screen_point,
+            geometry_revision: record.window.geometry_revision.clone(),
+            menu_id: surface.menu_id,
+        })
+    }
+
     pub fn validate_focus(
         &mut self,
         window: &ResolvedWindow,
@@ -1356,7 +1459,12 @@ mod store_tests {
                     width: 100,
                     height: 100,
                 },
-                window_bounds: None,
+                window_bounds: Some(Rect {
+                    x: 20.0,
+                    y: 30.0,
+                    width: 50.0,
+                    height: 50.0,
+                }),
                 capture_revision: CaptureRevision::parse("related-capture").unwrap(),
                 observation_epoch: None,
                 transform: SurfaceToWindowTransform {
@@ -1400,17 +1508,19 @@ mod store_tests {
         let mut store = ObservationStore::default();
         store.insert(observation).unwrap();
 
-        let point = store
-            .resolve_element_point(
-                &target,
-                &ElementRef {
-                    observation_id,
-                    id: element_id,
-                },
-            )
-            .unwrap();
+        let element = ElementRef {
+            observation_id,
+            id: element_id,
+        };
+        let point = store.resolve_element_point(&target, &element).unwrap();
         assert_eq!(point.surface_id, related_surface_id);
         assert_eq!(point.surface_point, Point { x: 30.0, y: 30.0 });
         assert_eq!(point.window_point, Point { x: 35.0, y: 45.0 });
+        let live_point = store
+            .resolve_element_screen_point(&target, &element, Point { x: 35.0, y: 45.0 })
+            .unwrap();
+        assert_eq!(live_point.surface_point, Point { x: 30.0, y: 30.0 });
+        assert_eq!(live_point.window_point, Point { x: 35.0, y: 45.0 });
+        assert_eq!(live_point.screen_point, Point { x: 35.0, y: 45.0 });
     }
 }

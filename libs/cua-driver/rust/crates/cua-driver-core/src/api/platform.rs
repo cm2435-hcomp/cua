@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use super::{
     capabilities::CapabilityManifest,
     contracts::{
-        AppId, AppQuery, AppRef, AppSelector, ElementRef, KeyStroke, Modifier, MouseButton,
+        AppId, AppQuery, AppRef, AppSelector, ElementRef, KeyStroke, Modifier, MouseButton, Point,
         Readiness, ScrollDirection, SelectionType, WindowGeneration, WindowId, WindowRef,
     },
     errors::NativeError,
@@ -115,6 +115,18 @@ impl<T> Candidate<T> {
             reason: reason.into(),
         }
     }
+}
+
+/// The platform-owned route decision for an ordinary element click.
+///
+/// Element click selection may depend on live native geometry and hit testing,
+/// so the targeted-pointer case carries the exact screen point proven by the
+/// platform. Core binds that point back to the current observation-owned
+/// surface before it permits dispatch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElementClickCandidate {
+    Semantic { reason: String },
+    TargetedPointer { screen_point: Point, reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -256,16 +268,16 @@ pub trait ObservationProvider<TargetState>: Send + Sync {
 pub trait SemanticActionProvider<TargetState>: Send + Sync {
     type PreparedAction: Send;
 
-    /// Determines whether an element click has an exact, currently usable
-    /// semantic primitive. `NotApplicable` lets core resolve the element's
-    /// current observation-owned point and query the captured-point route.
-    /// Stale identity failures must be returned, never converted to fallback.
+    /// Selects the one exact route for an element click from live native facts.
+    /// A targeted-pointer decision must carry the exact proven screen point;
+    /// core never substitutes the observed element-bounds center. Stale
+    /// identity failures must be returned, never converted to fallback.
     async fn element_click_candidate(
         &self,
         target: &mut TargetState,
         element: &ResolvedElement,
         spec: &ClickSpec,
-    ) -> Result<Candidate<()>, NativeError>;
+    ) -> Result<ElementClickCandidate, NativeError>;
 
     /// Determines whether the current retained element has an exact semantic
     /// page-scroll primitive. Only `NotApplicable` permits core to advance to

@@ -30,10 +30,10 @@ use super::{
         revision_accessibility, ObservationRecord, ResolvedDrag, ResolvedScroll, ResolvedWindow,
     },
     platform::{
-        Candidate, ClickSpec, ElementScrollSpec, InteractionProvider, KeyboardActionProvider,
-        LaunchScope, LifecycleProvider, NativeDispatch, ObservationProvider, ObserveRequest,
-        PlatformDriver, PointerActionProvider, ResolvedAction, SelectionSpec,
-        SemanticActionProvider, WindowProvider,
+        Candidate, ClickSpec, ElementClickCandidate, ElementScrollSpec, InteractionProvider,
+        KeyboardActionProvider, LaunchScope, LifecycleProvider, NativeDispatch,
+        ObservationProvider, ObserveRequest, PlatformDriver, PointerActionProvider, ResolvedAction,
+        SelectionSpec, SemanticActionProvider, WindowProvider,
     },
     settlement::{
         PendingSettlementEvidence, SettlementAttempt, SettlementEvidence, SettlementProfile,
@@ -757,7 +757,7 @@ impl<P: PlatformDriver> DriverController<P> {
                 .element_click_candidate(&mut state.platform, &element, &spec)
                 .await?
             {
-                Candidate::Prepared(()) => (
+                ElementClickCandidate::Semantic { reason } => (
                     Route::Semantic,
                     ResolvedAction::ElementClick {
                         source,
@@ -765,17 +765,22 @@ impl<P: PlatformDriver> DriverController<P> {
                         spec,
                     },
                     AddressingMode::Element,
-                    "semantic_element_click".to_owned(),
+                    reason,
                 ),
-                Candidate::NotApplicable { reason } => {
-                    let point = state
-                        .observations
-                        .resolve_element_point(&resolved, &source)?;
+                ElementClickCandidate::TargetedPointer {
+                    screen_point,
+                    reason,
+                } => {
+                    let point = state.observations.resolve_element_screen_point(
+                        &resolved,
+                        &source,
+                        screen_point,
+                    )?;
                     (
                         Route::TargetedPointer,
                         ResolvedAction::PointClick { point, spec },
                         AddressingMode::CapturedPoint,
-                        format!("semantic_not_applicable:{reason}"),
+                        reason,
                     )
                 }
             },
@@ -1361,6 +1366,10 @@ impl<P: PlatformDriver> DriverController<P> {
             .get("pointer_route")
             .cloned()
             .unwrap_or_else(|| candidate_detail.clone().into());
+        native_evidence.fields.insert(
+            "route_selection_detail".to_owned(),
+            candidate_detail.clone().into(),
+        );
         native_evidence
             .fields
             .insert("route_detail".to_owned(), route_detail);
