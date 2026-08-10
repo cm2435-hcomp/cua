@@ -205,6 +205,7 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
         }
         let recipe =
             select_scope_recipe(&self.host, &window.framework, route, action, &requirements)?;
+        let dispatch_scope = dispatch_scope_for(route, action, &recipe);
         let menu = MenuSuppressionPlan::NotApplicable;
         Ok(ScopePlan::new(
             action_id.clone(),
@@ -212,7 +213,7 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
             route,
             deadline,
             requirements,
-            DispatchScopeKind::Process,
+            dispatch_scope,
             MacNativeScopePlan {
                 facts,
                 host: self.host.clone(),
@@ -291,6 +292,28 @@ impl InteractionProvider<MacTargetState, MacTargetFocusCoordinator> for MacInter
             acquired.evidence,
             Box::new(acquired.cleanup),
         ))
+    }
+}
+
+fn dispatch_scope_for(
+    route: Route,
+    action: &ResolvedAction,
+    recipe: &MacScopeRecipe,
+) -> DispatchScopeKind {
+    let target_local_semantic_action = route == Route::Semantic
+        && matches!(
+            action,
+            ResolvedAction::SetValue { .. } | ResolvedAction::SelectText { .. }
+        );
+    let has_no_process_shared_resources = recipe.accessibility
+        == AccessibilityRecipe::NotApplicable
+        && recipe.menu == MenuSuppressionRecipe::NotApplicable
+        && recipe.target_belief == TargetBeliefRecipe::NotApplicable;
+
+    if target_local_semantic_action && has_no_process_shared_resources {
+        DispatchScopeKind::Target
+    } else {
+        DispatchScopeKind::Process
     }
 }
 
@@ -588,9 +611,15 @@ mod tests {
 
     use cua_driver_core::api::{
         capabilities::{Framework, WindowStateKind},
-        contracts::{AppId, AppRef, GeometryRevision, Rect, WindowGeneration, WindowId, WindowRef},
+        contracts::{
+            AppId, AppRef, AxRevision, ElementId, GeometryRevision, ObservationId, Rect,
+            WindowGeneration, WindowId, WindowRef,
+        },
         errors::ErrorPhase,
-        observation::{NativeProcessHandle, NativeWindowHandle, WindowGeometry},
+        observation::{
+            NativeElementHandle, NativeProcessHandle, NativeWindowHandle, ResolvedElement,
+            WindowGeometry,
+        },
     };
 
     use super::*;
@@ -771,6 +800,72 @@ mod tests {
     fn test_deadline() -> MutationDeadline {
         let work = Instant::now() + Duration::from_secs(30);
         MutationDeadline::new(work, work + Duration::from_secs(1)).unwrap()
+    }
+
+    fn semantic_element_action(select_text: bool) -> ResolvedAction {
+        let window = scope_plan().window;
+        let element = ResolvedElement {
+            owner: window.stamp(),
+            window,
+            observation_id: ObservationId::parse("observation").unwrap(),
+            element_id: ElementId::parse("element").unwrap(),
+            native: NativeElementHandle::new("native-element").unwrap(),
+            ax_revision: AxRevision::parse("ax-revision").unwrap(),
+            role: Some("AXTextArea".to_owned()),
+            subrole: None,
+            bounds: None,
+            actions: Vec::new(),
+            menu_id: None,
+        };
+        if select_text {
+            ResolvedAction::SelectText {
+                element,
+                selection: cua_driver_core::api::platform::SelectionSpec {
+                    text: "text".to_owned(),
+                    prefix: None,
+                    suffix: None,
+                    selection_type: cua_driver_core::api::contracts::SelectionType::Text,
+                },
+            }
+        } else {
+            ResolvedAction::SetValue {
+                element,
+                value: "value".to_owned(),
+            }
+        }
+    }
+
+    #[test]
+    fn only_resource_free_semantic_text_mutations_use_target_scope() {
+        let resource_free = MacScopeRecipe {
+            accessibility: AccessibilityRecipe::NotApplicable,
+            menu: MenuSuppressionRecipe::NotApplicable,
+            target_belief: TargetBeliefRecipe::NotApplicable,
+        };
+        for action in [
+            semantic_element_action(false),
+            semantic_element_action(true),
+        ] {
+            assert_eq!(
+                dispatch_scope_for(Route::Semantic, &action, &resource_free),
+                DispatchScopeKind::Target
+            );
+            assert_eq!(
+                dispatch_scope_for(Route::TargetedPointer, &action, &resource_free),
+                DispatchScopeKind::Process
+            );
+        }
+
+        let mut process_shared = resource_free;
+        process_shared.accessibility = AccessibilityRecipe::PriorStatePreservingIfSupported;
+        assert_eq!(
+            dispatch_scope_for(
+                Route::Semantic,
+                &semantic_element_action(false),
+                &process_shared,
+            ),
+            DispatchScopeKind::Process
+        );
     }
 
     #[test]
