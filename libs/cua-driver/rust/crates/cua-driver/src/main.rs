@@ -48,6 +48,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// they take `compat: bool` directly, but the binary crate decides what
 /// to pass without making every Command variant carry the flag.
 static CLAUDE_CODE_COMPAT: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static DRIVER_V2_MODE: AtomicBool = AtomicBool::new(false);
 
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
@@ -150,16 +152,29 @@ fn maybe_init_pip() {
 /// free of the `ureq` + rustls + ring deps that the check tool needs.
 #[cfg(target_os = "macos")]
 fn build_macos_registry() -> cua_driver_core::tool::ToolRegistry {
-    let mut r = platform_macos::register_tools();
+    let mut r = platform_macos::register_legacy_tools_with_compat(false);
     check_update_tool::register_into(&mut r);
     r
 }
 
 #[cfg(target_os = "macos")]
 fn build_macos_registry_with_compat(compat: bool) -> cua_driver_core::tool::ToolRegistry {
-    let mut r = platform_macos::register_tools_with_compat(compat);
+    let mut r = platform_macos::register_legacy_tools_with_compat(compat);
     check_update_tool::register_into(&mut r);
     r
+}
+
+#[cfg(target_os = "macos")]
+fn current_macos_version() -> String {
+    std::process::Command::new("/usr/bin/sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|version| version.trim().to_owned())
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 // ── macOS entry-point ─────────────────────────────────────────────────────
@@ -174,6 +189,9 @@ fn main() {
     let command = cli::parse_command();
     emit_entry_telemetry(&command);
     match command {
+        cli::Command::DriverV2 => {
+            DRIVER_V2_MODE.store(true, Ordering::SeqCst);
+        }
         cli::Command::TelemetryInstallEvent => {
             // Synchronous install ping (see `telemetry::capture_install`).
             // Blocks on the POST so the `.installation_recorded` marker
@@ -452,7 +470,13 @@ fn main() {
         }
     }
 
-    let cursor_cfg = cursor_overlay::CursorConfig::from_args();
+    let driver_v2 = DRIVER_V2_MODE.load(Ordering::SeqCst);
+    let mut cursor_cfg = cursor_overlay::CursorConfig::from_args();
+    if driver_v2 {
+        // The typed v2 surface owns a per-target logical cursor but exposes no
+        // user-visible cursor/overlay API.
+        cursor_cfg.enabled = false;
+    }
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -463,6 +487,13 @@ fn main() {
     );
 
     let enabled = cursor_cfg.enabled;
+
+    // Driver v2 performs one-shot ScreenCaptureKit observations from the
+    // protocol worker. Establish NSApplication on the main thread before that
+    // worker can accept its first request; the main loop is entered below.
+    if driver_v2 && platform_macos::session::has_graphic_access() {
+        platform_macos::pip::initialize_appkit_main_loop();
+    }
 
     // Initialise overlay channel synchronously BEFORE spawning background
     // thread.  This eliminates a race where run_on_main_thread() could be
@@ -508,24 +539,49 @@ fn main() {
                 .build()
                 .expect("tokio runtime");
             let compat = CLAUDE_CODE_COMPAT.load(Ordering::SeqCst);
-            rt.block_on(async move {
-                // Register tools; overlay init has already happened above.
-                let registry = Arc::new(build_macos_registry_with_compat(compat));
-                // Wire up replay tool's back-reference to the registry.
-                registry.init_self_weak();
-                if let Err(e) = cua_driver_core::server::run(registry).await {
-                    tracing::error!("MCP server error: {e}");
+            let server_result = rt.block_on(async move {
+                if driver_v2 {
+                    let platform = Arc::new(platform_macos::driver::MacDriver::new());
+                    let controller = Arc::new(cua_driver_core::api::DriverController::new(
+                        platform,
+                        cua_driver_core::api::PlatformName::Macos,
+                        current_macos_version(),
+                    ));
+                    let metadata = cua_driver_core::server::V2ServerMetadata::current(
+                        "cua-driver-macos",
+                        option_env!("CUA_DRIVER_BUILD_ID").unwrap_or("dev"),
+                    );
+                    cua_driver_core::server::run_v2(controller, metadata).await
+                } else {
+                    // Register tools; overlay init has already happened above.
+                    let registry = Arc::new(build_macos_registry_with_compat(compat));
+                    // Wire up replay tool's back-reference to the registry.
+                    registry.init_self_weak();
+                    cua_driver_core::server::run(registry).await
                 }
             });
+            let exit_code = match server_result {
+                Ok(()) => 0,
+                Err(error) => {
+                    if driver_v2 {
+                        tracing::error!("native v2 server error: {error}");
+                    } else {
+                        tracing::error!("MCP server error: {error}");
+                    }
+                    1
+                }
+            };
             // MCP server exited (stdin closed / client disconnected).
             // The main thread is blocked in NSApplication.run() and won't
             // exit on its own — force-exit the process cleanly.
-            std::process::exit(0);
+            std::process::exit(exit_code);
         })
         .expect("spawn mcp thread");
 
     // Main thread: AppKit overlay (blocks until the process exits).
-    if enabled {
+    if driver_v2 && platform_macos::session::has_graphic_access() {
+        platform_macos::pip::run_appkit_main_loop();
+    } else if enabled {
         platform_macos::cursor::overlay::run_on_main_thread();
     }
     // Overlay disabled: park the main thread while the MCP background thread
@@ -546,6 +602,10 @@ fn main() -> anyhow::Result<()> {
     let command = cli::parse_command();
     emit_entry_telemetry(&command);
     match command {
+        cli::Command::DriverV2 => {
+            eprintln!("cua-driver: driver-v2 is currently implemented only on macOS");
+            return Ok(());
+        }
         cli::Command::TelemetryInstallEvent => {
             // Synchronous install ping (see `telemetry::capture_install`).
             // Blocks on the POST so the `.installation_recorded` marker

@@ -40,13 +40,15 @@ pub mod video_sckit;
 pub mod pip;
 #[cfg(target_os = "macos")]
 pub mod session;
+#[cfg(target_os = "macos")]
+pub mod driver;
 
 use cua_driver_core::tool::ToolRegistry;
 
-/// Register all macOS tools.  For programs that don't restructure `main`
-/// (e.g. test harnesses), the overlay is skipped.
+/// Register the legacy macOS MCP/v1 tools. The native v2 server never calls
+/// this registry.
 pub fn register_tools() -> ToolRegistry {
-    register_tools_with_compat(false)
+    register_legacy_tools_with_compat(false)
 }
 
 /// Same as `register_tools` but lets the caller pick the Claude Code
@@ -54,10 +56,16 @@ pub fn register_tools() -> ToolRegistry {
 /// tool for the window-scoped variant (pid + window_id required,
 /// JPEG @ 85%, text note pointing at pixel tools).
 pub fn register_tools_with_compat(compat: bool) -> ToolRegistry {
+    register_legacy_tools_with_compat(compat)
+}
+
+/// Explicitly named legacy registry constructor used at the production
+/// composition root to keep MCP/v1 dispatch separate from native v2.
+pub fn register_legacy_tools_with_compat(compat: bool) -> ToolRegistry {
     #[cfg(target_os = "macos")]
     {
         let mut r = ToolRegistry::new();
-        tools::register_all(&mut r, compat);
+        tools::register_all_legacy(&mut r, compat);
         r
     }
     #[cfg(not(target_os = "macos"))]
@@ -84,7 +92,7 @@ pub fn register_tools_with_cursor(cfg: cursor_overlay::CursorConfig, compat: boo
             cursor::overlay::init(cfg);
         }
         let mut r = ToolRegistry::new();
-        tools::register_all(&mut r, compat);
+        tools::register_all_legacy(&mut r, compat);
         r
     }
     #[cfg(not(target_os = "macos"))]

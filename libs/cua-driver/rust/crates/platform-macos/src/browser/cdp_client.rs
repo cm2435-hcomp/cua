@@ -1,15 +1,16 @@
 //! CDP (Chrome DevTools Protocol) client for Electron and other chromium-based apps.
 //! Uses raw TCP for the HTTP /json endpoint and tokio-tungstenite for WebSocket.
 
+use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
-use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
-type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 pub struct CdpClient;
 
@@ -25,9 +26,9 @@ impl CdpClient {
             if let Ok(json) = http_get_json(port).await {
                 if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&json) {
                     if let Some(list) = arr.as_array() {
-                        let has_page = list.iter().any(|t| {
-                            t.get("type").and_then(|v| v.as_str()) == Some("page")
-                        });
+                        let has_page = list
+                            .iter()
+                            .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"));
                         if has_page {
                             return Some(port);
                         }
@@ -70,12 +71,16 @@ impl CdpClient {
         let mut session = CdpSession::connect(port, None).await?;
         let obj = tokio::time::timeout(
             Duration::from_secs(10),
-            session.call("Runtime.evaluate", serde_json::json!({
-                "expression": javascript,
-                "returnByValue": true,
-                "awaitPromise": true
-            })),
-        ).await
+            session.call(
+                "Runtime.evaluate",
+                serde_json::json!({
+                    "expression": javascript,
+                    "returnByValue": true,
+                    "awaitPromise": true
+                }),
+            ),
+        )
+        .await
         .map_err(|_| anyhow::anyhow!("CDP evaluate timed out after 10s"))??;
 
         parse_cdp_result(&obj)
@@ -103,10 +108,16 @@ pub struct CdpSessionCache {
 
 impl CdpSessionCache {
     pub fn new() -> Self {
-        Self { sessions: AsyncMutex::new(HashMap::new()) }
+        Self {
+            sessions: AsyncMutex::new(HashMap::new()),
+        }
     }
 
-    async fn get_or_connect(&self, port: u16, target_url_contains: Option<&str>) -> anyhow::Result<Arc<AsyncMutex<CdpSession>>> {
+    async fn get_or_connect(
+        &self,
+        port: u16,
+        target_url_contains: Option<&str>,
+    ) -> anyhow::Result<Arc<AsyncMutex<CdpSession>>> {
         let mut map = self.sessions.lock().await;
         if let Some(existing) = map.get(&port) {
             return Ok(existing.clone());
@@ -138,7 +149,12 @@ impl CdpSessionCache {
     /// attached — a browser with more than one tab open has no other way to
     /// know which one the caller means (CDP target ids have no relation to
     /// a window_id).
-    pub async fn insert_text(&self, text: &str, port: u16, target_url_contains: Option<&str>) -> anyhow::Result<()> {
+    pub async fn insert_text(
+        &self,
+        text: &str,
+        port: u16,
+        target_url_contains: Option<&str>,
+    ) -> anyhow::Result<()> {
         let arc = self.get_or_connect(port, target_url_contains).await?;
         let first_attempt = {
             let mut session = arc.lock().await;
@@ -177,7 +193,12 @@ impl CdpSessionCache {
     /// click) — this dispatches to whatever element currently has focus, the
     /// same as a hardware keyboard would. `target_url_contains` — see
     /// `insert_text`.
-    pub async fn dispatch_keystrokes(&self, text: &str, port: u16, target_url_contains: Option<&str>) -> anyhow::Result<()> {
+    pub async fn dispatch_keystrokes(
+        &self,
+        text: &str,
+        port: u16,
+        target_url_contains: Option<&str>,
+    ) -> anyhow::Result<()> {
         let arc = self.get_or_connect(port, target_url_contains).await?;
         let first_attempt = {
             let mut session = arc.lock().await;
@@ -199,18 +220,24 @@ impl CdpSessionCache {
 }
 
 impl Default for CdpSessionCache {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 async fn do_insert_text(session: &mut CdpSession, text: &str) -> anyhow::Result<()> {
     let obj = tokio::time::timeout(
         Duration::from_secs(10),
         session.call("Input.insertText", serde_json::json!({ "text": text })),
-    ).await
+    )
+    .await
     .map_err(|_| anyhow::anyhow!("CDP insertText timed out after 10s"))??;
 
     if let Some(err) = obj.get("error") {
-        let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+        let msg = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
         anyhow::bail!("CDP Input.insertText error: {msg}");
     }
     Ok(())
@@ -236,7 +263,10 @@ async fn do_dispatch_keystrokes(session: &mut CdpSession, text: &str) -> anyhow:
                 }
                 let obj = session.call("Input.dispatchKeyEvent", params).await?;
                 if let Some(err) = obj.get("error") {
-                    let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                    let msg = err
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
                     anyhow::bail!("CDP Input.dispatchKeyEvent error: {msg}");
                 }
             }
@@ -246,7 +276,8 @@ async fn do_dispatch_keystrokes(session: &mut CdpSession, text: &str) -> anyhow:
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
         Ok(())
-    }).await
+    })
+    .await
     .map_err(|_| anyhow::anyhow!("CDP keystroke dispatch timed out after 30s"))?
 }
 
@@ -280,12 +311,19 @@ impl CdpSession {
     async fn connect(port: u16, target_url_contains: Option<&str>) -> anyhow::Result<Self> {
         match ws_url_for_page_target(port, target_url_contains).await {
             Ok((ws_url, target_url)) => {
-                let (ws, _) = tokio_tungstenite::connect_async(&ws_url).await
+                let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
+                    .await
                     .map_err(|e| anyhow::anyhow!("WebSocket connect failed: {e}"))?;
-                Ok(Self { ws, session_id: None, current_target_url: Some(target_url), next_id: 1 })
+                Ok(Self {
+                    ws,
+                    session_id: None,
+                    current_target_url: Some(target_url),
+                    next_id: 1,
+                })
             }
             Err(page_discovery_err) => {
-                Self::connect_via_browser_endpoint(port, target_url_contains, page_discovery_err).await
+                Self::connect_via_browser_endpoint(port, target_url_contains, page_discovery_err)
+                    .await
             }
         }
     }
@@ -296,13 +334,20 @@ impl CdpSession {
         page_discovery_err: anyhow::Error,
     ) -> anyhow::Result<Self> {
         let browser_ws_url = format!("ws://127.0.0.1:{port}/devtools/browser");
-        let (ws, _) = tokio_tungstenite::connect_async(&browser_ws_url).await.map_err(|e| {
-            anyhow::anyhow!(
-                "No /json page discovery on port {port} ({page_discovery_err}), and \
+        let (ws, _) = tokio_tungstenite::connect_async(&browser_ws_url)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "No /json page discovery on port {port} ({page_discovery_err}), and \
                  connecting to the browser-level endpoint also failed: {e}"
-            )
-        })?;
-        let mut session = Self { ws, session_id: None, current_target_url: None, next_id: 1 };
+                )
+            })?;
+        let mut session = Self {
+            ws,
+            session_id: None,
+            current_target_url: None,
+            next_id: 1,
+        };
         session.attach_to_target(port, target_url_contains).await?;
         Ok(session)
     }
@@ -313,7 +358,11 @@ impl CdpSession {
     /// via `Target.getTargets`/`Target.attachToTarget` does NOT reopen the
     /// socket, so it doesn't re-trigger Chrome's confirmation popup —
     /// that's the whole reason this exists instead of always reconnecting.
-    async fn ensure_target(&mut self, port: u16, target_url_contains: Option<&str>) -> anyhow::Result<()> {
+    async fn ensure_target(
+        &mut self,
+        port: u16,
+        target_url_contains: Option<&str>,
+    ) -> anyhow::Result<()> {
         if self.session_id.is_some() {
             // Flattened browser-endpoint mode: always re-resolve + reattach
             // on the SAME connection (Target.getTargets/attachToTarget,
@@ -338,24 +387,44 @@ impl CdpSession {
         }
     }
 
-    async fn attach_to_target(&mut self, port: u16, target_url_contains: Option<&str>) -> anyhow::Result<()> {
-        let targets = self.call("Target.getTargets", serde_json::json!({})).await?;
-        let infos = targets["result"]["targetInfos"].as_array().cloned().unwrap_or_default();
-        let pages: Vec<&serde_json::Value> = infos.iter()
+    async fn attach_to_target(
+        &mut self,
+        port: u16,
+        target_url_contains: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let targets = self
+            .call("Target.getTargets", serde_json::json!({}))
+            .await?;
+        let infos = targets["result"]["targetInfos"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let pages: Vec<&serde_json::Value> = infos
+            .iter()
             .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
             .collect();
-        let target = pick_target(&pages, target_url_contains)
-            .ok_or_else(|| anyhow::anyhow!("Target.getTargets returned no page target on port {port}"))?;
-        let target_id = target.get("targetId").and_then(|v| v.as_str())
+        let target = pick_target(&pages, target_url_contains).ok_or_else(|| {
+            anyhow::anyhow!("Target.getTargets returned no page target on port {port}")
+        })?;
+        let target_id = target
+            .get("targetId")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Target.getTargets entry missing targetId"))?
             .to_owned();
-        let target_url = target.get("url").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+        let target_url = target
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
 
-        let attach = self.call(
-            "Target.attachToTarget",
-            serde_json::json!({ "targetId": target_id, "flatten": true }),
-        ).await?;
-        let session_id = attach["result"]["sessionId"].as_str()
+        let attach = self
+            .call(
+                "Target.attachToTarget",
+                serde_json::json!({ "targetId": target_id, "flatten": true }),
+            )
+            .await?;
+        let session_id = attach["result"]["sessionId"]
+            .as_str()
             .ok_or_else(|| anyhow::anyhow!("Target.attachToTarget did not return a sessionId"))?
             .to_owned();
         self.session_id = Some(session_id);
@@ -365,7 +434,11 @@ impl CdpSession {
 
     /// Send `method`/`params`, return the full response envelope once its
     /// `id` comes back (event frames and other in-flight ids are skipped).
-    async fn call(&mut self, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    async fn call(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -374,12 +447,15 @@ impl CdpSession {
             request["sessionId"] = serde_json::json!(sid);
         }
 
-        self.ws.send(Message::Text(request.to_string().into())).await
+        self.ws
+            .send(Message::Text(request.to_string()))
+            .await
             .map_err(|e| anyhow::anyhow!("WebSocket send failed: {e}"))?;
 
         loop {
-            let msg = self.ws.next().await
-                .ok_or_else(|| anyhow::anyhow!("WebSocket stream ended before response for id {id}"))??;
+            let msg = self.ws.next().await.ok_or_else(|| {
+                anyhow::anyhow!("WebSocket stream ended before response for id {id}")
+            })??;
             let text = match msg {
                 Message::Text(t) => t,
                 Message::Close(_) => anyhow::bail!("WebSocket closed before response for id {id}"),
@@ -388,7 +464,9 @@ impl CdpSession {
             let obj: serde_json::Value = serde_json::from_str(&text)
                 .map_err(|e| anyhow::anyhow!("CDP response parse error: {e}"))?;
             // Skip CDP event frames (they have "method" key but no "id").
-            if obj.get("method").is_some() { continue; }
+            if obj.get("method").is_some() {
+                continue;
+            }
             if obj.get("id").and_then(|v| v.as_u64()) == Some(id) {
                 return Ok(obj);
             }
@@ -401,21 +479,37 @@ impl CdpSession {
 /// discovery. Errors (not just returns None) so `CdpSession::connect` can
 /// report exactly why the classic path failed if the browser-endpoint
 /// fallback also fails.
-async fn ws_url_for_page_target(port: u16, target_url_contains: Option<&str>) -> anyhow::Result<(String, String)> {
+async fn ws_url_for_page_target(
+    port: u16,
+    target_url_contains: Option<&str>,
+) -> anyhow::Result<(String, String)> {
     let json = http_get_json(port).await?;
-    let targets: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|e| anyhow::anyhow!("CDP /json parse error: {e}"))?;
+    let targets: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("CDP /json parse error: {e}"))?;
 
-    let pages: Vec<&serde_json::Value> = targets.as_array()
-        .map(|arr| arr.iter().filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page")).collect())
+    let pages: Vec<&serde_json::Value> = targets
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+                .collect()
+        })
         .unwrap_or_default();
 
     let target = pick_target(&pages, target_url_contains)
         .ok_or_else(|| anyhow::anyhow!("No page target found on port {port}"))?;
-    let ws_url = target.get("webSocketDebuggerUrl").and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("No page target with webSocketDebuggerUrl found on port {port}"))?
+    let ws_url = target
+        .get("webSocketDebuggerUrl")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("No page target with webSocketDebuggerUrl found on port {port}")
+        })?
         .to_owned();
-    let target_url = target.get("url").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    let target_url = target
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
     Ok((ws_url, target_url))
 }
 
@@ -425,7 +519,10 @@ async fn ws_url_for_page_target(port: u16, target_url_contains: Option<&str>) ->
 /// `Target.getTargets`) since a browser with more than one tab open is
 /// otherwise picked non-deterministically — CDP target ids carry no
 /// relationship to the caller's `window_id`.
-fn pick_target<'a>(pages: &[&'a serde_json::Value], hint: Option<&str>) -> Option<&'a serde_json::Value> {
+fn pick_target<'a>(
+    pages: &[&'a serde_json::Value],
+    hint: Option<&str>,
+) -> Option<&'a serde_json::Value> {
     if let Some(hint) = hint {
         let hint_lower = hint.to_ascii_lowercase();
         if let Some(t) = pages.iter().find(|t| {
@@ -441,7 +538,10 @@ fn pick_target<'a>(pages: &[&'a serde_json::Value], hint: Option<&str>) -> Optio
 
 fn parse_cdp_result(obj: &serde_json::Value) -> anyhow::Result<String> {
     if let Some(err) = obj.get("error") {
-        let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+        let msg = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
         anyhow::bail!("CDP error: {msg}");
     }
     let result = &obj["result"]["result"];
@@ -466,9 +566,12 @@ pub(super) async fn listening_ports(pid: i32) -> Vec<u16> {
             // ORs `-p` with `-iTCP -sTCP:LISTEN`, returning every listening
             // port on the whole system in addition to this pid's fds.
             "-a",
-            "-p", &pid.to_string(),
-            "-iTCP", "-sTCP:LISTEN",
-            "-Fn", "-P",
+            "-p",
+            &pid.to_string(),
+            "-iTCP",
+            "-sTCP:LISTEN",
+            "-Fn",
+            "-P",
         ])
         .output()
         .await;
@@ -480,7 +583,9 @@ pub(super) async fn listening_ports(pid: i32) -> Vec<u16> {
     for line in text.lines() {
         // Lines starting with 'n' contain the address e.g. n*:9222 or n127.0.0.1:9222
         let trimmed = line.trim();
-        if !trimmed.starts_with('n') { continue; }
+        if !trimmed.starts_with('n') {
+            continue;
+        }
         if let Some(colon_pos) = trimmed.rfind(':') {
             let port_str = &trimmed[colon_pos + 1..];
             if let Ok(p) = port_str.parse::<u16>() {
@@ -496,10 +601,12 @@ async fn http_get_json(port: u16) -> anyhow::Result<String> {
     // connect — see the read loop below for why a bare `read_to_end` isn't
     // safe here.
     tokio::time::timeout(Duration::from_secs(5), async {
-        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
             .map_err(|e| anyhow::anyhow!("TCP connect error: {e}"))?;
 
-        let req = format!("GET /json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        let req =
+            format!("GET /json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await?;
 
         // Chrome's CDP HTTP server ignores our `Connection: close` request
@@ -526,7 +633,8 @@ async fn http_get_json(port: u16) -> anyhow::Result<String> {
             .lines()
             .find_map(|l| {
                 let (name, value) = l.split_once(':')?;
-                name.trim().eq_ignore_ascii_case("content-length")
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
                     .then(|| value.trim().parse().unwrap_or(0))
             })
             .unwrap_or(0);
@@ -535,13 +643,16 @@ async fn http_get_json(port: u16) -> anyhow::Result<String> {
         while body.len() < content_length {
             let mut chunk = [0u8; 4096];
             let n = stream.read(&mut chunk).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             body.extend_from_slice(&chunk[..n]);
         }
         if content_length > 0 && body.len() > content_length {
             body.truncate(content_length);
         }
         Ok(String::from_utf8_lossy(&body).to_string())
-    }).await
+    })
+    .await
     .map_err(|_| anyhow::anyhow!("HTTP request to CDP port {port} timed out after 5s"))?
 }

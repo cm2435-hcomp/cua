@@ -17,6 +17,7 @@
 //! - 2-space indent per depth level
 
 pub mod bindings;
+pub mod enablement;
 pub mod tree;
 pub mod cache;
 

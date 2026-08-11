@@ -366,7 +366,7 @@ impl Default for ToolState {
 /// regular `screenshot` tool for the Claude Code computer-use compat
 /// variant — same name, stricter args, window-scoped JPEG @ 85% + a text
 /// note telling the caller to use pixel-addressed tools.
-pub fn register_all(registry: &mut ToolRegistry, compat: bool) {
+pub fn register_all_legacy(registry: &mut ToolRegistry, compat: bool) {
     let state = Arc::new(ToolState::default());
     // Share the element cache with the recording-hook layer so it can
     // resolve element_index → window-local screenshot coords for click.png.

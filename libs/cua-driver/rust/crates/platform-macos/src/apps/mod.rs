@@ -332,7 +332,7 @@ pub(crate) fn locate_by_name(name: &str) -> Option<AppLocator> {
 /// Read `CFBundleIdentifier` from an `.app` bundle's `Info.plist`.
 /// Falls back to shelling out to `plutil` (already used elsewhere in
 /// this file) to avoid pulling in a plist crate just for this.
-fn bundle_id_for_app_path(app_path: &str) -> Option<String> {
+pub(crate) fn bundle_id_for_app_path(app_path: &str) -> Option<String> {
     let plist = format!("{app_path}/Contents/Info.plist");
     let out = Command::new("plutil")
         .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-", &plist])
@@ -389,6 +389,13 @@ pub fn list_all_apps() -> Vec<AppInfo> {
     let mut all = running;
     all.extend(installed);
     all
+}
+
+/// Enumerate installed application bundles without consulting running
+/// processes. The v2 lifecycle provider combines this with native
+/// `NSWorkspace.runningApplications` data and does not shell to System Events.
+pub fn list_installed_apps() -> Vec<AppInfo> {
+    scan_installed_apps()
 }
 
 fn scan_installed_apps() -> Vec<AppInfo> {

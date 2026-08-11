@@ -17,6 +17,10 @@ use cua_driver_core::{protocol::Content, tool::ToolRegistry};
 
 /// Which CLI command was requested.
 pub enum Command {
+    /// Native, typed background driver v2 protocol over newline-delimited
+    /// stdio. This is deliberately not MCP and cannot reach the legacy tool
+    /// registry.
+    DriverV2,
     Mcp {
         /// Force in-process MCP execution — skip the TCC auto-relaunch
         /// path that would spawn a daemon via `open -n -g -a CuaDriver
@@ -162,7 +166,7 @@ pub fn parse_command() -> Command {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("cua-driver {} — cross-platform computer-use automation driver", env!("CARGO_PKG_VERSION"));
         println!("Usage: cua-driver [SUBCOMMAND] [OPTIONS]");
-        println!("Subcommands: mcp, list-tools, describe, call, serve, stop, status, config, recording, update, check-update, doctor, diagnose, permissions, autostart, skills, manifest");
+        println!("Subcommands: driver-v2, mcp, list-tools, describe, call, serve, stop, status, config, recording, update, check-update, doctor, diagnose, permissions, autostart, skills, manifest");
         println!();
         println!("permissions options (macOS):");
         println!("  cua-driver permissions status   Report Accessibility + Screen Recording status. Read-only (no prompt).");
@@ -322,6 +326,7 @@ pub fn parse_command() -> Command {
             socket: socket.clone(),
             claude_code_compat,
         },
+        Some("driver-v2") => Command::DriverV2,
         Some("list-tools") => Command::ListTools,
         Some("mcp-config") => Command::McpConfig { client: mcp_client },
         Some("serve") => Command::Serve {
@@ -861,11 +866,19 @@ pub fn build_manifest() -> serde_json::Value {
             "command": binary,
             "args": ["mcp"]
         },
+        "native_v2_invocation": {
+            "command": binary,
+            "args": ["driver-v2"],
+            "protocol_version": { "major": 2, "minor": 0 }
+        },
         // Subcommand catalog — keep in sync with `parse_command` above.
         // `args` is a hint shape for consumers; the canonical source is
         // `--help` text. Each entry follows the same JSON shape so the
         // consumer can render uniformly.
         "subcommands": [
+            { "name": "driver-v2",
+              "description": "Run the typed background-only native v2 protocol over newline-delimited stdio (macOS).",
+              "args": [] },
             { "name": "mcp",
               "description": "Run the MCP JSON-RPC server over stdio (the default invocation).",
               "args": [
@@ -2872,6 +2885,7 @@ mod stdin_bom_tests {
 pub fn telemetry_entry_event(cmd: &Command) -> Option<String> {
     use crate::telemetry::event;
     let name = match cmd {
+        Command::DriverV2 => "cua_driver_v2".to_owned(),
         Command::Mcp { .. } => event::MCP.to_owned(),
         Command::Serve { .. } => event::SERVE.to_owned(),
         Command::Stop { .. } => event::STOP.to_owned(),
