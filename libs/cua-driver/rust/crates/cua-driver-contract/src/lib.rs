@@ -82,6 +82,7 @@ pub const ACTION_RESULT_TOOLS: &[&str] = &[
     "press_key",
     "hotkey",
     "set_value",
+    "select_text",
     "set_window_frame",
     "invoke_menu",
     "browser_click",

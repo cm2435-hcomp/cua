@@ -188,13 +188,6 @@ impl Tool for DragTool {
         // that drop background CGEvents), via the same skylight assist click
         // uses. Requires a window_id to have a window to front.
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
-        if !delivery_mode.is_foreground() {
-            return ToolResult::error(
-                "Background drag is unavailable on macOS; use delivery_mode:\"foreground\"."
-                    .to_owned(),
-            )
-            .with_structured(serde_json::json!({ "code": "background_unavailable" }));
-        }
         // Coerce integer or float from JSON for coordinate fields.
         let coerce = |key: &str| -> Option<f64> {
             args.opt_f64(key)
@@ -219,6 +212,40 @@ impl Tool for DragTool {
         };
 
         let window_id = args.opt_u64("window_id").map(|v| v as u32);
+        if delivery_mode.is_foreground() && window_id.is_none() {
+            return ToolResult::error(
+                "delivery_mode=foreground requires an exact window_id for drag",
+            )
+            .with_structured(serde_json::json!({
+                "code": "ambiguous_window_target",
+                "effect": "refused",
+                "native_side_effect_started": false,
+            }));
+        }
+        let fg = delivery_mode.is_foreground();
+        let _mutation_lease = if fg {
+            None
+        } else {
+            let Some(wid) = window_id else {
+                return ToolResult::error("background drag requires an exact window_id")
+                    .with_structured(serde_json::json!({
+                        "code": "ambiguous_window_target",
+                        "effect": "refused",
+                        "native_side_effect_started": false,
+                    }));
+            };
+            match super::gate_background_window_action(
+                pid,
+                wid,
+                None,
+                cua_driver_core::background_input::BackgroundAction::WindowPointer,
+            )
+            .await
+            {
+                Ok(lease) => Some(lease),
+                Err(refusal) => return refusal,
+            }
+        };
         let duration_ms = args.u64_or("duration_ms", 500);
         let steps = args.u64_or("steps", 20) as usize;
         let from_zoom = args.bool_or("from_zoom", false);
@@ -297,7 +324,6 @@ impl Tool for DragTool {
 
         // Dispatch blocking drag synthesis.
         let mods_owned = modifiers.clone();
-        let fg = delivery_mode.is_foreground() && window_id.is_some();
         let cursor_for_drag = cursor_key.clone();
         crate::cursor::overlay::send_command(
             cursor_key.clone(),

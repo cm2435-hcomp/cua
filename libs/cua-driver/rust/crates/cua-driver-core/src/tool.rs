@@ -302,6 +302,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
             "input.keyboard.type",
             "accessibility.element_tokens",
         ],
+        "select_text" => &["input.keyboard.type", "accessibility.element_tokens"],
 
         // ── screen / capture ─────────────────────────────────────────
         // Note: the regular `screenshot` tool was removed from the
@@ -2295,6 +2296,7 @@ fn is_physical_desktop_action(tool: &str) -> bool {
             | "press_key"
             | "hotkey"
             | "set_value"
+            | "select_text"
             | "bring_to_front"
             | "set_window_frame"
     )
@@ -4104,6 +4106,7 @@ fn synthesize_action_label(tool_name: &str, args: &Value) -> String {
         ),
         "drag" => "drag".into(),
         "set_value" => arg("value").unwrap_or_default(),
+        "select_text" => arg("text").unwrap_or_default(),
         "launch_app" => arg("bundle_id").or_else(|| arg("name")).unwrap_or_default(),
         _ => String::new(),
     };
@@ -4251,6 +4254,7 @@ mod capability_tests {
         "press_key",
         "hotkey",
         "set_value",
+        "select_text",
         // screen
         "zoom",
         "get_screen_size",
@@ -4496,6 +4500,7 @@ mod capability_tests {
             "type_text_chars",
             "press_key",
             "set_value",
+            "select_text",
             // get_window_state emits the tokens — same capability
             // claim, from the other side of the contract.
             "get_window_state",

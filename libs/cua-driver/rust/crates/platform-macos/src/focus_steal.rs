@@ -56,7 +56,10 @@
 //! queue's own thread regardless of run-loop state.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use std::time::{Duration, Instant};
 
 use objc2_app_kit::{
@@ -90,10 +93,9 @@ struct Entry {
     target_pid: Option<i32>,
     /// One intentional activation that a wildcard entry must allow through.
     ///
-    /// Raw background pixel clicks use the focus-without-raise recipe: the
-    /// target must become AppKit-active long enough for its event queue to
-    /// accept the click, while activations of every *other* app should still
-    /// be suppressed as cross-app side effects.
+    /// Some explicit action recipes may permit one known activation while
+    /// suppressing every other cross-app side effect. Signed background clicks
+    /// do not: their target-only focus belief must leave real activation alone.
     allowed_pid: Option<i32>,
     /// Pid to restore focus to when an activation matches this entry.
     restore_to: i32,
@@ -103,6 +105,10 @@ struct Entry {
     /// Provenance for tracing — e.g. `"LaunchAppTool.pre"`.
     #[allow(dead_code)]
     origin: &'static str,
+    /// Set by the NSWorkspace observer before it restores the prior
+    /// frontmost app. Callers that must prove zero transient activation can
+    /// inspect this through their lease after a bounded callback drain.
+    matched_activation: Arc<AtomicBool>,
 }
 
 /// Singleton focus-steal preventer.
@@ -145,6 +151,7 @@ impl FocusStealPreventer {
         SuppressionLease {
             handle,
             dispatcher: Arc::clone(&shared.dispatcher),
+            matched_activation: shared.dispatcher.activation_flag(handle),
             released: false,
         }
     }
@@ -166,6 +173,7 @@ impl FocusStealPreventer {
         SuppressionLease {
             handle,
             dispatcher: Arc::clone(&shared.dispatcher),
+            matched_activation: shared.dispatcher.activation_flag(handle),
             released: false,
         }
     }
@@ -211,10 +219,17 @@ pub fn begin_suppression_allowing(
 pub struct SuppressionLease {
     handle: SuppressionHandle,
     dispatcher: Arc<Dispatcher>,
+    matched_activation: Arc<AtomicBool>,
     released: bool,
 }
 
 impl SuppressionLease {
+    /// Whether the guarded target attempted to become the frontmost
+    /// application while this lease was active.
+    pub fn matched_activation(&self) -> bool {
+        self.matched_activation.load(Ordering::Acquire)
+    }
+
     /// Explicit release. Useful if the caller wants to drop the lease
     /// before its scope ends without taking the `Drop` path.
     pub fn release(mut self) {
@@ -298,6 +313,7 @@ impl Dispatcher {
             restore_to,
             deadline: Instant::now() + ENTRY_DEADLINE,
             origin,
+            matched_activation: Arc::new(AtomicBool::new(false)),
         };
         {
             let mut guard = self.entries.lock().unwrap();
@@ -309,6 +325,18 @@ impl Dispatcher {
         // fresh tokio interval on the next tick).
         let _ = self.janitor_active.send(true);
         SuppressionHandle(id)
+    }
+
+    fn activation_flag(&self, handle: SuppressionHandle) -> Arc<AtomicBool> {
+        Arc::clone(
+            &self
+                .entries
+                .lock()
+                .unwrap()
+                .get(&handle.0)
+                .expect("new suppression entry must remain present until its lease is built")
+                .matched_activation,
+        )
     }
 
     /// Remove an entry. When the map drains to empty, signals the janitor
@@ -335,19 +363,23 @@ impl Dispatcher {
         guard.retain(|_, e| e.deadline > now);
         guard
             .values()
-            .filter(|e| {
+            .filter_map(|e| {
                 if e.allowed_pid == Some(activated_pid) {
-                    return false;
+                    return None;
                 }
-                match e.target_pid {
+                let matched = match e.target_pid {
                     Some(p) => p == activated_pid,
                     // Wildcard: match any activation except the restore_to
                     // pid (don't fight ourselves when we re-activate the
                     // prior frontmost).
                     None => activated_pid != e.restore_to,
+                };
+                if !matched {
+                    return None;
                 }
+                e.matched_activation.store(true, Ordering::Release);
+                Some(e.restore_to)
             })
-            .map(|e| e.restore_to)
             .collect()
     }
 
@@ -569,9 +601,9 @@ mod tests {
         assert!(d.snapshot_matches(7).is_empty());
     }
 
-    /// A background pixel click intentionally makes its target AppKit-active
-    /// without raising it. The wildcard guard must allow that one pid while
-    /// continuing to suppress unrelated cross-app activations.
+    /// Explicit recipes can allow one intentional target activation while
+    /// continuing to suppress unrelated cross-app activations. Background
+    /// clicks no longer use this exception.
     #[test]
     fn wildcard_can_allow_intentional_target_activation() {
         let d = Arc::new(Dispatcher::new());
@@ -601,6 +633,7 @@ mod tests {
         let lease = SuppressionLease {
             handle: h,
             dispatcher: Arc::clone(&d),
+            matched_activation: d.activation_flag(h),
             released: false,
         };
         assert_eq!(d.len(), 1);
@@ -616,10 +649,27 @@ mod tests {
         let lease = SuppressionLease {
             handle: h,
             dispatcher: Arc::clone(&d),
+            matched_activation: d.activation_flag(h),
             released: false,
         };
         lease.release();
         assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn lease_records_a_matching_activation_before_restore() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.witness");
+        let lease = SuppressionLease {
+            handle: h,
+            dispatcher: Arc::clone(&d),
+            matched_activation: d.activation_flag(h),
+            released: false,
+        };
+
+        assert!(!lease.matched_activation());
+        assert_eq!(d.snapshot_matches(42), vec![7]);
+        assert!(lease.matched_activation());
     }
 
     /// Force a leaked entry whose deadline is already past, then call
@@ -639,6 +689,7 @@ mod tests {
                     restore_to: 7,
                     deadline: Instant::now() - Duration::from_secs(1),
                     origin: "test.leak",
+                    matched_activation: Arc::new(AtomicBool::new(false)),
                 },
             );
         }

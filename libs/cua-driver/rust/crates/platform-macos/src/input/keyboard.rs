@@ -1,18 +1,224 @@
-//! Background keyboard synthesis via SLEventPostToPid (SkyLight SPI),
-//! with fallback to the public CGEvent::post_to_pid.
+//! macOS keyboard event construction.
 //!
-//! For keyboard events, `post_to_pid` attaches an `SLSEventAuthenticationMessage`
-//! so Chromium-based apps accept synthetic keystrokes as trusted live input
-//! (required on macOS 14+ for VS Code, Chrome, Electron apps).
+//! The canonical targeted route matches the signed helper: construct the
+//! complete event sequence before the first post, fresh-timestamp every event,
+//! and post it exactly once with `CGEventPostToPid`. The explicit foreground
+//! helpers below retain their physical HID behavior.
 
 use core_graphics::{
-    event::{CGEvent, CGEventFlags},
+    event::{CGEvent, CGEventFlags, CGEventType},
     event_source::{CGEventSource, CGEventSourceStateID},
 };
 use foreign_types::ForeignType;
 
 const SCREEN_SHARING_BUNDLE_ID: &str = "com.apple.ScreenSharing";
 const SHIFT_KEY_CODE: u16 = 56;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TargetedKeyEventKind {
+    FlagsChangedRequested,
+    KeyDown,
+    KeyUp,
+    FlagsChangedRestore,
+    UnicodeDown,
+    UnicodeUp,
+}
+
+pub(crate) struct PreparedTargetedKeyEvent {
+    kind: TargetedKeyEventKind,
+    native: CGEvent,
+}
+
+pub(crate) struct PreparedKeySequence {
+    events: Vec<PreparedTargetedKeyEvent>,
+}
+
+impl PreparedKeySequence {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    #[cfg(test)]
+    fn kinds(&self) -> Vec<TargetedKeyEventKind> {
+        self.events.iter().map(|event| event.kind).collect()
+    }
+}
+
+// The sequence is fully constructed on one thread, transferred by ownership
+// to one blocking dispatch thread, and never accessed concurrently. CGEvent is
+// a retained Core Foundation object; this wrapper does not share it.
+unsafe impl Send for PreparedTargetedKeyEvent {}
+
+fn prepare_targeted_event(
+    kind: TargetedKeyEventKind,
+    key_code: u16,
+    key_down: bool,
+    flags: CGEventFlags,
+    text: Option<&str>,
+) -> anyhow::Result<PreparedTargetedKeyEvent> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    let native = match kind {
+        TargetedKeyEventKind::FlagsChangedRequested | TargetedKeyEventKind::FlagsChangedRestore => {
+            let event = CGEvent::new(source)
+                .map_err(|_| anyhow::anyhow!("CGEvent::new flagsChanged failed"))?;
+            event.set_type(CGEventType::FlagsChanged);
+            event
+        }
+        TargetedKeyEventKind::KeyDown
+        | TargetedKeyEventKind::KeyUp
+        | TargetedKeyEventKind::UnicodeDown
+        | TargetedKeyEventKind::UnicodeUp => {
+            CGEvent::new_keyboard_event(source, key_code, key_down)
+                .map_err(|_| anyhow::anyhow!("CGEvent::new_keyboard_event failed"))?
+        }
+    };
+    native.set_flags(flags);
+    if let Some(text) = text {
+        native.set_string(text);
+    }
+    Ok(PreparedTargetedKeyEvent { kind, native })
+}
+
+/// Prepare the signed-helper four-event key sequence without posting it.
+pub(crate) fn prepare_key_sequence(
+    key: &str,
+    modifiers: &[&str],
+) -> anyhow::Result<PreparedKeySequence> {
+    let implied_shift = key == "+" || key.eq_ignore_ascii_case("plus");
+    let key_code = key_name_to_code(if implied_shift { "=" } else { key })?;
+    let mut requested_flags = modifier_flags(modifiers);
+    if implied_shift {
+        requested_flags |= CGEventFlags::CGEventFlagShift;
+    }
+    let restore_flags = combined_session_flags();
+    let events = vec![
+        prepare_targeted_event(
+            TargetedKeyEventKind::FlagsChangedRequested,
+            0,
+            false,
+            requested_flags,
+            None,
+        )?,
+        prepare_targeted_event(
+            TargetedKeyEventKind::KeyDown,
+            key_code,
+            true,
+            requested_flags,
+            None,
+        )?,
+        prepare_targeted_event(
+            TargetedKeyEventKind::KeyUp,
+            key_code,
+            false,
+            requested_flags,
+            None,
+        )?,
+        prepare_targeted_event(
+            TargetedKeyEventKind::FlagsChangedRestore,
+            0,
+            false,
+            restore_flags,
+            None,
+        )?,
+    ];
+    Ok(PreparedKeySequence { events })
+}
+
+pub(crate) fn prepare_unicode_sequence(text: &str) -> anyhow::Result<PreparedKeySequence> {
+    let restore_flags = combined_session_flags();
+    let mut events = Vec::with_capacity(text.chars().count().saturating_mul(4));
+    for character in text.chars() {
+        let character_text = character.to_string();
+        let (key_code, implied_shift) = physical_key_for_char(character).unwrap_or((0, false));
+        let requested_flags = if implied_shift {
+            CGEventFlags::CGEventFlagShift
+        } else {
+            CGEventFlags::CGEventFlagNull
+        };
+        events.push(prepare_targeted_event(
+            TargetedKeyEventKind::FlagsChangedRequested,
+            0,
+            false,
+            requested_flags,
+            None,
+        )?);
+        events.push(prepare_targeted_event(
+            TargetedKeyEventKind::UnicodeDown,
+            key_code,
+            true,
+            requested_flags,
+            Some(&character_text),
+        )?);
+        events.push(prepare_targeted_event(
+            TargetedKeyEventKind::UnicodeUp,
+            key_code,
+            false,
+            requested_flags,
+            Some(&character_text),
+        )?);
+        events.push(prepare_targeted_event(
+            TargetedKeyEventKind::FlagsChangedRestore,
+            0,
+            false,
+            restore_flags,
+            None,
+        )?);
+    }
+    Ok(PreparedKeySequence { events })
+}
+
+/// Post an already-constructed sequence. `CGEventPostToPid` is void, so the
+/// completed loop proves dispatch was attempted but not that the app consumed
+/// the events.
+pub(crate) fn post_prepared_sequence(
+    pid: i32,
+    sequence: &PreparedKeySequence,
+    inter_group_delay_ms: u64,
+) {
+    for (index, event) in sequence.events.iter().enumerate() {
+        unsafe {
+            CGEventSetTimestamp(
+                event.native.as_ptr().cast::<std::ffi::c_void>(),
+                fresh_event_timestamp(),
+            );
+        }
+        event.native.post_to_pid(pid as libc::pid_t);
+        if event.kind == TargetedKeyEventKind::FlagsChangedRestore
+            && index + 1 < sequence.events.len()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(
+                inter_group_delay_ms.max(8),
+            ));
+        }
+    }
+}
+
+fn fresh_event_timestamp() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut time) } != 0 {
+        return 0;
+    }
+    u64::try_from(time.tv_sec)
+        .unwrap_or_default()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(time.tv_nsec).unwrap_or_default())
+}
+
+fn combined_session_flags() -> CGEventFlags {
+    let bits = unsafe { CGEventSourceFlagsState(CGEventSourceStateID::CombinedSessionState) };
+    CGEventFlags::from_bits_truncate(bits)
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceFlagsState(state_id: CGEventSourceStateID) -> u64;
+    fn CGEventSetTimestamp(event: *mut std::ffi::c_void, timestamp: u64);
+}
 
 fn is_screen_sharing_bundle_id(bundle_id: &str) -> bool {
     bundle_id == SCREEN_SHARING_BUNDLE_ID
@@ -32,80 +238,23 @@ pub fn is_screen_sharing_pid(pid: i32) -> bool {
 
 /// Press and release a single key, delivered to `pid` without stealing focus.
 pub fn press_key(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
-    // Handle "+" / "plus" → Shift+= (US keyboard layout).
-    if key == "+" || key.to_lowercase() == "plus" {
-        let flags = modifier_flags(&["shift"]);
-        let eq_code = key_name_to_code("=")?;
-        post_key(pid, eq_code, true, modifier_flags(modifiers) | flags)?;
-        std::thread::sleep(std::time::Duration::from_millis(8));
-        post_key(pid, eq_code, false, modifier_flags(modifiers) | flags)?;
-        return Ok(());
-    }
-
-    let key_code = key_name_to_code(key)?;
-    let flags = modifier_flags(modifiers);
-
-    post_key(pid, key_code, true, flags)?;
-    std::thread::sleep(std::time::Duration::from_millis(8));
-    post_key(pid, key_code, false, flags)?;
+    let sequence = prepare_key_sequence(key, modifiers)?;
+    post_prepared_sequence(pid, &sequence, 0);
     Ok(())
 }
 
 /// Type a string character-by-character to `pid`.
 pub fn type_text(pid: i32, text: &str) -> anyhow::Result<()> {
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-
-    for ch in text.chars() {
-        let ch_str = ch.to_string();
-        let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
-            .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
-        down.set_string(&ch_str);
-        // Always zero flags: Chrome inspects the flags field to infer modifier
-        // state; without this, uppercase chars (e.g. 'E') are seen as Shift+e
-        // and the modifier leaks into the next character (Swift fix: event.flags = []).
-        down.set_flags(CGEventFlags::CGEventFlagNull);
-        post_keyboard_event(pid, &down);
-        std::thread::sleep(std::time::Duration::from_millis(8));
-
-        let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
-            .map_err(|_| anyhow::anyhow!("CGEvent keyboard up failed"))?;
-        up.set_string(&ch_str);
-        up.set_flags(CGEventFlags::CGEventFlagNull);
-        post_keyboard_event(pid, &up);
-        std::thread::sleep(std::time::Duration::from_millis(8));
-    }
+    let sequence = prepare_unicode_sequence(text)?;
+    post_prepared_sequence(pid, &sequence, 8);
     Ok(())
 }
 
 /// Type a string character-by-character with an extra `inter_char_delay_ms`
 /// pause after each character (on top of the internal 8 ms down/up gap).
 pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-
-    for ch in text.chars() {
-        let ch_str = ch.to_string();
-        let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
-            .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
-        down.set_string(&ch_str);
-        down.set_flags(CGEventFlags::CGEventFlagNull);
-        post_keyboard_event(pid, &down);
-        std::thread::sleep(std::time::Duration::from_millis(8));
-
-        let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
-            .map_err(|_| anyhow::anyhow!("CGEvent keyboard up failed"))?;
-        up.set_string(&ch_str);
-        up.set_flags(CGEventFlags::CGEventFlagNull);
-        post_keyboard_event(pid, &up);
-
-        // Additional inter-character delay on top of the 8 ms internal gap.
-        if inter_char_delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms));
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(8));
-        }
-    }
+    let sequence = prepare_unicode_sequence(text)?;
+    post_prepared_sequence(pid, &sequence, inter_char_delay_ms);
     Ok(())
 }
 
@@ -735,6 +884,70 @@ pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
 mod tests {
     use super::*;
     use core_graphics::event::CGEventType;
+
+    #[test]
+    fn targeted_chord_is_the_signed_helper_four_event_sequence() {
+        let sequence = prepare_key_sequence("a", &["cmd"]).unwrap();
+        assert_eq!(sequence.len(), 4);
+        assert_eq!(
+            sequence.kinds(),
+            vec![
+                TargetedKeyEventKind::FlagsChangedRequested,
+                TargetedKeyEventKind::KeyDown,
+                TargetedKeyEventKind::KeyUp,
+                TargetedKeyEventKind::FlagsChangedRestore,
+            ]
+        );
+        assert_eq!(
+            sequence.events[0].native.get_type() as u32,
+            CGEventType::FlagsChanged as u32
+        );
+        assert_eq!(
+            sequence.events[1].native.get_type() as u32,
+            CGEventType::KeyDown as u32
+        );
+        assert_eq!(
+            sequence.events[2].native.get_type() as u32,
+            CGEventType::KeyUp as u32
+        );
+        assert_eq!(
+            sequence.events[3].native.get_type() as u32,
+            CGEventType::FlagsChanged as u32
+        );
+        for event in &sequence.events[..3] {
+            assert!(event
+                .native
+                .get_flags()
+                .contains(CGEventFlags::CGEventFlagCommand));
+        }
+    }
+
+    #[test]
+    fn targeted_unicode_prepares_every_group_before_dispatch() {
+        let sequence = prepare_unicode_sequence("A東").unwrap();
+        assert_eq!(sequence.len(), 8);
+        assert_eq!(
+            sequence.kinds(),
+            vec![
+                TargetedKeyEventKind::FlagsChangedRequested,
+                TargetedKeyEventKind::UnicodeDown,
+                TargetedKeyEventKind::UnicodeUp,
+                TargetedKeyEventKind::FlagsChangedRestore,
+                TargetedKeyEventKind::FlagsChangedRequested,
+                TargetedKeyEventKind::UnicodeDown,
+                TargetedKeyEventKind::UnicodeUp,
+                TargetedKeyEventKind::FlagsChangedRestore,
+            ]
+        );
+        assert!(sequence.events[1]
+            .native
+            .get_flags()
+            .contains(CGEventFlags::CGEventFlagShift));
+        assert_eq!(
+            sequence.events[5].native.get_flags(),
+            CGEventFlags::CGEventFlagNull
+        );
+    }
 
     #[test]
     fn physical_text_uses_flags_changed_for_balanced_shift_transitions() {

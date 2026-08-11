@@ -81,6 +81,7 @@ extern "C" {
         element: AXUIElementRef,
         timeout_in_seconds: f32,
     ) -> AXError;
+    pub fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> AXError;
     pub fn AXUIElementGetTypeID() -> CFTypeID;
     pub fn AXIsProcessTrusted() -> bool;
     /// `AXIsProcessTrustedWithOptions(options)` — when called with
@@ -117,6 +118,7 @@ pub unsafe fn element_at_screen_position(pid: i32, x: f64, y: f64) -> Option<AXU
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     pub fn AXValueCreate(the_type: AXValueType, value_ptr: *const c_void) -> AXValueRef;
+    pub fn AXValueGetTypeID() -> CFTypeID;
     pub fn AXValueGetType(value: AXValueRef) -> AXValueType;
     pub fn AXValueGetValue(
         value: AXValueRef,
@@ -137,6 +139,24 @@ struct CGSizeValue {
     height: f64,
 }
 
+/// Core Foundation's `CFRange` layout, used by `AXSelectedTextRange`.
+/// Locations and lengths are UTF-16 code-unit offsets for AX text elements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct AxCfRange {
+    pub location: isize,
+    pub length: isize,
+}
+
+impl AxCfRange {
+    pub fn from_utf16(location: usize, length: usize) -> Option<Self> {
+        Some(Self {
+            location: isize::try_from(location).ok()?,
+            length: isize::try_from(length).ok()?,
+        })
+    }
+}
+
 // ── Helper functions ──────────────────────────────────────────────────────────
 
 use core_foundation::{array::CFArray, base::TCFType, string::CFString as CFStr};
@@ -152,6 +172,24 @@ pub unsafe fn is_attribute_settable(element: AXUIElementRef, attr_name: &str) ->
     AXUIElementIsAttributeSettable(element, attr.as_concrete_TypeRef(), &mut settable)
         == kAXErrorSuccess
         && settable != 0
+}
+
+/// Read the process which owns an AX element without inferring ownership from
+/// the top-level application used to discover it.
+///
+/// # Safety
+///
+/// `element` must be a live AX element reference for the duration of the call.
+pub unsafe fn element_pid(element: AXUIElementRef) -> Result<i32, AXError> {
+    let mut pid = 0_i32;
+    let error = AXUIElementGetPid(element, &mut pid);
+    if error != kAXErrorSuccess {
+        return Err(error);
+    }
+    if pid <= 0 {
+        return Err(kAXErrorFailure);
+    }
+    Ok(pid)
 }
 
 /// Copy a string attribute from an AX element. Returns `None` on any error.
@@ -173,6 +211,53 @@ pub unsafe fn copy_string_attr(element: AXUIElementRef, attr_name: &str) -> Opti
     }
     let s = CFStr::wrap_under_create_rule(value as _);
     Some(s.to_string())
+}
+
+/// Copy a `kAXValueCFRangeType` attribute.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn copy_cf_range_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Result<Option<AxCfRange>, AXError> {
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if error == kAXErrorNoValue || error == kAXErrorAttributeUnsupported {
+        return Ok(None);
+    }
+    if error != kAXErrorSuccess {
+        return Err(error);
+    }
+    if value.is_null() {
+        return Ok(None);
+    }
+    if core_foundation::base::CFGetTypeID(value) != AXValueGetTypeID() {
+        CFRelease(value);
+        return Err(kAXErrorFailure);
+    }
+    let value = value as AXValueRef;
+    if AXValueGetType(value) != kAXValueCFRangeType {
+        CFRelease(value as CFTypeRef);
+        return Err(kAXErrorFailure);
+    }
+    let mut range = AxCfRange {
+        location: 0,
+        length: 0,
+    };
+    let copied = AXValueGetValue(
+        value,
+        kAXValueCFRangeType,
+        &mut range as *mut _ as *mut c_void,
+    );
+    CFRelease(value as CFTypeRef);
+    if copied {
+        Ok(Some(range))
+    } else {
+        Err(kAXErrorFailure)
+    }
 }
 
 /// Copy a numeric attribute from an AX element as an `f64`. Returns `None` on
@@ -228,6 +313,58 @@ pub unsafe fn copy_bool_attr(element: AXUIElementRef, attr_name: &str) -> Option
     }
     CFRelease(value);
     None
+}
+
+/// Copy a `kAXValueCGPointType` attribute.
+///
+/// Missing and unsupported attributes are optional. Other query or type
+/// failures remain distinguishable to callers that require exact geometry.
+///
+/// # Safety
+///
+/// `element` must be a valid Accessibility object reference for this call.
+pub unsafe fn copy_point_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Result<Option<(f64, f64)>, AXError> {
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err == kAXErrorNoValue || err == kAXErrorAttributeUnsupported {
+        return Ok(None);
+    }
+    if err != kAXErrorSuccess {
+        return Err(err);
+    }
+    if value.is_null() {
+        return Ok(None);
+    }
+    if core_foundation::base::CFGetTypeID(value) != AXValueGetTypeID() {
+        CFRelease(value);
+        return Err(kAXErrorFailure);
+    }
+    let value = value as AXValueRef;
+    if AXValueGetType(value) != kAXValueCGPointType {
+        CFRelease(value as CFTypeRef);
+        return Err(kAXErrorFailure);
+    }
+    #[repr(C)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    let mut point = CGPoint { x: 0.0, y: 0.0 };
+    let copied = AXValueGetValue(
+        value,
+        kAXValueCGPointType,
+        &mut point as *mut _ as *mut c_void,
+    );
+    CFRelease(value as CFTypeRef);
+    if copied {
+        Ok(Some((point.x, point.y)))
+    } else {
+        Err(kAXErrorFailure)
+    }
 }
 
 /// A copied AX attribute represented for both existing string-only consumers
@@ -563,6 +700,27 @@ pub unsafe fn set_string_attr(element: AXUIElementRef, attr_name: &str, value: &
     AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_value.as_CFTypeRef())
 }
 
+/// Set a `kAXValueCFRangeType` attribute.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn set_cf_range_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+    range: AxCfRange,
+) -> AXError {
+    let value = AXValueCreate(kAXValueCFRangeType, &range as *const _ as *const c_void);
+    if value.is_null() {
+        return kAXErrorFailure;
+    }
+    let attr = CFStr::new(attr_name);
+    let error =
+        AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), value as CFTypeRef);
+    CFRelease(value as CFTypeRef);
+    error
+}
+
 /// Set an AX attribute to a CFNumber (double) value. Numeric controls — most
 /// notably `AXSlider` (NSSlider) and `AXStepper` — expose a numeric `AXValue`
 /// reject a `CFString` write — `-25200` (kAXErrorFailure, observed live on a
@@ -626,16 +784,29 @@ pub unsafe fn set_size_attr(
     result
 }
 
+/// Set an AX attribute to a CFBoolean value.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn set_bool_attr(element: AXUIElementRef, attr_name: &str, value: bool) -> AXError {
+    use core_foundation::boolean::CFBoolean;
+    let attr = CFStr::new(attr_name);
+    let cf_value = if value {
+        CFBoolean::true_value()
+    } else {
+        CFBoolean::false_value()
+    };
+    AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_value.as_CFTypeRef())
+}
+
 /// Set an AX attribute to a CFBoolean true value.
 ///
 /// # Safety
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn set_bool_attr_true(element: AXUIElementRef, attr_name: &str) -> AXError {
-    use core_foundation::boolean::CFBoolean;
-    let attr = CFStr::new(attr_name);
-    let cf_true = CFBoolean::true_value();
-    AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_true.as_CFTypeRef())
+    set_bool_attr(element, attr_name, true)
 }
 
 /// Signal to a Chromium/Electron application root that a real assistive client

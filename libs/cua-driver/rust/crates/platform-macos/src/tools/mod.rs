@@ -5,9 +5,11 @@ mod click;
 mod clipboard;
 mod double_click;
 mod drag;
+mod element_click_route;
 mod get_window_state;
 mod hotkey;
 mod invoke_menu;
+mod keyboard_target;
 mod kill_app;
 mod launch_app;
 mod list_apps;
@@ -15,6 +17,7 @@ mod list_windows;
 mod press_key;
 mod right_click;
 mod scroll;
+mod select_text;
 mod set_value;
 mod set_window_frame;
 mod type_text;
@@ -212,9 +215,10 @@ pub(crate) fn background_refusal_result(
 /// Exclusive per-process ownership of one background mutation. Callers must
 /// keep this value alive through actuator dispatch, focus restoration, and
 /// target-bound verification.
+#[derive(Debug)]
 pub(crate) struct BackgroundMutationLease {
     pid: i32,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _permit: crate::background_mutation::DispatchPermit,
 }
 
 impl BackgroundMutationLease {
@@ -269,16 +273,83 @@ pub(crate) async fn gate_background_window_action(
     element_ptr: Option<usize>,
     action: cua_driver_core::background_input::BackgroundAction,
 ) -> Result<BackgroundMutationLease, cua_driver_core::protocol::ToolResult> {
-    let lease = acquire_background_mutation(pid).await;
+    let lease = acquire_background_mutation(pid)?;
     lease.gate_again(window_id, element_ptr, action).await?;
     Ok(lease)
 }
 
-pub(crate) async fn acquire_background_mutation(pid: i32) -> BackgroundMutationLease {
-    BackgroundMutationLease {
+/// Re-prove an exact window target for a semantic AX mutation that does not
+/// acquire process-shared focus, pointer, keyboard, or menu resources.
+///
+/// The caller must retain the addressed element through dispatch and exact
+/// read-back. This deliberately does not acquire the per-process mutation
+/// coordinator, allowing independent AX value/range writes to two windows of
+/// one application to overlap safely.
+pub(crate) async fn gate_target_local_ax_action(
+    pid: i32,
+    window_id: u32,
+    element_ptr: usize,
+) -> Result<BackgroundMutationLease, cua_driver_core::protocol::ToolResult> {
+    let lease = acquire_target_mutation(pid, window_id)?;
+    decide_background_window_action(
         pid,
-        _guard: crate::background_mutation::acquire(pid).await,
+        window_id,
+        Some(element_ptr),
+        cua_driver_core::background_input::BackgroundAction::AxSemantic,
+    )
+    .await?;
+    Ok(lease)
+}
+
+fn dispatch_conflict_result(
+    pid: i32,
+    window_id: Option<u32>,
+    conflict: crate::background_mutation::DispatchConflict,
+) -> cua_driver_core::protocol::ToolResult {
+    let mut structured = serde_json::json!({
+        "code": "target_busy",
+        "effect": "refused",
+        "pid": pid,
+        "native_side_effect_started": false,
+        "requested_scope": conflict.requested.kind(),
+        "requested_identity": conflict.requested.identity(),
+        "held_scope": conflict.held.kind(),
+        "held_identity": conflict.held.identity(),
+    });
+    if let Some(window_id) = window_id {
+        structured["window_id"] = serde_json::json!(window_id);
     }
+    cua_driver_core::protocol::ToolResult::error(
+        "Native dispatch refused (target_busy): an incompatible action is already in flight",
+    )
+    .with_structured(structured)
+}
+
+pub(crate) fn acquire_background_mutation(
+    pid: i32,
+) -> Result<BackgroundMutationLease, cua_driver_core::protocol::ToolResult> {
+    let permit = crate::background_mutation::try_acquire(
+        crate::background_mutation::DispatchScope::Process(pid),
+    )
+    .map_err(|conflict| dispatch_conflict_result(pid, None, conflict))?;
+    Ok(BackgroundMutationLease {
+        pid,
+        _permit: permit,
+    })
+}
+
+fn acquire_target_mutation(
+    pid: i32,
+    window_id: u32,
+) -> Result<BackgroundMutationLease, cua_driver_core::protocol::ToolResult> {
+    let permit = crate::background_mutation::try_acquire(
+        crate::background_mutation::DispatchScope::Target { pid, window_id },
+    )
+    .map_err(|conflict| dispatch_conflict_result(pid, Some(window_id), conflict))?;
+    Ok(BackgroundMutationLease {
+        pid,
+        _permit: permit,
+    })
 }
 
 /// Finish the post-action observation window. Embedded interactive clients
@@ -880,6 +951,10 @@ pub fn register_all(
     ));
     registry.register(pid_window_guarded(
         set_value::SetValueTool::new(state.clone()),
+        &pid_window_candidates,
+    ));
+    registry.register(pid_window_guarded(
+        select_text::SelectTextTool::new(state.clone()),
         &pid_window_candidates,
     ));
     registry.register(pid_window_guarded(

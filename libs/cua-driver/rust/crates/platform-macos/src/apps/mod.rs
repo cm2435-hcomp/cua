@@ -635,6 +635,19 @@ pub fn frontmost_pid() -> Option<i32> {
     }
 }
 
+/// Return the exact hidden state of a running application.
+///
+/// `None` means NSWorkspace no longer knows the pid. Minimized-window recovery
+/// treats that as an identity failure rather than guessing that the app is
+/// visible.
+pub fn is_hidden(pid: i32) -> Option<bool> {
+    use objc2_app_kit::NSRunningApplication;
+    unsafe {
+        NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .map(|application| application.isHidden())
+    }
+}
+
 /// Re-activate the app with `pid` via
 /// `NSRunningApplication.runningApplicationWithProcessIdentifier(pid)?.activateWithOptions([])`.
 /// Returns `true` if the app was found and activate was attempted.

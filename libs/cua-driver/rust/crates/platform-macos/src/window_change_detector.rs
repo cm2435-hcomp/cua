@@ -192,10 +192,10 @@ impl WindowChangeDetector {
     /// Capture the before-state and suppress cross-app activations while
     /// allowing one intentional target activation.
     ///
-    /// The raw background pixel-click path needs this middle ground:
-    /// focus-without-raise makes `allowed_pid` AppKit-active so its event queue
-    /// accepts the click, but a link or hand-off that activates a different app
-    /// must still restore the user's original foreground.
+    /// Retained for explicit action recipes that intentionally permit one real
+    /// activation while suppressing every unrelated cross-app activation. The
+    /// signed background-click route does not use this: its target-only belief
+    /// must not change WindowServer foreground at all.
     pub fn snapshot_allowing_activation(prior_front: Option<i32>, allowed_pid: i32) -> Snapshot {
         Self::capture(prior_front, true, Some(allowed_pid))
     }

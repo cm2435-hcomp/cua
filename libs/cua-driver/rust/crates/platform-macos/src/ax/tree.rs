@@ -50,6 +50,8 @@ pub struct AXNode {
     /// 0-based index (Some = actionable, None = non-actionable display-only node)
     pub element_index: Option<usize>,
     pub role: String,
+    /// AXSubrole, retained for exact controls such as title-bar close buttons.
+    pub subrole: Option<String>,
     /// AXTitle — shown as `"title"` in the tree line.
     pub title: Option<String>,
     /// AXValue — shown as `= "value"` in the tree line.
@@ -401,6 +403,7 @@ unsafe fn walk_element(
     // (digit buttons). Merging them would produce "2" (quoted) instead of (2)
     // (parens), breaking _find_calc_button which searches for "(2)".
     let title = copy_string_attr(element, "AXTitle");
+    let subrole = copy_string_attr(element, "AXSubrole");
     // Read AXValue once with enough type information to preserve the existing
     // string-only markdown while also exposing numeric/boolean control state.
     let copied_value = copy_stringish_attr(element, "AXValue");
@@ -491,6 +494,7 @@ unsafe fn walk_element(
         AXNode {
             element_index: Some(idx),
             role: role.clone(),
+            subrole: subrole.clone(),
             title: if visible_title.is_empty() {
                 None
             } else {
@@ -525,6 +529,7 @@ unsafe fn walk_element(
         AXNode {
             element_index: None,
             role: role.clone(),
+            subrole,
             title: if visible_title.is_empty() {
                 None
             } else {
@@ -638,6 +643,9 @@ fn format_node_line(node: &AXNode) -> String {
         let mut attrs: Vec<String> = Vec::new();
         if let Some(id) = &node.identifier {
             attrs.push(format!("id={}", id));
+        }
+        if let Some(subrole) = &node.subrole {
+            attrs.push(format!("subrole=\"{}\"", subrole));
         }
         if let Some(h) = &node.help {
             attrs.push(format!("help=\"{}\"", h));

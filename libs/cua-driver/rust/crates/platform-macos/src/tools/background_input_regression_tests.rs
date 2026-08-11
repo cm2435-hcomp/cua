@@ -12,7 +12,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[tokio::test]
-async fn same_pid_lease_covers_proof_dispatch_restoration_and_verification() {
+async fn same_pid_lease_refuses_immediately_through_the_first_action_lifecycle() {
     const PID: i32 = -92_101;
     let events = Arc::new(Mutex::new(Vec::new()));
     let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
@@ -20,7 +20,7 @@ async fn same_pid_lease_covers_proof_dispatch_restoration_and_verification() {
 
     let first_events = events.clone();
     let first = tokio::spawn(async move {
-        let _lease = acquire_background_mutation(PID).await;
+        let _lease = acquire_background_mutation(PID).unwrap();
         first_events
             .lock()
             .unwrap()
@@ -34,24 +34,15 @@ async fn same_pid_lease_covers_proof_dispatch_restoration_and_verification() {
     });
     first_started_rx.await.unwrap();
 
-    let second_events = events.clone();
-    let mut second = tokio::spawn(async move {
-        let _lease = acquire_background_mutation(PID).await;
-        second_events.lock().unwrap().push("second:proof");
-    });
-
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut second)
-            .await
-            .is_err(),
-        "the sibling-window mutation must wait through restoration and verification"
-    );
+    let refusal = acquire_background_mutation(PID).unwrap_err();
+    assert_eq!(refusal.is_error, Some(true));
+    let structured = refusal.structured_content.unwrap();
+    assert_eq!(structured["code"], "target_busy");
+    assert_eq!(structured["effect"], "refused");
+    assert_eq!(structured["native_side_effect_started"], false);
     finish_first_tx.send(()).unwrap();
     first.await.unwrap();
-    tokio::time::timeout(Duration::from_secs(1), second)
-        .await
-        .expect("same-pid mutation should proceed after the full lifecycle")
-        .unwrap();
+    acquire_background_mutation(PID).unwrap();
 
     assert_eq!(
         *events.lock().unwrap(),
@@ -59,8 +50,7 @@ async fn same_pid_lease_covers_proof_dispatch_restoration_and_verification() {
             "first:proof",
             "first:dispatch",
             "first:restore",
-            "first:verify",
-            "second:proof",
+            "first:verify"
         ]
     );
 }
@@ -69,11 +59,11 @@ async fn same_pid_lease_covers_proof_dispatch_restoration_and_verification() {
 async fn different_pid_lease_enters_while_first_mutation_is_in_flight() {
     const FIRST_PID: i32 = -92_102;
     const SECOND_PID: i32 = -92_103;
-    let first = acquire_background_mutation(FIRST_PID).await;
+    let first = acquire_background_mutation(FIRST_PID).unwrap();
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
 
     let second = tokio::spawn(async move {
-        let _lease = acquire_background_mutation(SECOND_PID).await;
+        let _lease = acquire_background_mutation(SECOND_PID).unwrap();
         entered_tx.send(()).unwrap();
     });
 
