@@ -644,6 +644,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
  "windows 0.58.0",
 ]
 

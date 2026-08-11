@@ -1,7 +1,7 @@
 //! ElectronJS: detect Electron apps and evaluate JS via CDP inspector.
 
-use std::time::Duration;
 use std::collections::HashSet;
+use std::time::Duration;
 
 use super::cdp_client::{listening_ports, CdpClient};
 
@@ -79,12 +79,16 @@ impl ElectronJs {
                     break;
                 }
             }
-            if new_port.is_some() { break; }
+            if new_port.is_some() {
+                break;
+            }
         }
 
         let port = new_port.ok_or_else(|| {
-            anyhow::anyhow!("Could not find Electron inspector port for pid {pid}. \
-                             Try launching with --inspect or --remote-debugging-port.")
+            anyhow::anyhow!(
+                "Could not find Electron inspector port for pid {pid}. \
+                             Try launching with --inspect or --remote-debugging-port."
+            )
         })?;
 
         CdpClient::evaluate(javascript, port).await
@@ -125,4 +129,3 @@ fn find_bundle_path_for_app(name: &str) -> Option<String> {
     }
     None
 }
-

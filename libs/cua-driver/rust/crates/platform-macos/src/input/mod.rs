@@ -8,11 +8,13 @@
 //!    public `CGEventPostToPid` to reach Catalyst/Chromium apps and trigger
 //!    the activity-monitor tickle required for live-input detection.
 
-pub mod mouse;
-pub mod keyboard;
 pub mod ax_actions;
+pub mod keyboard;
+pub mod mouse;
 pub mod skylight;
+pub mod slps_make_key;
+pub(crate) mod synthesized_event;
 
 pub use ax_actions::perform_ax_action;
+pub use keyboard::{hotkey, press_key, type_text};
 pub use mouse::click_at_xy;
-pub use keyboard::{press_key, type_text, hotkey};

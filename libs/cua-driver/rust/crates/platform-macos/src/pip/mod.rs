@@ -190,12 +190,24 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
 
 // ── AppKit main loop helper for Serve mode ───────────────────────────────
 
+/// Initialize the process-wide AppKit application on the main thread before a
+/// background protocol worker can submit ScreenCaptureKit work.
+pub fn initialize_appkit_main_loop() {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    let _mtm = objc2_foundation::MainThreadMarker::new()
+        .expect("initialize_appkit_main_loop must be called from the main thread");
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: bool = msg_send![app, setActivationPolicy: 1i64];
+        let _: () = msg_send![app, finishLaunching];
+    }
+}
+
 /// Park the main thread in `NSApplication.run()`. Used by `cua-driver
-/// serve --experimental-pip` so the dispatch_async_f → main queue
-/// path PiP frames go through can be drained. Mirrors the cursor
-/// overlay's `run_appkit` startup (Accessory activation policy →
-/// finishLaunching → run) without installing the overlay's
-/// CALayer-backed window itself.
+/// serve --experimental-pip` and driver v2 so main-queue AppKit and
+/// ScreenCaptureKit callbacks are drained.
 ///
 /// Never returns — the background `serve::run_serve_cmd` thread calls
 /// `std::process::exit` when it finishes, which tears down NSApp at
@@ -206,13 +218,9 @@ pub fn run_appkit_main_loop() {
 
     let _mtm = objc2_foundation::MainThreadMarker::new()
         .expect("run_appkit_main_loop must be called from the main thread");
+    initialize_appkit_main_loop();
     unsafe {
         let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-        // Accessory policy: no Dock icon, no menu bar. Keeps the
-        // daemon out of the user's application switcher, same as
-        // the cursor overlay's NSApp setup.
-        let _: bool = msg_send![app, setActivationPolicy: 1i64];
-        let _: () = msg_send![app, finishLaunching];
         let _: () = msg_send![app, run];
     }
 }

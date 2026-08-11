@@ -37,14 +37,23 @@ fn main() {
     // its own build.rs, but platform-macos' unit-test binary is linked from
     // this package, so it needs the same runtime search paths here.
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
-    if let Ok(out) = std::process::Command::new("xcode-select").arg("-p").output() {
+    if let Ok(out) = std::process::Command::new("xcode-select")
+        .arg("-p")
+        .output()
+    {
         if out.status.success() {
             let xcode_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
             for sub in [
                 "Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx",
                 "Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.5/macosx",
+                "usr/lib/swift/macosx",
+                "usr/lib/swift-5.5/macosx",
             ] {
-                println!("cargo:rustc-link-arg=-Wl,-rpath,{xcode_path}/{sub}");
+                let runtime_path = std::path::Path::new(&xcode_path).join(sub);
+                if runtime_path.is_dir() {
+                    println!("cargo:rustc-link-search=native={}", runtime_path.display());
+                    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", runtime_path.display());
+                }
             }
         }
     }

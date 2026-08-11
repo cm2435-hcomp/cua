@@ -22,13 +22,20 @@
 //!   3. `stop()` calls `stop_capture()` (which finalises the mp4 moov
 //!      atom) and returns the elapsed-time metadata.
 
-use std::path::Path;
-use std::time::Instant;
+use std::{
+    ffi::c_void,
+    path::Path,
+    sync::mpsc::{sync_channel, RecvTimeoutError},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use cua_driver_core::video::{VideoBackend, VideoBackendFactory, VideoMetadata};
 
+use screencapturekit::async_api::{AsyncSCScreenshotManager, AsyncSCShareableContent};
+use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, SCFrameStatus};
 use screencapturekit::prelude::{
-    SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration,
+    CMSampleBuffer, SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration,
+    SCStreamOutputType,
 };
 use screencapturekit::recording_output::{
     SCRecordingOutput, SCRecordingOutputCodec, SCRecordingOutputConfiguration,
@@ -36,6 +43,391 @@ use screencapturekit::recording_output::{
 };
 
 pub struct SckitVideoBackendFactory;
+
+/// Metadata produced by the same completed one-shot ScreenCaptureKit request
+/// that returned the PNG. The normalized fields retain the existing
+/// observation contract while avoiding a short-lived `SCStream` per state
+/// call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFrameMetadata {
+    pub completion_unix_ms: u64,
+    pub display_time: Option<u64>,
+    pub frame_status: Option<SCFrameStatus>,
+    pub scale_factor: Option<f64>,
+    pub content_scale: Option<f64>,
+    pub content_rect: Option<FrameRect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFrameSample {
+    pub png_bytes: Vec<u8>,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    /// ScreenCaptureKit's exact source-window frame at sample construction.
+    pub source_frame: FrameRect,
+    pub evidence: WindowFrameEvidence,
+    pub metadata: WindowFrameMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameEvidence {
+    /// One completed `SCScreenshotManager.captureImage` request. The exact
+    /// window and geometry are bracketed independently by the observation.
+    ScreenshotCompletion,
+    /// A same-sample SCStream image plus its native frame attachments.
+    StreamAttachments,
+    /// Exact-window WindowServer capture used only after both
+    /// ScreenCaptureKit routes fail within their bounded budgets.
+    WindowServerFallback,
+}
+
+struct TemporaryCapturePath(std::path::PathBuf);
+
+impl Drop for TemporaryCapturePath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Capture one exact desktop-independent window with the same one-shot
+/// ScreenCaptureKit API used by the signed helper's Appshot path.
+///
+/// The caller independently brackets exact window identity and geometry.
+/// `timeout` is validated here and enforced by the async observation wrapper;
+/// ScreenCaptureKit's synchronous Rust bridge has no cancellation parameter.
+pub async fn capture_window_sample(
+    window_id: u32,
+    expected_scale_factor: f64,
+    timeout: Duration,
+) -> anyhow::Result<WindowFrameSample> {
+    if !expected_scale_factor.is_finite() || expected_scale_factor <= 0.0 {
+        anyhow::bail!("invalid expected scale factor for window {window_id}");
+    }
+    if timeout.is_zero() {
+        anyhow::bail!("ScreenCaptureKit window {window_id} sample deadline elapsed");
+    }
+    let started_at = Instant::now();
+    let screenshot_budget = timeout
+        .checked_div(3)
+        .unwrap_or(timeout)
+        .min(Duration::from_secs(2));
+    let screenshot = tokio::time::timeout(
+        screenshot_budget,
+        capture_window_screenshot_sample(window_id, expected_scale_factor),
+    )
+    .await;
+    if let Ok(Ok(sample)) = screenshot {
+        return Ok(sample);
+    }
+
+    let remaining = timeout.saturating_sub(started_at.elapsed());
+    if remaining.is_zero() {
+        anyhow::bail!("ScreenCaptureKit window {window_id} sample deadline elapsed");
+    }
+    let stream_budget = remaining.min(Duration::from_secs(3));
+    let stream = tokio::task::spawn_blocking(move || {
+        capture_window_stream_sample(window_id, expected_scale_factor, stream_budget)
+    })
+    .await;
+    if let Ok(Ok(sample)) = stream {
+        return Ok(sample);
+    }
+
+    let remaining = timeout.saturating_sub(started_at.elapsed());
+    if remaining.is_zero() {
+        anyhow::bail!("window {window_id} capture routes exceeded their shared deadline");
+    }
+    tokio::time::timeout(
+        remaining,
+        tokio::task::spawn_blocking(move || capture_window_server_sample(window_id)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("WindowServer capture timed out for window {window_id}"))?
+    .map_err(|error| anyhow::anyhow!("WindowServer capture worker failed: {error}"))?
+}
+
+async fn capture_window_screenshot_sample(
+    window_id: u32,
+    expected_scale_factor: f64,
+) -> anyhow::Result<WindowFrameSample> {
+    let content = AsyncSCShareableContent::get()
+        .await
+        .map_err(|error| anyhow::anyhow!("SCShareableContent::get failed: {error}"))?;
+    let window = content
+        .windows()
+        .into_iter()
+        .find(|candidate| candidate.window_id() == window_id)
+        .ok_or_else(|| anyhow::anyhow!("ScreenCaptureKit window {window_id} is unavailable"))?;
+    let frame = frame_rect(window.frame());
+    let width = scaled_dimension(frame.width, expected_scale_factor, "width")?;
+    let height = scaled_dimension(frame.height, expected_scale_factor, "height")?;
+    let filter = SCContentFilter::create().with_window(&window).build();
+    let configuration = SCStreamConfiguration::new()
+        .with_width(width)
+        .with_height(height)
+        .with_ignores_shadows_single_window(true)
+        .with_shows_cursor(false)
+        .with_captures_audio(false);
+    let image = AsyncSCScreenshotManager::capture_image(&filter, &configuration)
+        .await
+        .map_err(|error| anyhow::anyhow!("ScreenCaptureKit screenshot failed: {error}"))?;
+    let completion_unix_ms = unix_ms_now();
+    let pixel_width = u32::try_from(image.width())
+        .map_err(|_| anyhow::anyhow!("captured image width exceeds u32"))?;
+    let pixel_height = u32::try_from(image.height())
+        .map_err(|_| anyhow::anyhow!("captured image height exceeds u32"))?;
+
+    let temporary_path = TemporaryCapturePath(std::env::temp_dir().join(format!(
+        "cua-v2-sck-sample-{}-{}.png",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    )));
+    image.save_png(&temporary_path.0).map_err(|error| {
+        anyhow::anyhow!("failed to encode ScreenCaptureKit sample for window {window_id}: {error}")
+    })?;
+    let png_bytes = std::fs::read(&temporary_path.0).map_err(|error| {
+        anyhow::anyhow!("failed to read encoded ScreenCaptureKit sample: {error}")
+    })?;
+    if png_bytes.is_empty() {
+        anyhow::bail!("ScreenCaptureKit produced an empty PNG for window {window_id}");
+    }
+
+    let metadata = WindowFrameMetadata {
+        completion_unix_ms,
+        display_time: None,
+        frame_status: None,
+        scale_factor: None,
+        content_scale: None,
+        content_rect: None,
+    };
+    Ok(WindowFrameSample {
+        png_bytes,
+        pixel_width,
+        pixel_height,
+        source_frame: frame,
+        evidence: WindowFrameEvidence::ScreenshotCompletion,
+        metadata,
+    })
+}
+
+fn capture_window_stream_sample(
+    window_id: u32,
+    expected_scale_factor: f64,
+    timeout: Duration,
+) -> anyhow::Result<WindowFrameSample> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow::anyhow!("invalid ScreenCaptureKit sample timeout"))?;
+    let content = SCShareableContent::get()
+        .map_err(|error| anyhow::anyhow!("SCShareableContent::get failed: {error}"))?;
+    let window = content
+        .windows()
+        .into_iter()
+        .find(|candidate| candidate.window_id() == window_id)
+        .ok_or_else(|| anyhow::anyhow!("ScreenCaptureKit window {window_id} is unavailable"))?;
+    let frame = window.frame();
+    let width = scaled_dimension(frame.size.width, expected_scale_factor, "width")?;
+    let height = scaled_dimension(frame.size.height, expected_scale_factor, "height")?;
+    let filter = SCContentFilter::create().with_window(&window).build();
+    let configuration = SCStreamConfiguration::new()
+        .with_width(width)
+        .with_height(height)
+        .with_queue_depth(2)
+        .with_ignores_shadows_single_window(true)
+        .with_shows_cursor(false)
+        .with_captures_audio(false);
+
+    let (sender, receiver) = sync_channel(2);
+    let mut stream = SCStream::new(&filter, &configuration);
+    stream
+        .add_output_handler(
+            move |sample, _| {
+                let completion_unix_ms = unix_ms_now();
+                let _ = sender.try_send((sample, completion_unix_ms));
+            },
+            SCStreamOutputType::Screen,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!("ScreenCaptureKit failed to register output for window {window_id}")
+        })?;
+    stream
+        .start_capture()
+        .map_err(|error| anyhow::anyhow!("ScreenCaptureKit stream start failed: {error}"))?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let received = if remaining.is_zero() {
+        Err(anyhow::anyhow!(
+            "ScreenCaptureKit window {window_id} sample deadline elapsed"
+        ))
+    } else {
+        receiver
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                RecvTimeoutError::Timeout => anyhow::anyhow!(
+                    "ScreenCaptureKit window {window_id} produced no sample before its deadline"
+                ),
+                RecvTimeoutError::Disconnected => anyhow::anyhow!(
+                    "ScreenCaptureKit output for window {window_id} disconnected before a sample"
+                ),
+            })
+    };
+    let stop_result = stream.stop_capture().map_err(|error| {
+        anyhow::anyhow!("ScreenCaptureKit stream stop failed for window {window_id}: {error}")
+    });
+    let (sample, completion_unix_ms) = received?;
+    stop_result?;
+
+    let frame_info = sample.frame_info();
+    let image = sample
+        .cg_image()
+        .map_err(|status| anyhow::anyhow!("ScreenCaptureKit sample has no image: {status}"))?;
+    let pixel_width = u32::try_from(image.width())
+        .map_err(|_| anyhow::anyhow!("captured image width exceeds u32"))?;
+    let pixel_height = u32::try_from(image.height())
+        .map_err(|_| anyhow::anyhow!("captured image height exceeds u32"))?;
+    let temporary_path = TemporaryCapturePath(std::env::temp_dir().join(format!(
+        "cua-v2-sck-sample-{}-{}.png",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    )));
+    image.save_png(&temporary_path.0).map_err(|error| {
+        anyhow::anyhow!("failed to encode ScreenCaptureKit sample for window {window_id}: {error}")
+    })?;
+    let png_bytes = std::fs::read(&temporary_path.0).map_err(|error| {
+        anyhow::anyhow!("failed to read encoded ScreenCaptureKit sample: {error}")
+    })?;
+    if png_bytes.is_empty() {
+        anyhow::bail!("ScreenCaptureKit produced an empty PNG for window {window_id}");
+    }
+    let metadata = WindowFrameMetadata {
+        completion_unix_ms,
+        display_time: frame_info.as_ref().and_then(|info| info.display_time),
+        frame_status: frame_info
+            .as_ref()
+            .and_then(|info| info.frame_status)
+            .or_else(|| frame_status_from_attachment(&sample)),
+        scale_factor: frame_info.as_ref().and_then(|info| info.scale_factor),
+        content_scale: frame_info.as_ref().and_then(|info| info.content_scale),
+        content_rect: frame_info
+            .as_ref()
+            .and_then(|info| info.content_rect)
+            .map(frame_rect),
+    };
+    Ok(WindowFrameSample {
+        png_bytes,
+        pixel_width,
+        pixel_height,
+        source_frame: frame_rect(frame),
+        evidence: WindowFrameEvidence::StreamAttachments,
+        metadata,
+    })
+}
+
+fn capture_window_server_sample(window_id: u32) -> anyhow::Result<WindowFrameSample> {
+    let bounds = crate::windows::window_bounds_by_id(window_id)
+        .ok_or_else(|| anyhow::anyhow!("WindowServer window {window_id} is unavailable"))?;
+    let png_bytes = crate::capture::screenshot_window_bytes(window_id)?;
+    let (pixel_width, pixel_height) = crate::capture::png_dimensions(&png_bytes)?;
+    Ok(WindowFrameSample {
+        png_bytes,
+        pixel_width,
+        pixel_height,
+        source_frame: FrameRect {
+            x: bounds.x,
+            y: bounds.y,
+            width: bounds.width,
+            height: bounds.height,
+        },
+        evidence: WindowFrameEvidence::WindowServerFallback,
+        metadata: WindowFrameMetadata {
+            completion_unix_ms: unix_ms_now(),
+            display_time: None,
+            frame_status: None,
+            scale_factor: None,
+            content_scale: None,
+            content_rect: None,
+        },
+    })
+}
+
+fn frame_rect(frame: screencapturekit::cg::CGRect) -> FrameRect {
+    FrameRect {
+        x: frame.origin.x,
+        y: frame.origin.y,
+        width: frame.size.width,
+        height: frame.size.height,
+    }
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn frame_status_from_attachment(sample: &CMSampleBuffer) -> Option<SCFrameStatus> {
+    type CFIndex = isize;
+    type CFTypeId = usize;
+    const CF_NUMBER_SINT32_TYPE: i32 = 3;
+
+    #[link(name = "CoreMedia", kind = "framework")]
+    unsafe extern "C" {
+        fn CMSampleBufferGetSampleAttachmentsArray(
+            sample_buffer: *mut c_void,
+            create_if_necessary: u8,
+        ) -> *const c_void;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFArrayGetCount(array: *const c_void) -> CFIndex;
+        fn CFArrayGetValueAtIndex(array: *const c_void, index: CFIndex) -> *const c_void;
+        fn CFDictionaryGetValue(dictionary: *const c_void, key: *const c_void) -> *const c_void;
+        fn CFGetTypeID(value: *const c_void) -> CFTypeId;
+        fn CFNumberGetTypeID() -> CFTypeId;
+        fn CFNumberGetValue(number: *const c_void, number_type: i32, value: *mut c_void) -> u8;
+    }
+    #[link(name = "ScreenCaptureKit", kind = "framework")]
+    unsafe extern "C" {
+        static SCStreamFrameInfoStatus: *const c_void;
+    }
+
+    unsafe {
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample.as_ptr(), 0);
+        if attachments.is_null() || CFArrayGetCount(attachments) < 1 {
+            return None;
+        }
+        let dictionary = CFArrayGetValueAtIndex(attachments, 0);
+        if dictionary.is_null() {
+            return None;
+        }
+        let number = CFDictionaryGetValue(dictionary, SCStreamFrameInfoStatus);
+        if number.is_null() || CFGetTypeID(number) != CFNumberGetTypeID() {
+            return None;
+        }
+        let mut raw = 0_i32;
+        if CFNumberGetValue(number, CF_NUMBER_SINT32_TYPE, (&mut raw as *mut i32).cast()) == 0 {
+            return None;
+        }
+        SCFrameStatus::from_raw(raw)
+    }
+}
+
+fn scaled_dimension(points: f64, scale: f64, name: &str) -> anyhow::Result<u32> {
+    let pixels = (points * scale).round();
+    if !pixels.is_finite() || pixels < 1.0 || pixels > f64::from(u32::MAX) {
+        anyhow::bail!("invalid ScreenCaptureKit {name}: {points} points at {scale}x");
+    }
+    Ok(pixels as u32)
+}
 
 impl VideoBackendFactory for SckitVideoBackendFactory {
     fn start(&self, output_path: &Path) -> anyhow::Result<Box<dyn VideoBackend>> {
