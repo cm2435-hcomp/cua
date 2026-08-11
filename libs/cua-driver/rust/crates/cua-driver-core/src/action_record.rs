@@ -714,6 +714,7 @@ fn transport_from_legacy(
         }
         "dom_event" => ActionTransport::BrowserCdpRuntimeFunction,
         "trusted" => ActionTransport::BrowserCdpInputMouse,
+        "chromium_cdp_scroll_gesture" => ActionTransport::BrowserCdpInputMouse,
         "key_events" | "key_events_fg" => {
             let foreground = path.ends_with("_fg")
                 || args
@@ -1813,6 +1814,7 @@ mod tests {
             "cgevent_fg",
             "dom_event",
             "trusted",
+            "chromium_cdp_scroll_gesture",
             "key_events",
             "key_events_fg",
             "pixel",
@@ -1831,6 +1833,31 @@ mod tests {
                 "legacy path {path} must normalize before the breaking cutover"
             );
         }
+    }
+
+    #[test]
+    fn chromium_cdp_scroll_normalizes_as_background_trusted_input() {
+        let record = ActionExecutionRecord::from_legacy(
+            "scroll",
+            &serde_json::json!({"delivery_mode": "background"}),
+            &serde_json::json!({
+                "path": "chromium_cdp_scroll_gesture",
+                "effect": "unverifiable",
+            }),
+        )
+        .expect("Chromium CDP scroll should normalize");
+
+        assert_eq!(record.transport, ActionTransport::BrowserCdpInputMouse);
+        assert_eq!(record.requested_delivery, RequestedDelivery::Background);
+        assert_eq!(record.actual_delivery, Some(ActualDelivery::Background));
+        assert_eq!(
+            serde_json::to_value(record.public_result().expect("public result")).unwrap(),
+            serde_json::json!({
+                "effect": "unverifiable",
+                "route": "trusted_input",
+                "delivery": {"mode": "background"},
+            })
+        );
     }
 
     #[test]
