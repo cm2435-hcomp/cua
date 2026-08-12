@@ -228,16 +228,6 @@ pub fn is_available() -> bool {
     post_to_pid_fn().is_some()
 }
 
-/// `true` when the focus-without-raise SPIs resolved, including either the
-/// modern window-owner PSN lookup or the deprecated pid fallback.
-pub fn is_focus_without_raise_available() -> bool {
-    let has_psn_lookup = (connection_id_fn().is_some()
-        && get_window_owner_fn().is_some()
-        && get_connection_psn_fn().is_some())
-        || get_process_for_pid_fn().is_some();
-    get_front_process_fn().is_some() && has_psn_lookup && post_event_record_to_fn().is_some()
-}
-
 // ── ObjC runtime helpers ───────────────────────────────────────────────────
 
 /// Look up an ObjC class by C-string name via `objc_getClass`.
@@ -484,68 +474,6 @@ impl SpaceQuery {
             )
         }))
     }
-}
-
-// ── Focus-without-raise ───────────────────────────────────────────────────────
-
-/// Activate `target_pid`'s window `target_wid` without raising any windows
-/// or triggering Space-follow. Ported from yabai's
-/// `window_manager_focus_window_without_raise`.
-///
-/// Recipe:
-/// 1. `_SLPSGetFrontProcess` → capture current front PSN.
-/// 2. `SLSGetWindowOwner + SLSGetConnectionPSN` → target PSN, with
-///    `GetProcessForPID(target_pid)` as an older-system fallback.
-/// 3. Post 248-byte defocus record to front PSN (`bytes[0x8a] = 0x02`).
-/// 4. Post 248-byte focus record to target PSN (`bytes[0x8a] = 0x01`,
-///    `bytes[0x3c..0x3f]` = `target_wid` little-endian).
-///
-/// Deliberately skips `SLPSSetFrontProcessWithOptions` — see the Swift
-/// reference `FocusWithoutRaise.swift` for why omitting it keeps
-/// Chromium's user-activation gate open.
-///
-/// Returns `true` when all SPIs resolved and both posts succeeded.
-pub fn activate_without_raise(target_pid: pid_t, target_wid: u32) -> bool {
-    let post_fn = match post_event_record_to_fn() {
-        Some(f) => f,
-        None => return false,
-    };
-    let get_front = match get_front_process_fn() {
-        Some(f) => f,
-        None => return false,
-    };
-    // 8-byte PSN buffers (two UInt32s).
-    let mut prev_psn = [0u8; 8];
-    let mut target_psn = [0u8; 8];
-
-    let ok_prev = unsafe { get_front(prev_psn.as_mut_ptr() as *mut c_void) } == 0;
-    if !ok_prev {
-        return false;
-    }
-
-    if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
-        return false;
-    }
-
-    // Build the 248-byte event buffer.
-    let mut buf = [0u8; 0xF8];
-    buf[0x04] = 0xF8;
-    buf[0x08] = 0x0D;
-    // Stamp target window id in little-endian at bytes 0x3c–0x3f.
-    buf[0x3C] = (target_wid & 0xFF) as u8;
-    buf[0x3D] = ((target_wid >> 8) & 0xFF) as u8;
-    buf[0x3E] = ((target_wid >> 16) & 0xFF) as u8;
-    buf[0x3F] = ((target_wid >> 24) & 0xFF) as u8;
-
-    // Step 3: defocus previous front.
-    buf[0x8A] = 0x02;
-    let defocus_ok = unsafe { post_fn(prev_psn.as_ptr() as *const c_void, buf.as_ptr()) == 0 };
-
-    // Step 4: focus target.
-    buf[0x8A] = 0x01;
-    let focus_ok = unsafe { post_fn(target_psn.as_ptr() as *const c_void, buf.as_ptr()) == 0 };
-
-    defocus_ok && focus_ok
 }
 
 // ── NSMenu shortcut activation ────────────────────────────────────────────────

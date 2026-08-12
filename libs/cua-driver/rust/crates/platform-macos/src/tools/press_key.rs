@@ -343,7 +343,40 @@ impl Tool for PressKeyTool {
         } else {
             None
         };
-        let pre_focus_ptr: Option<usize> = pre_focus_guard.as_ref().map(|g| g.as_ptr());
+        // The public app-scoped key contract deliberately has no element
+        // argument. Match the signed helper by resolving the process's exact
+        // focused element and accepting it only when fresh ancestry proves it
+        // belongs to this requested window. This preserves multi-window app
+        // support without weakening the sibling-window ambiguity gate.
+        let inferred_focus_guard = if pre_focus_guard.is_none() {
+            window_id.and_then(|wid| unsafe {
+                crate::ax::exact_target::focused_element_in_window(pid, wid)
+                    .map(|element| super::keyboard_target::RetainedAxElement::from_owned(element))
+            })
+        } else {
+            None
+        };
+        let pre_focus_ptr: Option<usize> = pre_focus_guard
+            .as_ref()
+            .map(|guard| guard.as_ptr())
+            .or_else(|| {
+                inferred_focus_guard
+                    .as_ref()
+                    .map(|guard| guard.as_ptr() as usize)
+            });
+
+        // Resolve the same effective AX/process target the signed helper uses.
+        // The application PID owns the window and synthetic-focus state; a
+        // view-bridge/web-content element may supply a distinct dispatch PID.
+        let keyboard_target =
+            match super::keyboard_target::KeyboardTarget::resolve(pid, pre_focus_ptr) {
+                Ok(target) => target,
+                Err(error) => return delivery_failed(error),
+            };
+        let dispatch_pid = keyboard_target.dispatch_pid();
+        let application_pid = keyboard_target.application_pid();
+        let effective_element_ptr = keyboard_target.element_ptr().or(pre_focus_ptr);
+        let out_of_process_target = keyboard_target.is_out_of_process();
 
         // ── Exact-target background gate (macOS background input v1) ──
         // A window-addressed background key is process-scoped transport: it
@@ -414,21 +447,51 @@ impl Tool for PressKeyTool {
         let prior_front = apps::frontmost_pid();
         let snapshot = WindowChangeDetector::snapshot(prior_front);
 
+        // Reconcile only the target application's AppKit focus belief. This is
+        // the missing Swift prelude that made a PID-routed Command+A disappear
+        // in background TextEdit even though the native post itself completed.
+        let focus_belief_posted = if !fg {
+            if let Some(wid) = window_id {
+                match tokio::task::spawn_blocking(move || {
+                    crate::input::synthetic_focus::enforce_keyboard(pid, wid)
+                })
+                .await
+                {
+                    Ok(Ok(posted)) => posted,
+                    Ok(Err(error)) => {
+                        let native_side_effect_started = error.native_side_effect_started();
+                        return ToolResult::error(format!(
+                            "Background keyboard focus preparation failed: {error}"
+                        ))
+                        .with_structured(serde_json::json!({
+                            "code": "background_unavailable",
+                            "effect": if native_side_effect_started { "partial" } else { "refused" },
+                            "native_side_effect_started": native_side_effect_started,
+                        }));
+                    }
+                    Err(error) => {
+                        return ToolResult::error(format!(
+                            "Background keyboard focus task failed: {error}"
+                        ))
+                        .with_structured(serde_json::json!({
+                            "code": "background_unavailable",
+                            "effect": "partial",
+                            "native_side_effect_started": true,
+                        }));
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
             prior_front,
             "press_key.CGEvent",
             || async move {
-                // Pre-focus the element under suppression so its
-                // side-effects are captured by the snapshot + lease.
-                if let Some(element_ptr) = pre_focus_ptr {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        crate::input::ax_actions::focus_element(element_ptr)
-                    })
-                    .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                }
-
                 tokio::task::spawn_blocking(move || {
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     // Foreground rung: keep the exact target frontmost through a genuine
@@ -461,9 +524,15 @@ impl Tool for PressKeyTool {
                             )
                         });
                     }
-                    // background (default): auth-envelope post, no raise.
-                    dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                        crate::input::keyboard::press_key(pid, &key, &m)
+                    // Background: match the signed helper's controller order.
+                    // Refresh target-only keyboard focus, conditionally restore
+                    // the exact resolved field, construct the complete sequence,
+                    // then post each event once to the effective PID.
+                    keyboard_target.focus_field_if_needed()?;
+                    let sequence = crate::input::keyboard::prepare_key_sequence(&key, &m)?;
+                    dispatch_with_ax_oracle(pid, window_id, effective_element_ptr, || {
+                        crate::input::keyboard::post_prepared_sequence(dispatch_pid, &sequence, 0);
+                        Ok(())
                     })
                 })
                 .await
@@ -493,6 +562,12 @@ impl Tool for PressKeyTool {
                     "path": if fg { "key_events_fg" } else { "key_events" },
                     "verified": confirmed,
                     "effect": if confirmed { "confirmed" } else { "unverifiable" },
+                    "application_pid": application_pid,
+                    "dispatch_pid": dispatch_pid,
+                    "out_of_process_target": out_of_process_target,
+                    "event_count_posted": if fg { 2 } else { 4 },
+                    "focus_belief_posted": focus_belief_posted,
+                    "post_primitives": if fg { serde_json::json!(["hid"]) } else { serde_json::json!(["core_graphics_pid"]) },
                 });
                 ToolResult::text(format!(
                     "✅ Pressed {display_key} on pid {pid}{label}.{}",

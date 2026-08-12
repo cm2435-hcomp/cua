@@ -9,6 +9,77 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CdpPageTarget {
+    pub port: u16,
+    pub title: String,
+    pub url: String,
+    websocket_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CdpScrollDispatch {
+    pub port: u16,
+    pub title: String,
+    pub viewport_x: f64,
+    pub viewport_y: f64,
+    pub viewport_origin_x: f64,
+    pub viewport_origin_y: f64,
+}
+
+pub(crate) struct PreparedCdpScroll {
+    session: CdpSession,
+    target: CdpPageTarget,
+    point: CdpViewportPoint,
+}
+
+impl PreparedCdpScroll {
+    pub(crate) async fn revalidate(&mut self, screen_x: f64, screen_y: f64) -> anyhow::Result<()> {
+        let (title, point) = read_exact_viewport(&mut self.session, screen_x, screen_y).await?;
+        if title != self.target.title {
+            anyhow::bail!(
+                "CDP page title changed after preflight: expected {:?}, observed {:?}",
+                self.target.title,
+                title
+            );
+        }
+        self.point = point;
+        Ok(())
+    }
+
+    pub(crate) async fn dispatch(
+        mut self,
+        delta_x: f64,
+        delta_y: f64,
+    ) -> anyhow::Result<CdpScrollDispatch> {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.session.call(
+                "Input.synthesizeScrollGesture",
+                serde_json::json!({
+                    "x": self.point.x,
+                    "y": self.point.y,
+                    "xDistance": -delta_x,
+                    "yDistance": -delta_y,
+                    "speed": 800,
+                    "gestureSourceType": "mouse",
+                    "preventFling": true
+                }),
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("CDP scroll gesture timed out after 5s"))??;
+        Ok(CdpScrollDispatch {
+            port: self.target.port,
+            title: self.target.title,
+            viewport_x: self.point.x,
+            viewport_y: self.point.y,
+            viewport_origin_x: self.point.origin_x,
+            viewport_origin_y: self.point.origin_y,
+        })
+    }
+}
+
 pub struct CdpClient;
 
 impl CdpClient {
@@ -57,6 +128,62 @@ impl CdpClient {
     pub async fn find_port_for_pid(pid: i32) -> Option<u16> {
         let ports = listening_ports(pid).await;
         Self::find_page_target(&ports).await
+    }
+
+    /// Bind one classic CDP page to the exact title of the requested native
+    /// window. Never fall back to a first page, URL guess, or sibling tab.
+    pub(crate) async fn bind_exact_page_for_pid(
+        pid: i32,
+        exact_window_title: &str,
+    ) -> anyhow::Result<CdpPageTarget> {
+        if exact_window_title.trim().is_empty() {
+            anyhow::bail!("the target native window has no exact title for CDP page binding");
+        }
+        let ports = listening_ports(pid).await;
+        if ports.is_empty() {
+            anyhow::bail!("target PID {pid} owns no listening TCP port");
+        }
+        let mut matches = Vec::new();
+        for port in ports {
+            let Ok(json) = http_get_json(port).await else {
+                continue;
+            };
+            let Ok(port_matches) = exact_page_targets_from_json(port, &json, exact_window_title)
+            else {
+                continue;
+            };
+            matches.extend(port_matches);
+        }
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => anyhow::bail!(
+                "target PID {pid} has no classic CDP page whose title exactly matches {exact_window_title:?}"
+            ),
+            count => anyhow::bail!(
+                "target PID {pid} has {count} classic CDP pages whose title exactly matches {exact_window_title:?}"
+            ),
+        }
+    }
+
+    pub(crate) async fn prepare_scroll_gesture(
+        target: &CdpPageTarget,
+        screen_x: f64,
+        screen_y: f64,
+    ) -> anyhow::Result<PreparedCdpScroll> {
+        let mut session = CdpSession::connect_exact(target).await?;
+        let (title, point) = read_exact_viewport(&mut session, screen_x, screen_y).await?;
+        if title != target.title {
+            anyhow::bail!(
+                "CDP page title changed during preflight: expected {:?}, observed {:?}",
+                target.title,
+                title
+            );
+        }
+        Ok(PreparedCdpScroll {
+            session,
+            target: target.clone(),
+            point,
+        })
     }
 
     /// Evaluate JavaScript via CDP Runtime.evaluate on the first page target.
@@ -322,6 +449,19 @@ struct CdpSession {
 }
 
 impl CdpSession {
+    async fn connect_exact(target: &CdpPageTarget) -> anyhow::Result<Self> {
+        let connection = Arc::new(
+            CdpConnection::connect(&target.websocket_url)
+                .await
+                .map_err(|error| anyhow::anyhow!("WebSocket connect failed: {error}"))?,
+        );
+        Ok(Self {
+            connection,
+            session_id: None,
+            current_target_url: Some(target.url.clone()),
+        })
+    }
+
     async fn connect(port: u16, target_url_contains: Option<&str>) -> anyhow::Result<Self> {
         match ws_url_for_page_target(port, target_url_contains).await {
             Ok((ws_url, target_url)) => {
@@ -525,9 +665,135 @@ fn pick_target<'a>(
     }
 }
 
+fn exact_page_targets_from_json(
+    port: u16,
+    json: &str,
+    exact_title: &str,
+) -> anyhow::Result<Vec<CdpPageTarget>> {
+    let targets: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| anyhow::anyhow!("invalid CDP /json: {error}"))?;
+    let array = targets
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("CDP /json is not an array"))?;
+    Ok(array
+        .iter()
+        .filter(|target| {
+            target.get("type").and_then(|value| value.as_str()) == Some("page")
+                && target.get("title").and_then(|value| value.as_str()) == Some(exact_title)
+        })
+        .filter_map(|target| {
+            Some(CdpPageTarget {
+                port,
+                title: target.get("title")?.as_str()?.to_owned(),
+                url: target
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                websocket_url: target.get("webSocketDebuggerUrl")?.as_str()?.to_owned(),
+            })
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CdpViewportPoint {
+    x: f64,
+    y: f64,
+    origin_x: f64,
+    origin_y: f64,
+}
+
+async fn read_exact_viewport(
+    session: &mut CdpSession,
+    screen_x: f64,
+    screen_y: f64,
+) -> anyhow::Result<(String, CdpViewportPoint)> {
+    let metrics = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.call(
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": "({title: document.title, screenX: window.screenX, screenY: window.screenY, outerWidth: window.outerWidth, outerHeight: window.outerHeight, innerWidth: window.innerWidth, innerHeight: window.innerHeight})",
+                "returnByValue": true
+            }),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("CDP viewport metrics timed out after 5s"))??;
+    let value = metrics["result"]["value"]
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("CDP viewport metrics did not return an object"))?;
+    let title = value
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("CDP viewport metrics did not return document.title"))?
+        .to_owned();
+    Ok((
+        title,
+        viewport_point_from_metrics(value, screen_x, screen_y)?,
+    ))
+}
+
+fn viewport_point_from_metrics(
+    metrics: &serde_json::Map<String, serde_json::Value>,
+    screen_x: f64,
+    screen_y: f64,
+) -> anyhow::Result<CdpViewportPoint> {
+    let number = |name: &'static str| {
+        metrics
+            .get(name)
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| anyhow::anyhow!("CDP viewport metric {name} is missing or non-finite"))
+    };
+    let window_x = number("screenX")?;
+    let window_y = number("screenY")?;
+    let outer_width = number("outerWidth")?;
+    let outer_height = number("outerHeight")?;
+    let inner_width = number("innerWidth")?;
+    let inner_height = number("innerHeight")?;
+    if inner_width <= 0.0
+        || inner_height <= 0.0
+        || outer_width < inner_width
+        || outer_height < inner_height
+    {
+        anyhow::bail!(
+            "CDP viewport metrics are inconsistent: outer=({outer_width},{outer_height}) inner=({inner_width},{inner_height})"
+        );
+    }
+
+    let side_inset = ((outer_width - inner_width) / 2.0).max(0.0);
+    let top_inset = (outer_height - inner_height - side_inset).max(0.0);
+    let origin_x = window_x + side_inset;
+    let origin_y = window_y + top_inset;
+    let x = screen_x - origin_x;
+    let y = screen_y - origin_y;
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x >= inner_width
+        || y >= inner_height
+    {
+        anyhow::bail!(
+            "captured point ({screen_x},{screen_y}) maps outside the live CDP viewport: origin=({origin_x},{origin_y}) point=({x},{y}) size=({inner_width},{inner_height})"
+        );
+    }
+    Ok(CdpViewportPoint {
+        x,
+        y,
+        origin_x,
+        origin_y,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{pick_target, CdpSessionCache};
+    use super::{
+        exact_page_targets_from_json, pick_target, viewport_point_from_metrics, CdpPageTarget,
+        CdpSessionCache, CdpViewportPoint,
+    };
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -543,6 +809,61 @@ mod tests {
             serde_json::json!({ "type": "page", "url": "app://fixture/#window-a" }),
             serde_json::json!({ "type": "page", "url": "app://fixture/#window-b" }),
         ]
+    }
+
+    #[test]
+    fn exact_page_binding_never_falls_back_to_another_title() {
+        let json = serde_json::json!([
+            {
+                "type": "page",
+                "title": "Other page",
+                "url": "http://127.0.0.1/other",
+                "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/other"
+            },
+            {
+                "type": "page",
+                "title": "CUA exact target",
+                "url": "http://127.0.0.1/target",
+                "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/target"
+            }
+        ])
+        .to_string();
+        assert_eq!(
+            exact_page_targets_from_json(9222, &json, "CUA exact target").unwrap(),
+            vec![CdpPageTarget {
+                port: 9222,
+                title: "CUA exact target".to_owned(),
+                url: "http://127.0.0.1/target".to_owned(),
+                websocket_url: "ws://127.0.0.1/devtools/page/target".to_owned(),
+            }]
+        );
+        assert!(exact_page_targets_from_json(9222, &json, "Missing")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn captured_screen_point_converts_through_live_browser_chrome_metrics() {
+        let metrics = serde_json::json!({
+            "screenX": 100.0,
+            "screenY": 40.0,
+            "outerWidth": 1000.0,
+            "outerHeight": 800.0,
+            "innerWidth": 990.0,
+            "innerHeight": 700.0
+        });
+        let point =
+            viewport_point_from_metrics(metrics.as_object().unwrap(), 305.0, 235.0).unwrap();
+        assert_eq!(
+            point,
+            CdpViewportPoint {
+                x: 200.0,
+                y: 100.0,
+                origin_x: 105.0,
+                origin_y: 135.0,
+            }
+        );
+        assert!(viewport_point_from_metrics(metrics.as_object().unwrap(), 10.0, 10.0).is_err());
     }
 
     #[test]

@@ -206,6 +206,15 @@ impl Tool for TypeTextTool {
         // cua_driver_core::text_sanitize docs for rationale.
         let text = cua_driver_core::text_sanitize::strip_trailing_agent_protocol_tags(&text_raw)
             .into_owned();
+        if text.is_empty() {
+            return ToolResult::text("Empty type_text request completed without dispatch.")
+                .with_structured(serde_json::json!({
+                    "path": "ax",
+                    "verified": true,
+                    "effect": "confirmed",
+                    "delivered_chars": 0,
+                }));
+        }
         // Surface 6: element_token / element_index precedence resolution.
         let element_token_arg = args.opt_str("element_token");
         let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
@@ -272,6 +281,19 @@ impl Tool for TypeTextTool {
         } else {
             None
         };
+        // The app-scoped public contract does not expose an element argument.
+        // As in the signed helper, recover the process's focused element only
+        // when it provably belongs to the exact requested window. Do this only
+        // for the non-pixel form: a pixel focus action intentionally changes
+        // the focused element later in this request.
+        let inferred_focus_guard = if element_guard.is_none() && px.is_none() && py.is_none() {
+            window_id.and_then(|wid| unsafe {
+                crate::ax::exact_target::focused_element_in_window(pid, wid)
+                    .map(|element| super::keyboard_target::RetainedAxElement::from_owned(element))
+            })
+        } else {
+            None
+        };
 
         // ── Exact-target background gate (macOS background input v1) ──
         // A window-addressed background insert must prove exact delivery
@@ -280,17 +302,26 @@ impl Tool for TypeTextTool {
         // AX write only (exact element, no CGEvent fallback), or a structured
         // refusal. delivery_mode:"foreground" stays the caller's explicit
         // last resort and is not gated here.
-        let (_mutation_lease, keyboard_policy) =
-            if !delivery_mode.is_foreground() && window_id.is_some() {
-                let wid = window_id.expect("checked above");
-                let gate_element_ptr = element_guard.as_ref().map(|(g, _)| g.as_ptr() as usize);
+        let (_mutation_lease, keyboard_policy) = if !delivery_mode.is_foreground() {
+            if let Some(wid) = window_id {
+                let gate_element_ptr = element_guard
+                    .as_ref()
+                    .map(|(guard, _)| guard.as_ptr())
+                    .or_else(|| {
+                        inferred_focus_guard
+                            .as_ref()
+                            .map(|guard| guard.as_ptr() as usize)
+                    });
                 match background_keyboard_policy(pid, wid, gate_element_ptr).await {
                     Ok((lease, policy)) => (Some(lease), policy),
                     Err(refusal_result) => return refusal_result,
                 }
             } else {
                 (None, BackgroundKeyboardPolicy::Allowed)
-            };
+            }
+        } else {
+            (None, BackgroundKeyboardPolicy::Allowed)
+        };
 
         // ── px form: focus by pixel-click, then type into the focused element ──
         // Pass x,y (no element_index) for an *element px action*: pixel-click the
@@ -331,7 +362,7 @@ impl Tool for TypeTextTool {
             // focused element via the CGEvent (key_events) rung.
         }
         if let (Some((element, _)), Some(wid)) = (element_guard.as_ref(), window_id) {
-            let center_ptr = element.as_ptr() as usize;
+            let center_ptr = element.as_ptr();
             if let Ok(Some((screen_x, screen_y))) = tokio::task::spawn_blocking(move || unsafe {
                 crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
             })
@@ -351,7 +382,26 @@ impl Tool for TypeTextTool {
         }
         let element_ptr = element_guard
             .as_ref()
-            .map(|(g, idx)| (g.as_ptr(), Some(*idx)));
+            .map(|(guard, idx)| (guard.as_ptr(), Some(*idx)))
+            .or_else(|| {
+                inferred_focus_guard
+                    .as_ref()
+                    .map(|guard| (guard.as_ptr() as usize, None))
+            });
+        let keyboard_target =
+            match super::keyboard_target::KeyboardTarget::resolve(pid, element_ptr.map(|v| v.0)) {
+                Ok(target) => target,
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "type_text keyboard target resolution failed: {error}"
+                    ))
+                    .with_structured(serde_json::json!({
+                        "code": "delivery_failed",
+                        "effect": "refused",
+                        "native_side_effect_started": false,
+                    }));
+                }
+            };
 
         let text_clone = text.clone();
         let char_count = text.chars().count();
@@ -387,6 +437,7 @@ impl Tool for TypeTextTool {
                         delivery_mode,
                         window_id,
                         blocking_policy,
+                        keyboard_target,
                     )
                 })
                 .await
@@ -794,7 +845,7 @@ async fn background_keyboard_policy(
     use cua_driver_core::background_input::{
         decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
     };
-    let lease = super::acquire_background_mutation(pid).await;
+    let lease = super::acquire_background_mutation(pid)?;
     let facts = match tokio::task::spawn_blocking(move || {
         crate::ax::exact_target::gather_background_facts(pid, window_id, element_ptr)
     })
@@ -1011,21 +1062,29 @@ pub(super) fn target_in_web_area(
 /// read-back. `type_text` is deliberately non-idempotent: it must never clear
 /// an existing value merely because AX cannot read that value back.
 fn cgevent_type_verified(
-    pid: i32,
+    application_pid: i32,
+    keyboard_target: &super::keyboard_target::KeyboardTarget,
     text: &str,
     delay_ms: u64,
     before: Option<&str>,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     settle_ms: u64,
     window_id: Option<u32>,
+    prepare_background_focus: bool,
 ) -> anyhow::Result<(bool, Option<usize>)> {
-    // Focus the target element first so the keystrokes land in IT. Critical in
-    // foreground mode: a freshly-fronted window's keyboard focus may be on the
-    // search box or nowhere, so without this the text goes into the void (or the
-    // wrong field). AXFocused is best-effort — harmless when unsupported.
-    if let Some((ptr, _)) = element_ptr_and_idx {
-        let _ = crate::input::ax_actions::focus_element(ptr);
+    // The signed helper reconciles target-application belief before restoring
+    // the exact effective field. Neither step activates or raises the target.
+    if prepare_background_focus {
+        if let Some(wid) = window_id {
+            crate::input::synthetic_focus::enforce_keyboard(application_pid, wid).map_err(
+                |error| anyhow::anyhow!("background keyboard focus preparation failed: {error}"),
+            )?;
+        }
     }
+    keyboard_target.focus_field_if_needed()?;
+    // Match the helper controller order: target belief and exact-field focus
+    // are prepared before the complete fallible event sequence is built.
+    let sequence = crate::input::keyboard::prepare_unicode_sequence(text)?;
     // First-keystroke settle (foreground rung only — caller passes `settle_ms > 0`).
     // After a window is fronted (with_foreground_assist) and the element focused,
     // the surface isn't ready to accept input for a few tens of ms, so the FIRST
@@ -1036,7 +1095,11 @@ fn cgevent_type_verified(
     if settle_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(settle_ms));
     }
-    crate::input::keyboard::type_text_with_delay(pid, text, delay_ms)?;
+    crate::input::keyboard::post_prepared_sequence(
+        keyboard_target.dispatch_pid(),
+        &sequence,
+        delay_ms,
+    );
 
     // CGEvent posting is asynchronous with respect to the renderer. In
     // particular, Chromium can acknowledge the posting process while a long
@@ -1045,7 +1108,7 @@ fn cgevent_type_verified(
     // expires after observable growth, surface the exact partial count.
     let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
     Ok(await_typed_delivery(before, text, deadline, || {
-        read_axvalue_bound(pid, element_ptr_and_idx, window_id)
+        read_axvalue_bound(application_pid, element_ptr_and_idx, window_id)
     }))
 }
 
@@ -1097,6 +1160,7 @@ fn type_text_blocking(
     delivery_mode: super::DeliveryMode,
     window_id: Option<u32>,
     keyboard_policy: BackgroundKeyboardPolicy,
+    keyboard_target: super::keyboard_target::KeyboardTarget,
 ) -> anyhow::Result<TypeTextDelivery> {
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty — and for a
@@ -1138,12 +1202,14 @@ fn type_text_blocking(
         let do_type = || {
             cgevent_type_verified(
                 pid,
+                &keyboard_target,
                 text,
                 delay_ms,
                 before.as_deref(),
                 element_ptr_and_idx,
                 foreground_settle_ms,
                 window_id,
+                false,
             )
         };
         let ((verified, delivered_chars), fronted) = match window_id {
@@ -1227,12 +1293,14 @@ fn type_text_blocking(
         );
         let (verified, delivered_chars) = cgevent_type_verified(
             pid,
+            &keyboard_target,
             text,
             delay_ms,
             before.as_deref(),
             element_ptr_and_idx,
             /*settle_ms=*/ 0,
             window_id,
+            true,
         )?;
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: format!(" via CGEvent (terminal emulator, {delay_ms}ms delay)"),
@@ -1339,12 +1407,14 @@ fn type_text_blocking(
     // insert-at-cursor semantics.
     let (verified, delivered_chars) = cgevent_type_verified(
         pid,
+        &keyboard_target,
         text,
         delay_ms,
         before.as_deref(),
         element_ptr_and_idx,
         /*settle_ms=*/ 0,
         window_id,
+        true,
     )?;
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),
@@ -1357,6 +1427,19 @@ fn type_text_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn empty_text_is_a_confirmed_noop_before_address_resolution() {
+        let tool = TypeTextTool::new(Arc::new(ToolState::new(false, false, None)));
+        let result = tool
+            .invoke(serde_json::json!({"pid": -1, "text": ""}))
+            .await;
+        let structured = result
+            .structured_content
+            .expect("empty input must publish its no-op result");
+        assert_eq!(structured["effect"], "confirmed");
+        assert_eq!(structured["delivered_chars"], 0);
+    }
 
     /// Sanity-check that the terminal short-circuit can be expressed as a
     /// pure function of `is_terminal_target`: when true, the code goes
@@ -1385,6 +1468,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
+            crate::tools::keyboard_target::KeyboardTarget::resolve(-1, None).unwrap(),
         );
         // We don't care whether r is Ok or Err — what matters is that
         // calling it with is_terminal_target=true is safe and never
@@ -1411,6 +1495,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             Some(7),
             BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
+            crate::tools::keyboard_target::KeyboardTarget::resolve(-1, None).unwrap(),
         );
         match r {
             Ok(TypeTextDelivery::Refused(returned)) => assert_eq!(returned, refusal),
@@ -1430,6 +1515,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
+            crate::tools::keyboard_target::KeyboardTarget::resolve(-1, None).unwrap(),
         )
         .expect("preflight refusal must not attempt the invalid pid");
         let TypeTextDelivery::SynthesisRefused {

@@ -50,6 +50,8 @@ pub struct AXNode {
     /// 0-based index (Some = actionable, None = non-actionable display-only node)
     pub element_index: Option<usize>,
     pub role: String,
+    /// AXSubrole, retained for exact controls such as title-bar close buttons.
+    pub subrole: Option<String>,
     /// AXTitle — shown as `"title"` in the tree line.
     pub title: Option<String>,
     /// AXValue — shown as `= "value"` in the tree line.
@@ -102,6 +104,142 @@ struct ControlState {
     max_value: Option<f64>,
     enabled: Option<bool>,
     selected: Option<bool>,
+}
+
+#[derive(Default)]
+struct PresentationState {
+    role: String,
+    title: Option<String>,
+    subrole: Option<String>,
+    copied_value: Option<StringishAttrValue>,
+    placeholder: Option<String>,
+    description: Option<String>,
+    identifier: Option<String>,
+    help: Option<String>,
+}
+
+unsafe fn read_presentation_state(element: AXUIElementRef) -> PresentationState {
+    const ATTRIBUTES: [&str; 8] = [
+        "AXRole",
+        "AXTitle",
+        "AXSubrole",
+        "AXValue",
+        "AXPlaceholderValue",
+        "AXDescription",
+        "AXIdentifier",
+        "AXHelp",
+    ];
+    if let Some(values) = copy_multiple_attr_values(element, &ATTRIBUTES) {
+        let scalar_string = |index, attribute| {
+            values
+                .needs_scalar_fallback(index)
+                .then(|| copy_string_attr(element, attribute))
+                .flatten()
+        };
+        return PresentationState {
+            // AXRole controls traversal. If just that batch slot failed, pay
+            // one scalar retry rather than treating a layout container as an
+            // ordinary node or losing an exact AXWindow match.
+            role: values
+                .string(0)
+                .or_else(|| copy_string_attr(element, "AXRole"))
+                .unwrap_or_else(|| "AXUnknown".into()),
+            title: values.string(1).or_else(|| scalar_string(1, "AXTitle")),
+            subrole: values.string(2).or_else(|| scalar_string(2, "AXSubrole")),
+            copied_value: values.stringish(3).or_else(|| {
+                values
+                    .needs_scalar_fallback(3)
+                    .then(|| copy_stringish_attr(element, "AXValue"))
+                    .flatten()
+            }),
+            placeholder: values
+                .string(4)
+                .or_else(|| scalar_string(4, "AXPlaceholderValue")),
+            description: values
+                .string(5)
+                .or_else(|| scalar_string(5, "AXDescription")),
+            identifier: values
+                .string(6)
+                .or_else(|| scalar_string(6, "AXIdentifier")),
+            help: values.string(7).or_else(|| scalar_string(7, "AXHelp")),
+        };
+    }
+    PresentationState {
+        role: copy_string_attr(element, "AXRole").unwrap_or_else(|| "AXUnknown".into()),
+        title: copy_string_attr(element, "AXTitle"),
+        subrole: copy_string_attr(element, "AXSubrole"),
+        copied_value: copy_stringish_attr(element, "AXValue"),
+        placeholder: copy_string_attr(element, "AXPlaceholderValue"),
+        description: copy_string_attr(element, "AXDescription"),
+        identifier: copy_string_attr(element, "AXIdentifier"),
+        help: copy_string_attr(element, "AXHelp"),
+    }
+}
+
+unsafe fn read_screen_rect(element: AXUIElementRef) -> Option<[f64; 4]> {
+    const ATTRIBUTES: [&str; 2] = ["AXPosition", "AXSize"];
+    match copy_multiple_attr_values(element, &ATTRIBUTES) {
+        Some(values) => values.screen_rect(0, 1).or_else(|| {
+            (values.needs_scalar_fallback(0) || values.needs_scalar_fallback(1))
+                .then(|| element_screen_rect(element))
+                .flatten()
+        }),
+        None => element_screen_rect(element),
+    }
+}
+
+unsafe fn read_actionable_control_state(
+    element: AXUIElementRef,
+    value_state: Option<String>,
+    enabled: Option<bool>,
+) -> ControlState {
+    const ATTRIBUTES: [&str; 4] = [
+        "AXValueDescription",
+        "AXMinValue",
+        "AXMaxValue",
+        "AXSelected",
+    ];
+    if let Some(values) = copy_multiple_attr_values(element, &ATTRIBUTES) {
+        let scalar_string = |index, attribute| {
+            values
+                .needs_scalar_fallback(index)
+                .then(|| copy_string_attr(element, attribute))
+                .flatten()
+        };
+        let scalar_number = |index, attribute| {
+            values
+                .needs_scalar_fallback(index)
+                .then(|| copy_number_attr(element, attribute))
+                .flatten()
+        };
+        return ControlState {
+            value_state,
+            value_description: values
+                .string(0)
+                .or_else(|| scalar_string(0, "AXValueDescription"))
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            min_value: values.number(1).or_else(|| scalar_number(1, "AXMinValue")),
+            max_value: values.number(2).or_else(|| scalar_number(2, "AXMaxValue")),
+            enabled,
+            selected: values.boolean(3).or_else(|| {
+                values
+                    .needs_scalar_fallback(3)
+                    .then(|| copy_bool_attr(element, "AXSelected"))
+                    .flatten()
+            }),
+        };
+    }
+    ControlState {
+        value_state,
+        value_description: copy_string_attr(element, "AXValueDescription")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+        min_value: copy_number_attr(element, "AXMinValue"),
+        max_value: copy_number_attr(element, "AXMaxValue"),
+        enabled,
+        selected: copy_bool_attr(element, "AXSelected"),
+    }
 }
 
 fn read_control_state_if_actionable<F>(is_actionable: bool, read: F) -> ControlState
@@ -255,9 +393,34 @@ pub fn walk_tree_bounded(
                 .iter()
                 .map(|&child| {
                     set_messaging_timeout(child);
-                    let role = copy_string_attr(child, "AXRole").unwrap_or_default();
-                    let subrole = copy_string_attr(child, "AXSubrole");
-                    let identifier = copy_string_attr(child, "AXIdentifier");
+                    const ATTRIBUTES: [&str; 3] = ["AXRole", "AXSubrole", "AXIdentifier"];
+                    let (role, subrole, identifier) =
+                        if let Some(values) = copy_multiple_attr_values(child, &ATTRIBUTES) {
+                            (
+                                values
+                                    .string(0)
+                                    .or_else(|| copy_string_attr(child, "AXRole"))
+                                    .unwrap_or_default(),
+                                values.string(1).or_else(|| {
+                                    values
+                                        .needs_scalar_fallback(1)
+                                        .then(|| copy_string_attr(child, "AXSubrole"))
+                                        .flatten()
+                                }),
+                                values.string(2).or_else(|| {
+                                    values
+                                        .needs_scalar_fallback(2)
+                                        .then(|| copy_string_attr(child, "AXIdentifier"))
+                                        .flatten()
+                                }),
+                            )
+                        } else {
+                            (
+                                copy_string_attr(child, "AXRole").unwrap_or_default(),
+                                copy_string_attr(child, "AXSubrole"),
+                                copy_string_attr(child, "AXIdentifier"),
+                            )
+                        };
                     // Match AX window element → CGWindowID via private SPI.
                     // Only windows carry one, so skip the round-trip elsewhere.
                     let ax_window_id = if role == "AXWindow" {
@@ -366,7 +529,8 @@ unsafe fn walk_element(
     // element, so every descendant must be bounded before any attribute read.
     set_messaging_timeout(element);
 
-    let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| "AXUnknown".into());
+    let presentation = read_presentation_state(element);
+    let role = presentation.role;
 
     let in_web_content = in_web_content || is_web_content_role(&role);
 
@@ -400,20 +564,21 @@ unsafe fn walk_element(
     // This is critical for Calculator where AXTitle="" but AXDescription="2"
     // (digit buttons). Merging them would produce "2" (quoted) instead of (2)
     // (parens), breaking _find_calc_button which searches for "(2)".
-    let title = copy_string_attr(element, "AXTitle");
+    let title = presentation.title;
+    let subrole = presentation.subrole;
     // Read AXValue once with enough type information to preserve the existing
     // string-only markdown while also exposing numeric/boolean control state.
-    let copied_value = copy_stringish_attr(element, "AXValue");
+    let copied_value = presentation.copied_value;
     let value = copied_value
         .as_ref()
         .and_then(|copied| copied.string_value.clone());
     // AXPlaceholderValue as fallback for empty text fields.
     let value = value
         .filter(|v| !v.trim().is_empty())
-        .or_else(|| copy_string_attr(element, "AXPlaceholderValue"));
-    let description = copy_string_attr(element, "AXDescription");
-    let identifier = copy_string_attr(element, "AXIdentifier");
-    let help = copy_string_attr(element, "AXHelp").filter(|h| !h.trim().is_empty());
+        .or(presentation.placeholder);
+    let description = presentation.description;
+    let identifier = presentation.identifier;
+    let help = presentation.help.filter(|h| !h.trim().is_empty());
     let actions = copy_action_names(element);
 
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
@@ -464,23 +629,17 @@ unsafe fn walk_element(
     }
 
     let element_ptr = element as usize;
-    let frame = element_screen_rect(element);
+    let frame = read_screen_rect(element);
     // Structured `elements` only contains actionable nodes. Keep all new AX
     // round-trips behind that same gate so display-only rows pay no cost.
-    let control_state = read_control_state_if_actionable(is_actionable, || ControlState {
-        value_state: copied_value
-            .map(|copied| copied.state_value)
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| value.clone())
-            .map(|v| v.trim().to_owned())
-            .filter(|v| !v.is_empty()),
-        value_description: copy_string_attr(element, "AXValueDescription")
-            .map(|v| v.trim().to_owned())
-            .filter(|v| !v.is_empty()),
-        min_value: copy_number_attr(element, "AXMinValue"),
-        max_value: copy_number_attr(element, "AXMaxValue"),
-        enabled,
-        selected: copy_bool_attr(element, "AXSelected"),
+    let value_state = copied_value
+        .map(|copied| copied.state_value)
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| value.clone())
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let control_state = read_control_state_if_actionable(is_actionable, || {
+        read_actionable_control_state(element, value_state, enabled)
     });
     let node = if is_actionable {
         let idx = *counter;
@@ -491,6 +650,7 @@ unsafe fn walk_element(
         AXNode {
             element_index: Some(idx),
             role: role.clone(),
+            subrole: subrole.clone(),
             title: if visible_title.is_empty() {
                 None
             } else {
@@ -525,6 +685,7 @@ unsafe fn walk_element(
         AXNode {
             element_index: None,
             role: role.clone(),
+            subrole,
             title: if visible_title.is_empty() {
                 None
             } else {
@@ -638,6 +799,9 @@ fn format_node_line(node: &AXNode) -> String {
         let mut attrs: Vec<String> = Vec::new();
         if let Some(id) = &node.identifier {
             attrs.push(format!("id={}", id));
+        }
+        if let Some(subrole) = &node.subrole {
+            attrs.push(format!("subrole=\"{}\"", subrole));
         }
         if let Some(h) = &node.help {
             attrs.push(format!("help=\"{}\"", h));

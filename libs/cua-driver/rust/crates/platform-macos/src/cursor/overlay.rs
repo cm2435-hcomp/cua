@@ -611,7 +611,7 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     // NSNormalWindowLevel = 0.  The overlay lives at the normal window level so
     // it appears in CGWindowList layer=0 results (which agents inspect via
     // list_windows).  Z-ordering above the target is managed dynamically via
-    // orderWindow:relativeTo: (see dispatch_pin_above / render_loop repin).
+    // orderWindow:relativeTo: (see dispatch_pin_relative_to_target / render_loop repin).
     let _: () = msg_send![win, setLevel: 0i64];
     // NSWindowCollectionBehaviorCanJoinAllSpaces(1<<0) | FullScreenAuxiliary(1<<8) | Stationary(1<<4)
     let _: () = msg_send![win, setCollectionBehavior: (1u64 | (1<<8) | (1<<4))];
@@ -645,8 +645,10 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
         }
     }
 
-    // ---- Show the window ----
-    let _: () = msg_send![win, orderFrontRegardless];
+    // Leave the transparent window ordered out until the render loop has an
+    // externally visible cursor. Ordering it in here would put a blank,
+    // full-screen normal-level window above the user's foreground app while
+    // the default cursor is still parked at its off-screen sentinel.
 
     // ---- Render thread (60 fps) ----
     let layer_ptr = layer as usize;
@@ -673,6 +675,8 @@ fn render_loop(
     let mut hover_poll_needed = false;
     // Repin bookkeeping: track last pinned wid and a frame counter for
     // the periodic defensive-repin (every ~60 active frames ≈ 1 s).
+    let mut active_cursor_key: Option<CursorKey> = None;
+    let mut window_ordered_in = false;
     let mut last_pinned: Option<u64> = None;
     let mut repin_frames: u32 = 0;
 
@@ -708,12 +712,13 @@ fn render_loop(
         last_tick = now;
 
         // ── Phase 1: drain + tick all cursors (one lock acquisition) ──────
-        // `pinned_wid` follows the most-recently-updated cursor: a single
-        // NSWindow can occupy only one z-band, so the last-active cursor's
-        // target wins. `arrived` collects the keys whose path just ended.
+        // A single NSWindow can occupy only one z-band, so the last-active
+        // externally visible cursor's target wins. `arrived` collects the
+        // keys whose path just ended.
         let (
-            pinned_wid,
-            raise_unpinned,
+            desired_placement,
+            next_active_cursor_key,
+            active_visible_cursor_touched,
             arrived,
             win_w,
             win_h,
@@ -769,24 +774,24 @@ fn render_loop(
                             hover_changed |= rs.core.update_session_badge_hover(pointer);
                         }
                     }
-                    let pinned = last_key
+                    let active_visible_cursor_touched = last_key
                         .as_ref()
                         .and_then(|k| map.cursors.get(k))
-                        .map(|rs| rs.core.pinned_wid)
-                        .unwrap_or(last_pinned);
-                    let raise_unpinned = last_key
-                        .as_ref()
-                        .and_then(|k| map.cursors.get(k))
-                        .is_some_and(cursor_is_externally_visible)
-                        && pinned.is_none();
+                        .is_some_and(cursor_is_externally_visible);
+                    let (desired_placement, next_active_cursor_key) = desired_window_placement(
+                        map,
+                        last_key.as_ref(),
+                        active_cursor_key.as_ref(),
+                    );
                     let next_frame_tick_needed = render_map_needs_frame_tick(map);
                     let next_hover_poll_needed = map
                         .cursors
                         .values()
                         .any(|rs| rs.core.session_badge_needs_hover_poll());
                     (
-                        pinned,
-                        raise_unpinned,
+                        desired_placement,
+                        next_active_cursor_key,
+                        active_visible_cursor_touched,
                         arrived,
                         map.win_w,
                         map.win_h,
@@ -805,25 +810,48 @@ fn render_loop(
             arrival_fire(k);
         }
 
-        // Repin: immediately on target change, then defensive every ~1 s while
-        // the render loop is active. When quiescent, z-order is left unchanged
-        // until the next command wakes the loop.
+        active_cursor_key = next_active_cursor_key;
+
+        // Order in only while at least one cursor is externally visible.
+        // Repin immediately on target change, then defensively every ~1 s
+        // while the render loop is active. When quiescent, z-order is left
+        // unchanged until the next command wakes the loop.
         if frame_tick_needed || had_msg {
             repin_frames += 1;
-            let pin_changed = pinned_wid != last_pinned;
-            last_pinned = pinned_wid;
-            if pinned_wid.is_some() && (pin_changed || repin_frames >= 60) {
-                MacZOrderEnforcer { win_ptr }.reassert(pinned_wid);
-                repin_frames = 0;
-            } else if raise_unpinned {
-                // A direct move_cursor has no target window to pin against.
-                // Raise the normal-level, click-through overlay without
-                // activating the driver so a later foreground application
-                // cannot cover a standalone session cursor.
-                dispatch_order_front(win_ptr);
-                repin_frames = 0;
-            } else if repin_frames >= 60 {
-                repin_frames = 0;
+            match desired_placement {
+                WindowPlacement::OrderedOut => {
+                    if window_ordered_in {
+                        dispatch_order_out(win_ptr);
+                    }
+                    window_ordered_in = false;
+                    last_pinned = None;
+                    repin_frames = 0;
+                }
+                WindowPlacement::Pinned(pinned_wid) => {
+                    let pin_changed = last_pinned != Some(pinned_wid);
+                    if !window_ordered_in || pin_changed || repin_frames >= 60 {
+                        MacZOrderEnforcer { win_ptr }.reassert(Some(pinned_wid));
+                        repin_frames = 0;
+                    }
+                    window_ordered_in = true;
+                    last_pinned = Some(pinned_wid);
+                }
+                WindowPlacement::Front => {
+                    if !window_ordered_in || last_pinned.is_some() || active_visible_cursor_touched
+                    {
+                        // A direct move_cursor has no target window to pin
+                        // against. Raise the normal-level, click-through
+                        // overlay without activating the driver so a later
+                        // foreground application cannot cover a standalone
+                        // session cursor.
+                        dispatch_order_front(win_ptr);
+                        repin_frames = 0;
+                    } else if repin_frames >= 60 {
+                        repin_frames = 0;
+                    }
+                    window_ordered_in = true;
+                    last_pinned = None;
+                }
             }
         }
 
@@ -902,6 +930,56 @@ fn cursor_is_externally_visible(state: &RenderState) -> bool {
         && state.core.idle_alpha >= 0.004
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowPlacement {
+    OrderedOut,
+    Front,
+    Pinned(u64),
+}
+
+/// Resolve the shared overlay window's placement from render-visible state.
+///
+/// A hidden or sentinel cursor never owns the window's z-band. The most
+/// recently touched visible cursor wins, followed by the prior active visible
+/// cursor. If neither remains visible, the last cursor in paint order is the
+/// deterministic fallback. No visible cursor means the window must be ordered
+/// out, even if a hidden cursor still carries a stale target window id.
+fn desired_window_placement(
+    map: &RenderMap,
+    last_touched_key: Option<&CursorKey>,
+    active_cursor_key: Option<&CursorKey>,
+) -> (WindowPlacement, Option<CursorKey>) {
+    let selected = last_touched_key
+        .and_then(|key| {
+            map.cursors
+                .get_key_value(key)
+                .filter(|(_, state)| cursor_is_externally_visible(state))
+        })
+        .or_else(|| {
+            active_cursor_key.and_then(|key| {
+                map.cursors
+                    .get_key_value(key)
+                    .filter(|(_, state)| cursor_is_externally_visible(state))
+            })
+        })
+        .or_else(|| {
+            map.cursors
+                .iter()
+                .rev()
+                .find(|(_, state)| cursor_is_externally_visible(state))
+        });
+
+    let Some((key, state)) = selected else {
+        return (WindowPlacement::OrderedOut, None);
+    };
+    let placement = state
+        .core
+        .pinned_wid
+        .map(WindowPlacement::Pinned)
+        .unwrap_or(WindowPlacement::Front);
+    (placement, Some(key.clone()))
+}
+
 /// Convert a `tiny_skia::Pixmap` to a `CGImage` and set it as the contents
 /// of the given `CALayer` via `dispatch_async(main_queue, ...)`.
 fn dispatch_set_layer_contents(layer_ptr: usize, pixmap: tiny_skia::Pixmap) {
@@ -959,7 +1037,7 @@ fn dispatch_set_layer_contents(layer_ptr: usize, pixmap: tiny_skia::Pixmap) {
 /// Raise the normal-level overlay without activating the driver application.
 ///
 /// This is used only for an externally visible cursor with no target window.
-/// Target-bound actions continue to use [`dispatch_pin_above`] so background
+/// Target-bound actions continue to use [`dispatch_pin_relative_to_target`] so background
 /// delivery remains below unrelated foreground applications.
 fn dispatch_order_front(win_ptr: usize) {
     use std::ffi::c_void;
@@ -991,9 +1069,44 @@ fn dispatch_order_front(win_ptr: usize) {
     }
 }
 
-/// Order the overlay NSWindow just above `target_wid` in the global window
-/// server list.  Called from the render thread; dispatches to the main queue
-/// (AppKit must be used on the main thread).
+/// Remove the transparent overlay from the WindowServer ordering while no
+/// cursor has externally visible pixels.
+fn dispatch_order_out(win_ptr: usize) {
+    use std::ffi::c_void;
+
+    #[link(name = "dispatch", kind = "dylib")]
+    extern "C" {
+        static _dispatch_main_q: u8;
+        fn dispatch_async_f(
+            queue: *const c_void,
+            context: *mut c_void,
+            work: unsafe extern "C" fn(*mut c_void),
+        );
+    }
+
+    unsafe extern "C" fn order_out_cb(ctx: *mut c_void) {
+        let win_ptr = *Box::from_raw(ctx as *mut usize);
+        let win = win_ptr as *mut objc2::runtime::AnyObject;
+        let _: () =
+            objc2::msg_send![win, orderOut: std::ptr::null_mut::<objc2::runtime::AnyObject>()];
+    }
+
+    let payload = Box::new(win_ptr);
+    unsafe {
+        let main_queue = &raw const _dispatch_main_q as *const c_void;
+        dispatch_async_f(
+            main_queue,
+            Box::into_raw(payload) as *mut c_void,
+            order_out_cb,
+        );
+    }
+}
+
+/// Order the overlay NSWindow relative to `target_wid` in the global window
+/// server list. Called from the render thread; dispatches to the main queue
+/// (AppKit must be used on the main thread). Foreground targets use the normal
+/// above-target placement. Background targets place the overlay below the
+/// nearest non-driver window above them, or below the target when it is top.
 ///
 /// `NSWindowAbove = 1`; `orderWindow:relativeTo:` accepts any CGWindowID as
 /// the `relativeTo` argument — it works cross-application via CGS.
@@ -1025,7 +1138,53 @@ fn target_is_frontmost_visible_window(
         .is_some_and(|window| u64::from(window.window_id) == target_wid)
 }
 
-fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetRelativeOrder {
+    AboveTarget,
+    BelowWindow(u64),
+    OrderedOut,
+}
+
+/// Keep a target-bound cursor below the global top boundary for background apps.
+///
+/// A target can transiently rise to the front of the WindowServer list without
+/// becoming the active application, for example while Finder presents a
+/// contextual menu. Ordering the overlay above a cross-process target can also
+/// transiently promote it to the global top even when a spectator remains
+/// above the target. A background cursor therefore sits immediately below its
+/// nearest non-driver ceiling, which still leaves it above the target. If no
+/// such ceiling exists, the target itself caps the overlay. Foreground targets
+/// remain unrestricted so their cursor stays visible.
+fn target_relative_order(
+    target_wid: u64,
+    frontmost_pid: Option<i32>,
+    overlay_pid: i32,
+    windows: &[crate::windows::WindowInfo],
+) -> TargetRelativeOrder {
+    let Some(target) = windows.iter().find(|window| {
+        u64::from(window.window_id) == target_wid && window.is_on_screen && window.layer == 0
+    }) else {
+        return TargetRelativeOrder::OrderedOut;
+    };
+    if frontmost_pid == Some(target.pid) {
+        return TargetRelativeOrder::AboveTarget;
+    }
+
+    let ceiling_wid = windows
+        .iter()
+        .filter(|window| {
+            window.is_on_screen
+                && window.layer == 0
+                && window.pid != overlay_pid
+                && window.window_id != target.window_id
+                && window.z_index > target.z_index
+        })
+        .min_by_key(|window| window.z_index)
+        .map_or(target_wid, |window| u64::from(window.window_id));
+    TargetRelativeOrder::BelowWindow(ceiling_wid)
+}
+
+fn dispatch_pin_relative_to_target(win_ptr: usize, target_wid: u64) {
     use std::ffi::c_void;
 
     #[link(name = "dispatch", kind = "dylib")]
@@ -1039,11 +1198,35 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
     }
 
     unsafe extern "C" fn reorder_cb(ctx: *mut c_void) {
-        let (win_ptr, target_wid, raise_front): (usize, u64, bool) =
-            *Box::from_raw(ctx as *mut (usize, u64, bool));
+        let (win_ptr, target_wid): (usize, u64) = *Box::from_raw(ctx as *mut (usize, u64));
+        // Resolve the z-order decision on the AppKit main queue immediately
+        // before ordering. A pre-dispatch snapshot can go stale while this
+        // callback waits, which is enough for a background target/menu to rise
+        // and turn a previously-safe `Above` decision into a global-top leak.
+        let windows = crate::windows::visible_windows();
+        let frontmost_pid = crate::apps::frontmost_pid();
+        let relative_order = target_relative_order(
+            target_wid,
+            frontmost_pid,
+            std::process::id() as i32,
+            &windows,
+        );
+        let raise_front = target_is_frontmost_visible_window(target_wid, frontmost_pid, &windows);
         let win = win_ptr as *mut objc2::runtime::AnyObject;
-        // NSWindowAbove = 1; relativeTo: takes NSInteger (i64 on 64-bit)
-        let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_wid as i64];
+        if relative_order == TargetRelativeOrder::OrderedOut {
+            let _: () = objc2::msg_send![win, orderOut: std::ptr::null_mut::<
+                objc2::runtime::AnyObject,
+            >()];
+            return;
+        }
+        // NSWindowAbove = 1, NSWindowBelow = -1; relativeTo: takes NSInteger
+        // (i64 on 64-bit).
+        let (order, relative_wid) = match relative_order {
+            TargetRelativeOrder::AboveTarget => (1i64, target_wid),
+            TargetRelativeOrder::BelowWindow(window_id) => (-1i64, window_id),
+            TargetRelativeOrder::OrderedOut => unreachable!(),
+        };
+        let _: () = objc2::msg_send![win, orderWindow: order relativeTo: relative_wid as i64];
 
         // Tahoe can leave a normal-level transparent window behind an
         // already-frontmost cross-process target even after the relative
@@ -1056,10 +1239,7 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
         }
     }
 
-    let windows = crate::windows::visible_windows();
-    let raise_front =
-        target_is_frontmost_visible_window(target_wid, crate::apps::frontmost_pid(), &windows);
-    let payload = Box::new((win_ptr, target_wid, raise_front));
+    let payload = Box::new((win_ptr, target_wid));
     unsafe {
         let main_queue = &raw const _dispatch_main_q as *const c_void;
         dispatch_async_f(
@@ -1088,7 +1268,7 @@ struct MacZOrderEnforcer {
 impl ZOrderEnforcer for MacZOrderEnforcer {
     fn reassert(&self, target: Option<u64>) {
         if let Some(wid) = target {
-            dispatch_pin_above(self.win_ptr, wid);
+            dispatch_pin_relative_to_target(self.win_ptr, wid);
         }
         // target = None → no-op; see struct doc comment.
     }
@@ -1268,6 +1448,51 @@ mod tests {
             Some(target_pid),
             &windows,
         ));
+    }
+
+    #[test]
+    fn target_relative_order_caps_a_background_target_at_the_global_top() {
+        let target_pid = 100;
+        let spectator_pid = 200;
+        let overlay_pid = 300;
+        let mut windows = vec![
+            window(10, target_pid, 20),
+            window(11, spectator_pid, 30),
+            window(12, overlay_pid, 10),
+            window(13, spectator_pid, 40),
+        ];
+
+        assert_eq!(
+            target_relative_order(10, Some(spectator_pid), overlay_pid, &windows),
+            TargetRelativeOrder::BelowWindow(11),
+            "a background cursor must sit below its nearest safe z-order ceiling, not a farther spectator"
+        );
+
+        windows[0].z_index = 40;
+        assert_eq!(
+            target_relative_order(10, Some(spectator_pid), overlay_pid, &windows),
+            TargetRelativeOrder::BelowWindow(10),
+            "a background target at the global top must cap the overlay below itself"
+        );
+
+        windows[2].z_index = 50;
+        assert_eq!(
+            target_relative_order(10, Some(spectator_pid), overlay_pid, &windows),
+            TargetRelativeOrder::BelowWindow(10),
+            "an already-top overlay is not a valid ceiling for its own target"
+        );
+
+        assert_eq!(
+            target_relative_order(10, Some(target_pid), overlay_pid, &windows),
+            TargetRelativeOrder::AboveTarget,
+            "a foreground target keeps the normal visible cursor placement"
+        );
+
+        assert_eq!(
+            target_relative_order(999, Some(spectator_pid), overlay_pid, &windows),
+            TargetRelativeOrder::OrderedOut,
+            "a missing exact target must fail closed instead of leaving stale overlay placement"
+        );
     }
 
     fn move_msg(key: &str, x: f64, y: f64) -> OverlayMsg {
@@ -1469,6 +1694,87 @@ mod tests {
 
         map.cursors.get_mut("sessA").unwrap().core.cfg.enabled = false;
         assert!(!cursor_is_externally_visible(&map.cursors["sessA"]));
+    }
+
+    #[test]
+    fn window_placement_requires_an_externally_visible_cursor() {
+        let mut map = empty_map();
+        let default_key = "default".to_owned();
+
+        assert_eq!(
+            desired_window_placement(&map, None, None),
+            (WindowPlacement::OrderedOut, None),
+            "cold sentinel cursor must leave the overlay ordered out"
+        );
+
+        apply_msg(
+            &mut map,
+            OverlayMsg::Cmd(KeyedOverlayCommand {
+                key: default_key.clone(),
+                cmd: OverlayCommand::PinAbove(41),
+            }),
+        );
+        assert_eq!(
+            desired_window_placement(&map, Some(&default_key), None),
+            (WindowPlacement::OrderedOut, None),
+            "a target id alone must not order in a blank overlay"
+        );
+
+        assert!(seed_start_in_map(&mut map, &default_key, 60.0, 60.0));
+        assert_eq!(
+            desired_window_placement(&map, Some(&default_key), None),
+            (WindowPlacement::Pinned(41), Some(default_key.clone())),
+            "an on-screen cursor must restore its target-relative placement"
+        );
+
+        map.cursors.get_mut(&default_key).unwrap().core.idle_alpha = 0.003;
+        assert_eq!(
+            desired_window_placement(&map, None, Some(&default_key)),
+            (WindowPlacement::OrderedOut, None),
+            "completion of the idle fade must order the overlay out"
+        );
+    }
+
+    #[test]
+    fn window_placement_ignores_hidden_cursor_without_hiding_visible_peer() {
+        let mut map = empty_map();
+        let first_key = "first".to_owned();
+        let second_key = "second".to_owned();
+        assert!(seed_start_in_map(&mut map, &first_key, 40.0, 40.0));
+        assert!(seed_start_in_map(&mut map, &second_key, 80.0, 80.0));
+        for (key, window_id) in [(&first_key, 101), (&second_key, 202)] {
+            apply_msg(
+                &mut map,
+                OverlayMsg::Cmd(KeyedOverlayCommand {
+                    key: key.clone(),
+                    cmd: OverlayCommand::PinAbove(window_id),
+                }),
+            );
+        }
+
+        assert_eq!(
+            desired_window_placement(&map, Some(&first_key), None),
+            (WindowPlacement::Pinned(101), Some(first_key.clone()))
+        );
+        assert_eq!(
+            desired_window_placement(&map, None, Some(&first_key)),
+            (WindowPlacement::Pinned(101), Some(first_key.clone())),
+            "the prior active visible cursor must retain the shared z-band"
+        );
+
+        map.cursors.get_mut(&first_key).unwrap().core.visible = false;
+        assert_eq!(
+            desired_window_placement(&map, Some(&first_key), Some(&first_key)),
+            (WindowPlacement::Pinned(202), Some(second_key.clone())),
+            "a hidden last-touched cursor must fall back to its visible peer"
+        );
+
+        apply_msg(&mut map, OverlayMsg::Remove(second_key));
+        assert_eq!(
+            desired_window_placement(&map, None, Some(&first_key)),
+            (WindowPlacement::OrderedOut, None),
+            "removing the final visible cursor must order the overlay out"
+        );
     }
 
     #[test]

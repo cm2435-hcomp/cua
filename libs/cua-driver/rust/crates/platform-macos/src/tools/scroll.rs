@@ -14,6 +14,7 @@ use crate::ax::bindings::{
     copy_children, copy_element_attr, copy_string_attr, element_screen_center, kAXErrorSuccess,
     perform_action, AXUIElementRef,
 };
+use crate::browser::cdp_client::{CdpClient, CdpScrollDispatch, PreparedCdpScroll};
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 
@@ -32,6 +33,11 @@ struct WheelTarget {
     screen_y: f64,
     win_local: Option<(f64, f64)>,
     wid: Option<u32>,
+}
+
+enum TargetedScrollFailure {
+    Refused(String),
+    PossibleEffect(String),
 }
 
 fn after_exact_target_gate<T>(
@@ -173,13 +179,6 @@ impl Tool for ScrollTool {
         // background CGEvents). Only the pixel-wheel path honors it; the
         // keystroke path is background-by-design and untouched.
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
-        if !delivery_mode.is_foreground() && crate::browser::ElectronJs::is_electron(pid) {
-            return ToolResult::error(
-                "Background scroll is unavailable for Electron/Chromium windows on macOS."
-                    .to_owned(),
-            )
-            .with_structured(serde_json::json!({ "code": "background_unavailable" }));
-        }
         let direction = match args.require_str("direction") {
             Ok(v) => v,
             Err(e) => return e,
@@ -522,6 +521,77 @@ impl Tool for ScrollTool {
                     }
                 }
             }
+            let prepared_cdp: Option<PreparedCdpScroll> = if !delivery_mode.is_foreground()
+                && crate::browser::platform::is_standalone_chromium_process(pid)
+            {
+                let Some(wid) = target.wid else {
+                    return ToolResult::error(
+                        "Chromium background scroll requires an exact native window id.",
+                    )
+                    .with_structured(serde_json::json!({
+                        "code": "background_unavailable",
+                        "effect": "refused",
+                        "native_side_effect_started": false,
+                    }));
+                };
+                let Some(window) = crate::windows::window_info_by_id(wid) else {
+                    return ToolResult::error(format!(
+                        "Chromium target window {wid} closed before CDP scroll preflight."
+                    ))
+                    .with_structured(serde_json::json!({
+                        "code": "stale_target",
+                        "effect": "refused",
+                        "native_side_effect_started": false,
+                    }));
+                };
+                if window.pid != pid || window.title.trim().is_empty() {
+                    return ToolResult::error(format!(
+                        "Chromium window {wid} has no exact PID-owned title for CDP scroll binding."
+                    ))
+                    .with_structured(serde_json::json!({
+                        "code": "background_unavailable",
+                        "effect": "refused",
+                        "native_side_effect_started": false,
+                    }));
+                }
+                let cdp_target = match CdpClient::bind_exact_page_for_pid(pid, &window.title).await
+                {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return ToolResult::error(format!(
+                            "Chromium exact background scroll has no unique PID-owned CDP page: {error}"
+                        ))
+                        .with_structured(serde_json::json!({
+                            "code": "background_unavailable",
+                            "effect": "refused",
+                            "native_side_effect_started": false,
+                            "required_route": "chromium_cdp_input_synthesize_scroll_gesture",
+                        }));
+                    }
+                };
+                match CdpClient::prepare_scroll_gesture(
+                    &cdp_target,
+                    target.screen_x,
+                    target.screen_y,
+                )
+                .await
+                {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        return ToolResult::error(format!(
+                            "Chromium CDP scroll preflight failed before dispatch: {error}"
+                        ))
+                        .with_structured(serde_json::json!({
+                            "code": "background_unavailable",
+                            "effect": "refused",
+                            "native_side_effect_started": false,
+                            "required_route": "chromium_cdp_input_synthesize_scroll_gesture",
+                        }));
+                    }
+                }
+            } else {
+                None
+            };
             let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
             // Pin + glide the agent-cursor overlay to the target for visibility
             // (overlay only — does NOT move the hardware cursor). Mirrors click.
@@ -559,7 +629,22 @@ impl Tool for ScrollTool {
                 prior_front,
                 "scroll.CGScrollWheel",
                 || async move {
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    if let Some(mut prepared) = prepared_cdp {
+                        prepared
+                            .revalidate(screen_x, screen_y)
+                            .await
+                            .map_err(|error| TargetedScrollFailure::Refused(error.to_string()))?;
+                        let public_delta_x = -(delta_x as f64) * amount_ticks as f64;
+                        let public_delta_y = -(delta_y as f64) * amount_ticks as f64;
+                        return prepared
+                            .dispatch(public_delta_x, public_delta_y)
+                            .await
+                            .map(Some)
+                            .map_err(|error| {
+                                TargetedScrollFailure::PossibleEffect(error.to_string())
+                            });
+                    }
+                    match tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                         let do_it = move || -> anyhow::Result<()> {
                             crate::input::mouse::scroll_wheel_at_xy(
                                 pid,
@@ -572,7 +657,6 @@ impl Tool for ScrollTool {
                                 amount_ticks,
                             )
                         };
-                        // Foreground rung: brief front → wheel → restore prior frontmost.
                         match (fg, wid) {
                             (true, Some(w)) => {
                                 crate::input::skylight::with_foreground_assist(
@@ -586,6 +670,13 @@ impl Tool for ScrollTool {
                         }
                     })
                     .await
+                    {
+                        Ok(Ok(())) => Ok(None),
+                        Ok(Err(error)) => {
+                            Err(TargetedScrollFailure::PossibleEffect(error.to_string()))
+                        }
+                        Err(error) => Err(TargetedScrollFailure::PossibleEffect(error.to_string())),
+                    }
                 },
             )
             .await;
@@ -597,17 +688,42 @@ impl Tool for ScrollTool {
                 ""
             };
             return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
+                Ok(cdp_dispatch) => ToolResult::text(format!(
                     "✅ Sent {direction} scroll by {by} × {amount} via pixel wheel at \
                      ({screen_x:.0}, {screen_y:.0}){mode_label} (background CGEvent; not \
                      driver-verified — confirm via screenshot).{}",
                     changes.result_suffix()
                 ))
                 .with_structured(serde_json::json!({
-                    "path": if fg { "cgevent_fg" } else { "cgevent" }, "verified": false, "effect": "unverifiable"
+                    "path": if cdp_dispatch.is_some() { "chromium_cdp_scroll_gesture" } else if fg { "cgevent_fg" } else { "cgevent" },
+                    "verified": false,
+                    "effect": "unverifiable",
+                    "cdp": cdp_dispatch.map(|dispatch: CdpScrollDispatch| serde_json::json!({
+                        "method": "Input.synthesizeScrollGesture",
+                        "port": dispatch.port,
+                        "title": dispatch.title,
+                        "viewport_x": dispatch.viewport_x,
+                        "viewport_y": dispatch.viewport_y,
+                        "viewport_origin_x": dispatch.viewport_origin_x,
+                        "viewport_origin_y": dispatch.viewport_origin_y,
+                    })),
                 })),
-                Ok(Err(e)) => ToolResult::error(format!("Wheel scroll failed: {e}")),
-                Err(e)     => ToolResult::error(format!("Task error: {e}")),
+                Err(TargetedScrollFailure::Refused(error)) => ToolResult::error(format!(
+                    "Chromium CDP scroll target changed before dispatch: {error}"
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "stale_target",
+                    "effect": "refused",
+                    "native_side_effect_started": false,
+                })),
+                Err(TargetedScrollFailure::PossibleEffect(error)) => ToolResult::error(format!(
+                    "Targeted scroll dispatch failed after its native side-effect boundary began: {error}"
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "dispatch_failed",
+                    "effect": "partial",
+                    "native_side_effect_started": true,
+                })),
             };
         }
 

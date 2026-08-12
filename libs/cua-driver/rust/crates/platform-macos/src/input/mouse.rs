@@ -344,22 +344,22 @@ fn click_at_xy_inner(
     })
 }
 
-/// Prepare a raw background pixel click by making the target AppKit-active
-/// without raising or restacking its window.
+/// Prepare a raw background pixel click by giving only the target process a
+/// durable synthetic AppKit focus belief, without defocusing the user's real
+/// foreground application or raising/restacking the target window.
 ///
 /// The Swift implementation ran this immediately before the stamped event
 /// stream. The original Rust port retained the SkyLight primitive but omitted
 /// this call while cursor-overlay repinning was incomplete. Callers should
 /// re-pin their overlay after this returns, then post the click sequence.
 ///
-/// Returns whether the private focus-without-raise recipe succeeded. Event
-/// posting remains best-effort when the private APIs are unavailable.
-pub fn prepare_background_pixel_click(pid: i32, wid: u32) -> bool {
-    let activated = crate::input::skylight::activate_without_raise(pid as libc::pid_t, wid);
-    // Match Swift's settle interval so AppKit updates its active/key-window
-    // routing before the mouseMoved + primer + target stream arrives.
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    activated
+/// Returns whether this call posted new focus-belief events. An acknowledged
+/// controller-owned belief is reused across later actions in the same process.
+pub fn prepare_background_pixel_click(
+    pid: i32,
+    wid: u32,
+) -> Result<bool, crate::input::synthetic_focus::FocusPreparationError> {
+    crate::input::synthetic_focus::enforce(pid, wid)
 }
 
 /// Post the stamped event half of the Chromium-compatible left-click recipe
@@ -870,7 +870,7 @@ pub enum DragButton {
 /// left- and right-click primitives use. Window-local stamping mirrors
 /// `right_click_at_xy_with_window_local`.
 pub fn middle_click_at_xy(pid: i32, x: f64, y: f64, modifiers: &[&str]) -> anyhow::Result<()> {
-    middle_click_at_xy_inner(pid, x, y, None, modifiers)
+    middle_click_at_xy_inner(pid, x, y, None, None, modifiers)
 }
 
 /// Like `middle_click_at_xy` but stamps the window-local `(wx, wy)` point.
@@ -880,9 +880,10 @@ pub fn middle_click_at_xy_with_window_local(
     y: f64,
     wx: f64,
     wy: f64,
+    wid: u32,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    middle_click_at_xy_inner(pid, x, y, Some((wx, wy)), modifiers)
+    middle_click_at_xy_inner(pid, x, y, Some((wx, wy)), Some(wid), modifiers)
 }
 
 fn middle_click_at_xy_inner(
@@ -890,12 +891,27 @@ fn middle_click_at_xy_inner(
     x: f64,
     y: f64,
     window_local: Option<(f64, f64)>,
+    wid: Option<u32>,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let point = CGPoint::new(x, y);
     let flags = parse_modifier_flags(modifiers);
+    let click_group_id = wid.map(|_| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as i64
+    });
+
+    // Middle clicks need the same exact-window cursor primer and routing
+    // stamps as left/right clicks. Window-local coordinates alone are not
+    // enough when Chromium owns multiple top-level windows.
+    post_mouse_moved_primer(pid, &source, point, window_local, wid, click_group_id);
+    std::thread::sleep(std::time::Duration::from_millis(12));
 
     let down = CGEvent::new_mouse_event(
         source.clone(),
@@ -907,8 +923,8 @@ fn middle_click_at_xy_inner(
     if flags != CGEventFlags::CGEventFlagNull {
         down.set_flags(flags);
     }
-    post_mouse_event(pid, &down, window_local, None, None, 1, 2, 3);
-    std::thread::sleep(std::time::Duration::from_millis(16));
+    post_mouse_event(pid, &down, window_local, wid, click_group_id, 1, 2, 3);
+    std::thread::sleep(std::time::Duration::from_millis(28));
 
     let up = CGEvent::new_mouse_event(
         source,
@@ -920,7 +936,7 @@ fn middle_click_at_xy_inner(
     if flags != CGEventFlags::CGEventFlagNull {
         up.set_flags(flags);
     }
-    post_mouse_event(pid, &up, window_local, None, None, 1, 2, 3);
+    post_mouse_event(pid, &up, window_local, wid, click_group_id, 1, 2, 3);
 
     Ok(())
 }

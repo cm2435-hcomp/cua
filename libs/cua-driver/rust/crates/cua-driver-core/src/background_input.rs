@@ -177,9 +177,9 @@ fn refuse(
 ///   every route, including semantic AX;
 /// - semantic AX actions remain available for minimized/hidden targets;
 /// - the routed pointer requires a visible (possibly occluded) target; and
-/// - process-scoped keyboard additionally requires that the target is the
-///   only eligible same-pid keyboard destination, because the transport
-///   addresses a process, not a window.
+/// - process-scoped keyboard requires either a unique same-pid destination or
+///   a proven exact element that the platform focuses immediately before the
+///   PID-routed event sequence.
 pub fn decide_background_input(
     target: ExactWindowTarget,
     facts: &BackgroundTargetFacts,
@@ -286,14 +286,16 @@ pub fn decide_background_input(
                 );
             }
             debug_assert!(action.is_pid_keyboard());
-            if facts.competing_keyboard_destinations > 0 {
+            if facts.competing_keyboard_destinations > 0
+                && facts.element != ElementAncestry::ProvenDescendant
+            {
                 return refuse(
                     refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
                     format!(
-                        "pid {} owns {} other eligible top-level window(s); process-scoped \
-                         key events cannot be proven to reach window {} and could mutate a \
-                         sibling window. Use an exact element action, the page tool for \
-                         browser content, or delivery_mode:\"foreground\"",
+                        "pid {} owns {} other eligible top-level window(s), and no exact \
+                         element was proven for window {}; process-scoped key events could \
+                         mutate a sibling window. Use an exact element action, the page tool \
+                         for browser content, or delivery_mode:\"foreground\"",
                         target.pid, facts.competing_keyboard_destinations, target.window_id
                     ),
                     Some("accessibility"),
@@ -423,6 +425,21 @@ mod tests {
             assert!(
                 decide_background_input(TARGET, &facts, action).is_execute(),
                 "{action:?} is window-addressed and stays available"
+            );
+        }
+    }
+
+    #[test]
+    fn two_window_process_allows_keyboard_with_proven_exact_element() {
+        let facts = BackgroundTargetFacts {
+            competing_keyboard_destinations: 1,
+            element: ElementAncestry::ProvenDescendant,
+            ..matched_facts()
+        };
+        for action in [BackgroundAction::InsertText, BackgroundAction::GenericKey] {
+            assert!(
+                decide_background_input(TARGET, &facts, action).is_execute(),
+                "{action:?} has an exact focus target in the requested window"
             );
         }
     }
