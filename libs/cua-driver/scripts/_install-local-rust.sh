@@ -333,6 +333,21 @@ if [ "$OS" = "Linux" ]; then
             echo "${GREEN}updated installed GNOME helper; reload the GNOME session to activate it${NORMAL}"
         fi
     fi
+
+    SOURCE_X11_HELPER="$REPO_ROOT/../x11-helper"
+    if [ -d "$SOURCE_X11_HELPER/winrestore@cua" ]; then
+        STAGED_X11_HELPER="$VERSIONED_DIR/x11-helper"
+        mkdir -p "$STAGED_X11_HELPER"
+        cp -R "$SOURCE_X11_HELPER/." "$STAGED_X11_HELPER/"
+
+        INSTALLED_X11_HELPER="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/winrestore@cua"
+        if [ -d "$INSTALLED_X11_HELPER" ]; then
+            cp "$SOURCE_X11_HELPER/winrestore@cua/metadata.json" \
+                "$SOURCE_X11_HELPER/winrestore@cua/extension.js" \
+                "$INSTALLED_X11_HELPER/"
+            echo "${GREEN}updated installed X11 GNOME helper; reload the GNOME session to activate it${NORMAL}"
+        fi
+    fi
 fi
 
 # Atomically point `current` at the new versioned release dir.

@@ -833,6 +833,8 @@ pub(crate) fn allowed_environment_name(name: &str) -> bool {
                 | "DISPLAY"
                 | "WAYLAND_DISPLAY"
                 | "XDG_RUNTIME_DIR"
+                | "XDG_DATA_HOME"
+                | "XDG_DATA_DIRS"
                 | "XDG_SESSION_TYPE"
                 | "DBUS_SESSION_BUS_ADDRESS"
                 | "XAUTHORITY"
@@ -1199,6 +1201,11 @@ mod tests {
             [
                 ("WAYLAND_DISPLAY".into(), "wayland-7".into()),
                 ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
+                (
+                    "XDG_DATA_DIRS".into(),
+                    "/usr/local/share:/usr/share:/var/lib/snapd/desktop".into(),
+                ),
+                ("XDG_DATA_HOME".into(), "/home/user/.local/share".into()),
                 ("XDG_SESSION_TYPE".into(), "wayland".into()),
                 (
                     "DBUS_SESSION_BUS_ADDRESS".into(),
@@ -1212,6 +1219,11 @@ mod tests {
         for (name, value) in [
             ("WAYLAND_DISPLAY", "wayland-7"),
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            (
+                "XDG_DATA_DIRS",
+                "/usr/local/share:/usr/share:/var/lib/snapd/desktop",
+            ),
+            ("XDG_DATA_HOME", "/home/user/.local/share"),
             ("XDG_SESSION_TYPE", "wayland"),
             ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
         ] {

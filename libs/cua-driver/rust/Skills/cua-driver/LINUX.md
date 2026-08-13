@@ -17,6 +17,15 @@ can provide exact targeting and readback.
 AT-SPI is talked to natively over D-Bus (the `atspi`/zbus crate) — no
 `pyatspi` or GObject-introspection typelibs are required at runtime.
 
+On GNOME X11, observing an exact minimized window uses the bundled WinRestore
+Shell helper. The driver revalidates `(pid, XID, title)`, verifies the helper's
+immutable D-Bus owner is the current user's system `gnome-shell`, restores the
+window without activation, and checks exact visibility plus unchanged active
+window before capture. Install it once with
+`~/.cua-driver/packages/current/x11-helper/install.sh`, then log out and back
+in. Without the trusted helper, minimized observation refuses before dispatch;
+visible-window observation is unaffected.
+
 ## How input is delivered (the no-foreground contract)
 
 - **Pixel click** — `XSendEvent(ButtonPress/Release)` to the resolved

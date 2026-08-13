@@ -768,6 +768,7 @@ case "$LABEL" in
         SRC="$TMP_DIR/$BINARY_NAME"
         SRC_THEME="$TMP_DIR/cua-cursor-theme"
         SRC_WAYLAND_HELPER="$TMP_DIR/wayland-helper"
+        SRC_X11_HELPER="$TMP_DIR/x11-helper"
         SRC_APP=""
         ;;
 esac
@@ -961,6 +962,18 @@ else
                 "$SRC_WAYLAND_HELPER/winrects@cua/extension.js" \
                 "$INSTALLED_WAYLAND_HELPER/"
             log "updated installed GNOME helper; reload the GNOME session to activate it"
+        fi
+    fi
+    if [[ -d "${SRC_X11_HELPER:-}" ]]; then
+        mkdir -p "$VERSIONED_DIR/x11-helper"
+        cp -R "$SRC_X11_HELPER/." "$VERSIONED_DIR/x11-helper/"
+
+        INSTALLED_X11_HELPER="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/winrestore@cua"
+        if [[ -d "$INSTALLED_X11_HELPER" ]]; then
+            cp "$SRC_X11_HELPER/winrestore@cua/metadata.json" \
+                "$SRC_X11_HELPER/winrestore@cua/extension.js" \
+                "$INSTALLED_X11_HELPER/"
+            log "updated installed X11 GNOME helper; reload the GNOME session to activate it"
         fi
     fi
     log "installed $VERSIONED_DIR/$BINARY_NAME (version $VERSION, target $TARGET)"

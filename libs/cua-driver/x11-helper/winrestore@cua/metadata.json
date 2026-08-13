@@ -1,0 +1,7 @@
+{
+  "uuid": "winrestore@cua",
+  "name": "CUA Window Restore",
+  "description": "Restore one exact minimized X11 window without changing GNOME Shell focus.",
+  "shell-version": ["42", "43", "44"],
+  "version": 2
+}
