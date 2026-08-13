@@ -43,6 +43,30 @@ fn pid_window_target_candidates(pid: i64) -> Vec<WindowTargetCandidate> {
     window_target_candidates_for_pid(crate::wayland::list_windows_dispatch(Some(pid)), pid)
 }
 
+fn exact_window_target_is_current(pid: u32, window_id: u64) -> bool {
+    crate::wayland::list_windows_dispatch(Some(pid))
+        .into_iter()
+        .any(|window| window.xid == window_id && window.pid == Some(pid))
+        && (crate::wayland::is_wayland() || crate::x11::window_belongs_to_pid(window_id, pid))
+}
+
+fn stale_exact_window_action(pid: u32, window_id: u64, operation: &str) -> ToolResult {
+    ToolResult::error(format!(
+        "{operation} exact window pid {pid}, window_id {window_id} is stale or no longer owned by that process; observe again."
+    ))
+    .with_structured(json!({
+        "code": "observation_stale",
+        "phase": "preflight",
+        "retryable": true,
+        "effect": "refused",
+        "effect_may_have_occurred": false,
+        "native_side_effect_started": false,
+        "dispatch_scope": "target",
+        "pid": pid,
+        "window_id": window_id,
+    }))
+}
+
 fn pid_window_guarded<T: Tool + 'static>(
     tool: T,
     candidates: &WindowTargetCandidates,
@@ -205,11 +229,13 @@ impl Tool for ListAppsTool {
                 stripped and path separators replaced with `-` \
                 (e.g. `kde4/konqbrowser.desktop` → `kde4-konqbrowser`).\n\
                 - last_used: RFC3339 mtime of the `.desktop` file, when readable.\n\n\
-                Running apps come from `/proc`. Installed apps come from XDG Desktop Entry \
-                files in $XDG_DATA_HOME/applications and each $XDG_DATA_DIRS entry's \
-                applications/ subdir. Entries with `NoDisplay=true` or `Hidden=true` are \
-                filtered. A `.desktop` file whose launcher matches a running process \
-                (by basename) is merged into a single entry with `running: true`.\n\n\
+                Installed apps come from XDG Desktop Entry files in \
+                $XDG_DATA_HOME/applications and each $XDG_DATA_DIRS entry's applications/ \
+                subdir. Entries with `NoDisplay=true` or `Hidden=true` are filtered. A \
+                `.desktop` file whose launcher matches a running process (by basename) is \
+                merged into a single entry with `running: true`. A running process without \
+                a launcher is included only when it owns a top-level window, so kernel \
+                threads and background daemons do not become model-facing apps.\n\n\
                 Use this for \"is X installed?\" as well as \"is X running?\". For per-window \
                 state — visibility, geometry, titles — call list_windows instead."
                     .into(),
@@ -225,92 +251,27 @@ impl Tool for ListAppsTool {
         let apps = tokio::task::spawn_blocking(|| -> Vec<serde_json::Value> {
             let procs = crate::proc_fs::list_processes();
             let installed = crate::installed_apps::list_installed_apps();
-
-            // Match running processes to installed apps by executable
-            // basename (Exec=firefox %u → "firefox"; cmdline /usr/bin/firefox
-            // → "firefox"). Many distros register multiple .desktop entries
-            // sharing the same basename (e.g. several `firefox` profiles, a
-            // `code` and a `code-insiders` both shelling `code`), so the
-            // bucket is `Vec<usize>` — we pick a winner per running process
-            // via `disambiguate_installed_match` instead of overwriting.
-            let mut by_exe: std::collections::HashMap<String, Vec<usize>> =
-                std::collections::HashMap::new();
-            for (i, app) in installed.iter().enumerate() {
-                let basename = exec_basename(&app.launch_path);
-                if !basename.is_empty() {
-                    by_exe.entry(basename).or_default().push(i);
-                }
-            }
-
-            let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            let mut out = Vec::new();
-            for p in &procs {
-                let key_source = if !p.cmdline.is_empty() {
-                    &p.cmdline
-                } else {
-                    &p.name
-                };
-                let basename = exec_basename(key_source);
-                if basename.is_empty() {
-                    continue;
-                }
-                let candidates = by_exe.get(&basename).map(|v| v.as_slice()).unwrap_or(&[]);
-                let merged = disambiguate_installed_match(candidates, &installed, key_source);
-                if let Some(idx) = merged {
-                    consumed.insert(idx);
-                }
-                let (name, bundle_id, launch_path, kind, last_used) = match merged {
-                    Some(idx) => {
-                        let a = &installed[idx];
-                        (
-                            a.name.clone(),
-                            Some(a.bundle_id.clone()),
-                            Some(a.launch_path.clone()),
-                            Some("desktop".to_owned()),
-                            a.last_used.clone(),
-                        )
+            let windows = crate::wayland::list_windows_dispatch(None);
+            let window_pids = windows
+                .iter()
+                .filter_map(|window| window.pid)
+                .filter(|pid| crate::proc_fs::is_process_live(*pid))
+                .collect();
+            let mut window_classes_by_pid: std::collections::HashMap<
+                u32,
+                std::collections::HashSet<String>,
+            > = std::collections::HashMap::new();
+            for window in &windows {
+                if let Some(pid) = window.pid {
+                    if !window.app_name.is_empty() {
+                        window_classes_by_pid
+                            .entry(pid)
+                            .or_default()
+                            .insert(window.app_name.to_ascii_lowercase());
                     }
-                    None => (
-                        if !p.name.is_empty() {
-                            p.name.clone()
-                        } else {
-                            basename.clone()
-                        },
-                        None,
-                        None,
-                        None,
-                        None,
-                    ),
-                };
-                out.push(json!({
-                    "pid":         p.pid,
-                    "bundle_id":   bundle_id,
-                    "name":        name,
-                    "running":     true,
-                    "active":      false,
-                    "kind":        kind,
-                    "launch_path": launch_path,
-                    "last_used":   last_used,
-                    "windows":     Vec::<serde_json::Value>::new(),
-                }));
-            }
-            for (i, app) in installed.iter().enumerate() {
-                if consumed.contains(&i) {
-                    continue;
                 }
-                out.push(json!({
-                    "pid":         0,
-                    "bundle_id":   app.bundle_id.clone(),
-                    "name":        app.name.clone(),
-                    "running":     false,
-                    "active":      false,
-                    "kind":        "desktop",
-                    "launch_path": app.launch_path.clone(),
-                    "last_used":   app.last_used.clone(),
-                    "windows":     Vec::<serde_json::Value>::new(),
-                }));
             }
-            out
+            merge_app_inventory(&procs, &installed, &window_pids, &window_classes_by_pid)
         })
         .await
         .unwrap_or_default();
@@ -341,6 +302,202 @@ impl Tool for ListAppsTool {
                 })).collect::<Vec<_>>(),
         });
         ToolResult::text(lines.join("\n")).with_structured(structured)
+    }
+}
+
+fn merge_app_inventory(
+    processes: &[crate::proc_fs::ProcessInfo],
+    installed: &[crate::installed_apps::InstalledApp],
+    window_pids: &std::collections::HashSet<u32>,
+    window_classes_by_pid: &std::collections::HashMap<u32, std::collections::HashSet<String>>,
+) -> Vec<Value> {
+    let mut installed_by_executable: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, app) in installed.iter().enumerate() {
+        let basename = exec_basename(&app.launch_path);
+        if !basename.is_empty() {
+            installed_by_executable
+                .entry(basename)
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut installed_by_window_class: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, app) in installed.iter().enumerate() {
+        installed_by_window_class
+            .entry(app.bundle_id.to_ascii_lowercase())
+            .or_default()
+            .push(index);
+        if let Some(window_class) = app.startup_wm_class.as_deref() {
+            installed_by_window_class
+                .entry(window_class.to_ascii_lowercase())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    let mut matching_processes: std::collections::HashMap<
+        usize,
+        Vec<&crate::proc_fs::ProcessInfo>,
+    > = std::collections::HashMap::new();
+    let mut unmatched_window_processes = Vec::new();
+    for process in processes {
+        let key_source = if process.cmdline.is_empty() {
+            &process.name
+        } else {
+            &process.cmdline
+        };
+        let basename = exec_basename(key_source);
+        if basename.is_empty() {
+            continue;
+        }
+        let candidates = installed_by_executable
+            .get(&basename)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let executable_match = disambiguate_installed_match(candidates, installed, key_source);
+        let window_class_match = || {
+            let mut candidates = std::collections::BTreeSet::new();
+            for window_class in window_classes_by_pid.get(&process.pid)? {
+                if let Some(indices) = installed_by_window_class.get(window_class) {
+                    candidates.extend(indices.iter().copied());
+                }
+            }
+            disambiguate_installed_match(
+                &candidates.into_iter().collect::<Vec<_>>(),
+                installed,
+                key_source,
+            )
+        };
+        match executable_match.or_else(window_class_match) {
+            Some(index) => matching_processes.entry(index).or_default().push(process),
+            None if window_pids.contains(&process.pid) => unmatched_window_processes.push(process),
+            None => {}
+        }
+    }
+
+    let mut apps = Vec::with_capacity(installed.len() + unmatched_window_processes.len());
+    for (index, app) in installed.iter().enumerate() {
+        let process = matching_processes.get(&index).and_then(|matches| {
+            matches
+                .iter()
+                .copied()
+                .min_by_key(|process| (!window_pids.contains(&process.pid), process.pid))
+        });
+        apps.push(json!({
+            "pid": process.map_or(0, |process| process.pid),
+            "bundle_id": app.bundle_id,
+            "name": app.name,
+            "running": process.is_some(),
+            "active": false,
+            "kind": "desktop",
+            "launch_path": app.launch_path,
+            "last_used": app.last_used,
+            "windows": Vec::<Value>::new(),
+        }));
+    }
+    for process in unmatched_window_processes {
+        let name = if process.name.is_empty() {
+            exec_basename(&process.cmdline)
+        } else {
+            process.name.clone()
+        };
+        apps.push(json!({
+            "pid": process.pid,
+            "bundle_id": Value::Null,
+            "name": name,
+            "running": true,
+            "active": false,
+            "kind": Value::Null,
+            "launch_path": Value::Null,
+            "last_used": Value::Null,
+            "windows": Vec::<Value>::new(),
+        }));
+    }
+    apps
+}
+
+#[cfg(test)]
+mod list_apps_tests {
+    use super::*;
+
+    fn process(pid: u32, name: &str, cmdline: &str) -> crate::proc_fs::ProcessInfo {
+        crate::proc_fs::ProcessInfo {
+            pid,
+            name: name.to_owned(),
+            cmdline: cmdline.to_owned(),
+        }
+    }
+
+    fn installed(
+        name: &str,
+        bundle_id: &str,
+        launch_path: &str,
+    ) -> crate::installed_apps::InstalledApp {
+        crate::installed_apps::InstalledApp {
+            name: name.to_owned(),
+            bundle_id: bundle_id.to_owned(),
+            launch_path: launch_path.to_owned(),
+            startup_wm_class: None,
+            last_used: None,
+        }
+    }
+
+    #[test]
+    fn inventory_merges_installed_processes_and_excludes_non_window_daemons() {
+        let processes = vec![
+            process(11, "browser-helper", "/opt/browser/browser-helper"),
+            process(12, "browser-bin", "/opt/browser/browser-bin"),
+            process(13, "override-bin", "/opt/override/override-bin"),
+            process(21, "worker-daemon", "/usr/bin/worker-daemon"),
+            process(31, "portable-ui", "/opt/portable-ui"),
+        ];
+        let mut browser = installed("Browser", "example.browser", "/usr/bin/browser-stable");
+        browser.startup_wm_class = Some("Example-Browser".to_owned());
+        let installed = vec![
+            browser,
+            installed(
+                "Override Browser",
+                "override-browser",
+                "/usr/bin/override-browser-stable",
+            ),
+            installed("Notes", "example.notes", "/usr/bin/notes"),
+        ];
+        let window_pids = std::collections::HashSet::from([12, 13, 31]);
+        let window_classes_by_pid = std::collections::HashMap::from([
+            (
+                12,
+                std::collections::HashSet::from(["example-browser".to_owned()]),
+            ),
+            (
+                13,
+                std::collections::HashSet::from(["override-browser".to_owned()]),
+            ),
+        ]);
+
+        let apps =
+            merge_app_inventory(&processes, &installed, &window_pids, &window_classes_by_pid);
+
+        assert_eq!(apps.len(), 4);
+        let browser = apps
+            .iter()
+            .find(|app| app["bundle_id"] == "example.browser")
+            .expect("installed browser should be present once");
+        assert_eq!(browser["pid"], 12);
+        assert_eq!(browser["running"], true);
+        assert_eq!(
+            apps.iter()
+                .filter(|app| app["bundle_id"] == "example.browser")
+                .count(),
+            1
+        );
+        assert!(apps.iter().any(|app| app["name"] == "Notes"));
+        assert!(apps.iter().any(|app| {
+            app["bundle_id"] == "override-browser" && app["pid"] == 13 && app["running"] == true
+        }));
+        assert!(apps.iter().any(|app| app["pid"] == 31));
+        assert!(!apps.iter().any(|app| app["pid"] == 21));
     }
 }
 
@@ -480,6 +637,11 @@ fn window_record_json(w: &crate::x11::WindowInfo) -> Value {
         "pid": w.pid,
         "app_name": w.app_name,
         "title": w.title,
+        // EWMH client-list entries are application toplevels. Keep minimized
+        // targets selectable for exact observation/recovery while marking them
+        // unusable for ordinary visible-window ranking.
+        "is_standard": true,
+        "minimized": !w.is_on_screen,
         // Canonical cross-platform geometry (macOS/Windows parity).
         "bounds": { "x": w.x, "y": w.y, "width": w.width, "height": w.height },
         "is_on_screen": w.is_on_screen,
@@ -528,9 +690,15 @@ mod list_windows_tests {
         // Cross-platform companions.
         assert_eq!(rec["app_name"], json!("example-app"));
         assert_eq!(rec["is_on_screen"], json!(true));
+        assert_eq!(rec["is_standard"], json!(true));
+        assert_eq!(rec["minimized"], json!(false));
         assert_eq!(rec["z_index"], json!(3));
         assert_eq!(rec["window_id"], json!(42));
         assert_eq!(rec["title"], json!("Example"));
+
+        let mut state = json!({"pid": 1234, "window_id": 42});
+        add_window_bounds(&mut state, &w);
+        assert_eq!(state["window_bounds"], rec["bounds"]);
     }
 
     #[test]
@@ -561,6 +729,23 @@ mod list_windows_tests {
 }
 
 // ── get_window_state ─────────────────────────────────────────────────────────
+
+fn add_window_bounds(structured: &mut Value, window: &crate::x11::WindowInfo) {
+    structured["window_bounds"] = json!({
+        "x": window.x,
+        "y": window.y,
+        "width": window.width,
+        "height": window.height,
+    });
+}
+
+fn snapshot_index_extent(nodes: &[crate::atspi::AtspiNode]) -> usize {
+    nodes
+        .iter()
+        .filter_map(|node| node.element_index)
+        .max()
+        .map_or(0, |index| index + 1)
+}
 
 pub struct GetWindowStateTool {
     state: Arc<ToolState>,
@@ -666,17 +851,69 @@ impl Tool for GetWindowStateTool {
             .map(|v| v.max(1) as usize);
 
         let process_is_live = crate::proc_fs::is_process_live(pid);
-        let window_matches = if crate::wayland::is_wayland() {
-            crate::wayland::list_windows_dispatch(Some(pid))
-                .iter()
-                .any(|window| window.xid == xid && window.pid == Some(pid))
-        } else {
-            crate::x11::window_belongs_to_pid(xid, pid)
-        };
+        let target_window = crate::wayland::list_windows_dispatch(Some(pid))
+            .into_iter()
+            .find(|window| window.xid == xid && window.pid == Some(pid));
+        let window_matches = target_window.is_some()
+            && (crate::wayland::is_wayland() || crate::x11::window_belongs_to_pid(xid, pid));
         if !process_is_live || !window_matches {
             return ToolResult::error(format!(
                 "Window target pid {pid}, window_id {xid} is stale or no longer running; refresh list_windows."
             ));
+        }
+        let mut target_window =
+            target_window.expect("window_matches requires exact target metadata");
+
+        // GNOME X11 keeps a minimized client drawable mapped, so observation
+        // must inspect the EWMH hidden state and ask the trusted Shell owner to
+        // unminimize the exact pid/XID/title target before the AT-SPI walk and
+        // XComposite capture. Once Shell dispatch starts, every later failure
+        // retains possible-effect evidence.
+        let minimized_recovery = if crate::wayland::is_wayland() || target_window.is_on_screen {
+            None
+        } else {
+            let target = target_window.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::x11::minimized_recovery::restore_if_minimized(&target)
+            })
+            .await
+            {
+                Ok(Ok(recovery)) => recovery,
+                Ok(Err(failure)) => {
+                    return ToolResult::error(failure.message).with_structured(failure.structured)
+                }
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "minimized-window recovery worker failed with an unknown dispatch outcome: {error}"
+                    ))
+                    .with_structured(json!({
+                        "code": "internal",
+                        "phase": "dispatch",
+                        "retryable": false,
+                        "effect_may_have_occurred": true,
+                        "native_side_effect_started": true,
+                        "pid": pid,
+                        "window_id": xid,
+                    }))
+                }
+            }
+        };
+        if minimized_recovery.is_some() {
+            let Some(refreshed) = crate::wayland::list_windows_dispatch(Some(pid))
+                .into_iter()
+                .find(|window| window.xid == xid && window.pid == Some(pid) && window.is_on_screen)
+            else {
+                let evidence = minimized_recovery.as_ref().expect("checked above");
+                return ToolResult::error(
+                    "minimized-window recovery completed but exact X11 metadata did not refresh",
+                )
+                .with_structured(evidence.decorate_error(json!({
+                    "code": "ui_not_settled",
+                    "phase": "verify",
+                    "retryable": false,
+                })));
+            };
+            target_window = refreshed;
         }
 
         // Always walk the AT-SPI tree; capture the screenshot by default. The
@@ -745,8 +982,27 @@ impl Tool for GetWindowStateTool {
 
         match result {
             Ok(Ok((tree_opt, shot_opt, bounds))) => {
+                if tree_opt.as_ref().is_some_and(|tree| !tree.window_scoped)
+                    && crate::wayland::list_windows_dispatch(Some(pid)).len() > 1
+                {
+                    let refusal = ToolResult::error(format!(
+                        "Could not prove which AT-SPI top-level owns exact window {xid}; refresh after the window geometry or title settles."
+                    ))
+                    .with_structured(json!({
+                        "code": "observation_raced",
+                        "phase": "preflight",
+                        "retryable": true,
+                        "effect": "refused",
+                        "dispatch_scope": "target"
+                    }));
+                    return decorate_linux_post_recovery_error(
+                        refusal,
+                        minimized_recovery.as_ref(),
+                    );
+                }
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
+                add_window_bounds(&mut structured, &target_window);
 
                 if let Some(tr) = tree_opt {
                     let source_trusted = tr.trusted;
@@ -756,6 +1012,7 @@ impl Tool for GetWindowStateTool {
                         .iter()
                         .filter(|n| n.element_index.is_some())
                         .count();
+                    let token_index_extent = snapshot_index_extent(&tr.nodes);
                     let header = format!("window_id={xid} pid={pid} elements={count}\n\n");
                     content.push(cua_driver_core::protocol::Content::text(
                         header + &tr.tree_markdown,
@@ -775,8 +1032,11 @@ impl Tool for GetWindowStateTool {
                     // its existing integer `element_index`. The integer
                     // surface stays unchanged — the token is additive.
                     let snapshot_id = (!observation_only).then(|| {
-                        cua_driver_core::element_token::global()
-                            .register_snapshot(pid as i32, xid as u32, count)
+                        cua_driver_core::element_token::global().register_snapshot(
+                            pid as i32,
+                            xid as u32,
+                            token_index_extent,
+                        )
                     });
 
                     // Structured `elements` array: one entry per actionable node.
@@ -927,6 +1187,9 @@ impl Tool for GetWindowStateTool {
                         structured["screenshot_file_path"] = json!(fp);
                     }
                 }
+                if let Some(recovery) = &minimized_recovery {
+                    structured["minimized_recovery"] = recovery.structured();
+                }
 
                 ToolResult {
                     content,
@@ -935,10 +1198,40 @@ impl Tool for GetWindowStateTool {
                     action_record: None,
                 }
             }
-            Ok(Err(e)) => ToolResult::error(format!("Capture error: {e}")),
-            Err(e) => ToolResult::error(format!("Task error: {e}")),
+            Ok(Err(e)) => decorate_linux_observation_error(
+                ToolResult::error(format!("Capture error: {e}")),
+                minimized_recovery.as_ref(),
+            ),
+            Err(e) => decorate_linux_observation_error(
+                ToolResult::error(format!("Task error: {e}")),
+                minimized_recovery.as_ref(),
+            ),
         }
     }
+}
+
+fn decorate_linux_observation_error(
+    result: ToolResult,
+    recovery: Option<&crate::x11::minimized_recovery::RecoveryEvidence>,
+) -> ToolResult {
+    decorate_linux_post_recovery_error(result, recovery)
+}
+
+fn decorate_linux_post_recovery_error(
+    mut result: ToolResult,
+    recovery: Option<&crate::x11::minimized_recovery::RecoveryEvidence>,
+) -> ToolResult {
+    let Some(recovery) = recovery else {
+        return result;
+    };
+    let structured = result
+        .structured_content
+        .take()
+        .unwrap_or_else(|| json!({"code": "observation_stale", "phase": "verify"}));
+    let mut structured = recovery.decorate_error(structured);
+    structured["retryable"] = json!(false);
+    result.structured_content = Some(structured);
+    result
 }
 
 // ── launch_app ───────────────────────────────────────────────────────────────
@@ -962,6 +1255,12 @@ fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::
     let mut launch = std::process::Command::new(prog);
     launch
         .args(&rest)
+        // A GUI app can outlive the private worker that launched it. Never
+        // let it inherit the worker's request/response pipes: doing so can
+        // corrupt a launch response and keep shutdown waiting on a live app.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         // Enable accessibility for this child without toggling GNOME's global
         // ScreenReaderEnabled setting (which can launch Orca). Native
         // toolkits ignore these when they do not need them.
@@ -1074,6 +1373,7 @@ mod launch_app_tests {
             name: name.to_owned(),
             bundle_id: bundle_id.to_owned(),
             launch_path: launch_path.to_owned(),
+            startup_wm_class: None,
             last_used: None,
         }
     }
@@ -1133,6 +1433,33 @@ mod launch_app_tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+    }
+
+    #[test]
+    fn launched_apps_never_inherit_the_private_worker_stdio() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let script = std::env::temp_dir().join(format!(
+            "cua-driver-launch-stdio-{}-{suffix}.sh",
+            std::process::id()
+        ));
+        std::fs::write(&script, "while :; do :; done\n").unwrap();
+        let pid = spawn_launch_command("/bin/sh", &[script.to_string_lossy().into_owned()])
+            .expect("shell fixture should spawn");
+
+        for fd in 0..=2 {
+            assert_eq!(
+                std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).unwrap(),
+                std::path::Path::new("/dev/null"),
+                "launched fd {fd} must not retain a private-worker pipe"
+            );
+        }
+
+        // SAFETY: this targets only the exact test child returned above.
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+        let _ = std::fs::remove_file(script);
     }
 
     #[test]
@@ -1541,6 +1868,17 @@ fn type_text_structured_electron(text_len: usize) -> Value {
     })
 }
 
+fn type_text_structured_cdp(text_len: usize) -> Value {
+    json!({
+        "path": "cdp_insert_text",
+        "characters": text_len,
+        "verified": false,
+        "effect": "unverifiable",
+        "delivery_mode": "background",
+        "hardware_cursor_warp_attempted": false
+    })
+}
+
 /// Build the success `ToolResult` for an AT-SPI insert. The EditableText
 /// method's boolean is a delivery acknowledgement, not a fresh value readback,
 /// so native widgets remain `unverifiable`. Chromium embedders additionally
@@ -1629,6 +1967,105 @@ fn is_chromium_embedder(pid: u32) -> bool {
         }
     }
     false
+}
+
+fn chromium_debugging_port_from_cmdline(raw: &[u8]) -> Option<u16> {
+    let mut args = raw
+        .split(|byte| *byte == 0)
+        .filter_map(|arg| (!arg.is_empty()).then(|| String::from_utf8_lossy(arg).into_owned()));
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--remote-debugging-port=") {
+            return value.parse::<u16>().ok().filter(|port| *port != 0);
+        }
+        if arg == "--remote-debugging-port" {
+            return args
+                .next()
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|port| *port != 0);
+        }
+    }
+    None
+}
+
+fn chromium_debugging_port(pid: u32) -> Option<u16> {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .and_then(|raw| chromium_debugging_port_from_cmdline(&raw))
+}
+
+fn background_web_drag_unavailable(reason: impl Into<String>) -> ToolResult {
+    ToolResult::error(reason.into()).with_structured(json!({
+        "code": "background_unavailable",
+        "phase": "preflight",
+        "retryable": false,
+        "effect": "refused",
+        "dispatch_scope": "target",
+        "verified": false,
+        "input_route": "dom_event"
+    }))
+}
+
+async fn chromium_dom_event_drag(
+    pid: u32,
+    from_x: f64,
+    from_y: f64,
+    to_x: f64,
+    to_y: f64,
+) -> ToolResult {
+    if !is_chromium_embedder(pid) {
+        return background_web_drag_unavailable(
+            "input_route=dom_event requires a Chromium/Electron target on Linux",
+        );
+    }
+    let Some(port) = chromium_debugging_port(pid) else {
+        return background_web_drag_unavailable(
+            "Background Chromium drag requires an exactly bound CDP page; this process was not launched with a fixed --remote-debugging-port",
+        );
+    };
+    let script = format!(
+        r#"(() => {{
+          const rawSource = document.elementFromPoint({from_x}, {from_y});
+          const source = rawSource?.closest?.('[draggable="true"]') || rawSource;
+          const destination = document.elementFromPoint({to_x}, {to_y});
+          if (!source || !destination || source.ownerDocument !== destination.ownerDocument) return false;
+          let data = null;
+          try {{ data = new DataTransfer(); }} catch (_) {{}}
+          const common = {{ bubbles: true, cancelable: true, composed: true }};
+          const pointerId = 1;
+          source.dispatchEvent(new PointerEvent('pointerdown', {{...common, pointerId, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 1, clientX: {from_x}, clientY: {from_y}}}));
+          source.dispatchEvent(new MouseEvent('mousedown', {{...common, button: 0, buttons: 1, clientX: {from_x}, clientY: {from_y}}}));
+          source.dispatchEvent(new DragEvent('dragstart', {{...common, dataTransfer: data, clientX: {from_x}, clientY: {from_y}}}));
+          source.dispatchEvent(new PointerEvent('pointermove', {{...common, pointerId, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 1, clientX: {to_x}, clientY: {to_y}}}));
+          source.dispatchEvent(new MouseEvent('mousemove', {{...common, button: 0, buttons: 1, clientX: {to_x}, clientY: {to_y}}}));
+          destination.dispatchEvent(new DragEvent('dragenter', {{...common, dataTransfer: data, clientX: {to_x}, clientY: {to_y}}}));
+          destination.dispatchEvent(new DragEvent('dragover', {{...common, dataTransfer: data, clientX: {to_x}, clientY: {to_y}}}));
+          destination.dispatchEvent(new DragEvent('drop', {{...common, dataTransfer: data, clientX: {to_x}, clientY: {to_y}}}));
+          source.dispatchEvent(new DragEvent('dragend', {{...common, dataTransfer: data, clientX: {to_x}, clientY: {to_y}}}));
+          destination.dispatchEvent(new MouseEvent('mouseup', {{...common, button: 0, buttons: 0, clientX: {to_x}, clientY: {to_y}}}));
+          source.dispatchEvent(new PointerEvent('pointerup', {{...common, pointerId, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 0, clientX: {to_x}, clientY: {to_y}}}));
+          return true;
+        }})()"#
+    );
+    match cua_driver_core::cdp::evaluate_unique_page(port, &script, true).await {
+        Ok(result) if result == "true" => ToolResult::text(
+            "Dispatched a target-contained Chromium drag through the exact unique CDP page.",
+        )
+        .with_structured(json!({
+            "path": "dom_event",
+            "input_route": "dom_event",
+            "effect": "unverifiable",
+            "verified": false,
+            "delivery_mode": "background",
+            "hardware_cursor_warp_attempted": false
+        })),
+        Ok(result) if result == "false" => background_web_drag_unavailable(
+            "The exact CDP page could not resolve both drag coordinates before dispatch",
+        ),
+        Ok(result) => ToolResult::error(format!(
+            "Chromium DOM drag did not return a delivery acknowledgement: {result}"
+        )),
+        Err(error) => ToolResult::error(format!("Chromium DOM drag failed: {error}")),
+    }
 }
 
 fn is_webkitgtk_embedder(pid: u32) -> bool {
@@ -2875,6 +3312,24 @@ impl Tool for TypeTextTool {
         }
 
         let text_len = text.chars().count();
+        // A Chromium/Electron page with a unique CDP target can accept text in
+        // its currently focused editable without any toplevel activation. This
+        // is safer and more reliable than XTest after GNOME rebuilds renderer
+        // focus during an EWMH foreground assist. Multi-page endpoints refuse
+        // this route and continue through the existing explicit-focus ladder.
+        if resolved_elem_idx.is_none() && px.is_none() && is_chromium_embedder(pid) {
+            if let Some(port) = chromium_debugging_port(pid) {
+                if cua_driver_core::cdp::insert_text_unique_page(port, &text)
+                    .await
+                    .is_ok()
+                {
+                    return ToolResult::text(format!(
+                        "Typed {text_len} character(s) into the unique focused Chromium page."
+                    ))
+                    .with_structured(type_text_structured_cdp(text_len));
+                }
+            }
+        }
         // Native toolkit editables have a stronger focus-free route than raw
         // compositor keyboard injection. Keep Chromium/WebKit on real key events
         // because their accessibility bridges may echo a write that never reaches
@@ -3102,24 +3557,24 @@ impl Tool for TypeTextTool {
         // producing the renderer input event, so web embedders use real XTest
         // key events. Native toolkits keep their verifiable AT-SPI path below.
         if delivery.is_foreground() && (is_chromium_embedder(pid) || is_webkitgtk_embedder(pid)) {
-            if let Some(idx) = resolved_elem_idx {
-                let focused =
-                    tokio::task::spawn_blocking(move || crate::atspi::focus_element(pid, idx))
-                        .await;
-                match focused {
-                    Ok(Ok(true)) => {}
-                    Ok(Ok(false)) => {
-                        return ToolResult::error(format!(
-                            "AT-SPI Component.GrabFocus returned false for element {idx}"
-                        ))
-                    }
-                    Ok(Err(e)) => return ToolResult::error(e.to_string()),
-                    Err(e) => return ToolResult::error(format!("Task error: {e}")),
-                }
-            }
             let text_f = text.clone();
             let result = tokio::task::spawn_blocking(move || {
                 crate::input::with_x11_foreground(xid, 80, || {
+                    if let Some(idx) = resolved_elem_idx {
+                        if !crate::atspi::focus_element(pid, idx)? {
+                            anyhow::bail!(
+                                "AT-SPI Component.GrabFocus returned false for element {idx}"
+                            );
+                        }
+                        // Chromium can retain Focused in its AX bridge while an
+                        // EWMH activation is still rebuilding renderer focus.
+                        // GrabFocus therefore may observe the old true state and
+                        // return before the renderer consumes the new request.
+                        // Give the compositor/renderer one bounded turn before
+                        // delivering real XTest keys; otherwise the call reports
+                        // dispatch success while the input event is dropped.
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
                     crate::input::send_type_text_xtest(&text_f)
                 })
             })
@@ -3525,7 +3980,10 @@ impl Tool for PressKeyTool {
         // primary action is the focus-free route for editable web controls;
         // resolving the element only for its window ID silently loses the key
         // on Chromium inputs whose window is backgrounded.
-        if let Some(element_index) = element_index_arg {
+        if element_index_arg.is_some()
+            && (!delivery.is_foreground() || crate::wayland::wayland_input_enabled())
+        {
+            let element_index = element_index_arg.expect("checked above");
             let focused = tokio::task::spawn_blocking(move || {
                 crate::atspi::focus_element(pid, element_index)
             })
@@ -3608,6 +4066,13 @@ impl Tool for PressKeyTool {
             // XSendEvent (no focus steal) for apps that accept it.
             if deliver_fg {
                 return crate::input::with_x11_foreground(xid, 80, || {
+                    if let Some(element_index) = element_index_arg {
+                        if !crate::atspi::focus_element(pid, element_index)? {
+                            anyhow::bail!(
+                                "AT-SPI Component.GrabFocus returned false for element {element_index}"
+                            );
+                        }
+                    }
                     crate::input::send_key_xtest(&key_for_task, &m)
                 });
             }
@@ -3876,7 +4341,10 @@ impl Tool for HotkeyTool {
             }
         }
 
-        if let Some(element_index) = resolved_element_index {
+        if resolved_element_index.is_some()
+            && (!delivery.is_foreground() || crate::wayland::wayland_input_enabled())
+        {
+            let element_index = resolved_element_index.expect("checked above");
             let focused = tokio::task::spawn_blocking(move || {
                 crate::atspi::focus_element(pid, element_index)
             })
@@ -3937,6 +4405,13 @@ impl Tool for HotkeyTool {
             // foreground rung must use XTest, which reaches the focused window.
             if deliver_fg {
                 return crate::input::with_x11_foreground(xid, 80, || {
+                    if let Some(element_index) = resolved_element_index {
+                        if !crate::atspi::focus_element(pid, element_index)? {
+                            anyhow::bail!(
+                                "AT-SPI Component.GrabFocus returned false for element {element_index}"
+                            );
+                        }
+                    }
                     crate::input::send_key_xtest(&key, &m)
                 });
             }
@@ -3982,7 +4457,8 @@ impl Tool for SetValueTool {
                     "element_index": cua_driver_core::tool_schema::element_index_schema(),
                     "element_token": cua_driver_core::tool_schema::element_token_schema(),
                     "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
-                    "value":{"type":"string"}
+                    "value":{"type":"string"},
+                    "delivery_mode": crate::input::delivery::delivery_mode_schema()
                 },"additionalProperties":false
             }),
             read_only: false, destructive: true, idempotent: false, open_world: true,
@@ -4011,14 +4487,23 @@ impl Tool for SetValueTool {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let idx = match resolved {
-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
-                element_index
-            }
+        let (idx, resolved_window_id) = match resolved {
+            cua_driver_core::element_token::ResolvedElement::Element {
+                element_index,
+                window_id,
+                ..
+            } => (element_index, window_id.map(u64::from)),
             cua_driver_core::element_token::ResolvedElement::None => return ToolResult::error(
                 "set_value requires element_index or element_token to address the target element.",
             ),
         };
+        let target_window_id = args.opt_u64("window_id").or(resolved_window_id);
+        if let Some(window_id) = target_window_id {
+            if !exact_window_target_is_current(pid, window_id) {
+                return stale_exact_window_action(pid, window_id, "set_value");
+            }
+        }
+        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
         let cursor_id = resolve_cursor_key(&args);
         let value_for_task = value.clone();
         // Pulse the agent cursor onto the target element before writing, so a
@@ -4037,13 +4522,370 @@ impl Tool for SetValueTool {
             }
             overlay_glide_to_for(&cursor_id, sx, sy).await;
         }
-        let result =
-            tokio::task::spawn_blocking(move || crate::atspi::set_value(pid, idx, &value_for_task))
-                .await;
+        let target_xid = target_window_id.unwrap_or(0);
+        let result = tokio::task::spawn_blocking(move || {
+            crate::atspi::set_value(pid, target_xid, idx, &value_for_task)
+        })
+        .await;
         match result {
             Ok(Ok(())) => ToolResult::text(format!("Set value of element [{idx}] to '{value}'.")),
-            Ok(Err(e)) => ToolResult::error(e.to_string()),
-            Err(e) => ToolResult::error(format!("Task error: {e}")),
+            Ok(Err(crate::atspi::native::SetValueFailure::Stale(detail))) => {
+                ToolResult::error(detail).with_structured(json!({
+                    "code": "observation_stale",
+                    "phase": "preflight",
+                    "retryable": true,
+                    "effect": "refused",
+                    "effect_may_have_occurred": false,
+                    "native_side_effect_started": false,
+                    "dispatch_scope": "target",
+                    "pid": pid,
+                    "window_id": target_xid,
+                }))
+            }
+            Ok(Err(crate::atspi::native::SetValueFailure::Refused(detail))) => {
+                if let Some(window_id) = target_window_id {
+                    if !exact_window_target_is_current(pid, window_id) {
+                        return stale_exact_window_action(pid, window_id, "set_value");
+                    }
+                }
+                ToolResult::error(detail).with_structured(json!({
+                    "code": "unsupported_in_background",
+                    "phase": "preflight",
+                    "retryable": false,
+                    "effect": "refused",
+                    "dispatch_scope": "target"
+                }))
+            }
+            Ok(Err(crate::atspi::native::SetValueFailure::NeedsForeground(detail))) => {
+                if !delivery.is_foreground() {
+                    return crate::input::delivery::background_unavailable_error(
+                        crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+                    );
+                }
+                let Some(window_id) = target_window_id else {
+                    return ToolResult::error(format!(
+                        "{detail}; foreground set_value requires an exact window_id"
+                    ))
+                    .with_structured(json!({
+                        "code": "invalid_arguments",
+                        "phase": "preflight",
+                        "retryable": false,
+                        "effect": "refused",
+                        "dispatch_scope": "target"
+                    }));
+                };
+
+                // Confirm this focus-bound fallback still names a text control
+                // before changing focus or sending a key. A generic focusable
+                // element must not turn set_value into arbitrary typing.
+                let preflight_text =
+                    tokio::task::spawn_blocking(move || crate::atspi::text_value(pid, idx)).await;
+                match preflight_text {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        return ToolResult::error(format!(
+                            "{detail}; exact Text interface unavailable: {error}"
+                        ))
+                        .with_structured(json!({
+                            "code": "unsupported_in_background",
+                            "phase": "preflight",
+                            "retryable": false,
+                            "effect": "refused",
+                            "dispatch_scope": "target"
+                        }))
+                    }
+                    Err(error) => {
+                        return ToolResult::error(format!(
+                            "set_value text preflight worker failed: {error}"
+                        ))
+                        .with_structured(json!({
+                            "code": "dispatch_failed",
+                            "phase": "preflight",
+                            "retryable": false,
+                            "effect": "refused",
+                            "dispatch_scope": "target"
+                        }))
+                    }
+                }
+
+                let replacement = value.clone();
+                let replacement_for_input = replacement.clone();
+                let injected = tokio::task::spawn_blocking(move || {
+                    crate::input::with_x11_foreground(window_id, 80, || {
+                        // Grab the widget focus only after with_x11_foreground
+                        // has journaled the user's prior active window. Some
+                        // Electron bridges activate their toplevel as a side
+                        // effect of Component.GrabFocus; doing this before the
+                        // transaction would make the target look like the
+                        // "prior" window and defeat restoration.
+                        match crate::atspi::focus_element(pid, idx)? {
+                            true => {}
+                            false => anyhow::bail!(
+                                "AT-SPI Component.GrabFocus returned false for element {idx}"
+                            ),
+                        }
+                        // Chromium acknowledges Component.GrabFocus before its
+                        // renderer has necessarily installed the corresponding
+                        // DOM focus. Likewise, Ctrl+A's key-up can still be in
+                        // flight when the first replacement character arrives.
+                        // Bound both settlement intervals so the focused
+                        // fallback cannot silently drop the first character.
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        crate::input::send_key_xtest("a", &["ctrl"])?;
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        crate::input::send_type_text_xtest(&replacement_for_input)
+                    })
+                })
+                .await;
+                match injected {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        return ToolResult::error(format!(
+                            "set_value foreground keyboard delivery failed: {error}"
+                        ))
+                        .with_structured(json!({
+                            "code": "dispatch_failed",
+                            "phase": "verify",
+                            "retryable": false,
+                            "effect": "unverifiable",
+                            "dispatch_scope": "target"
+                        }))
+                    }
+                    Err(error) => {
+                        return ToolResult::error(format!(
+                            "set_value foreground worker failed: {error}"
+                        ))
+                        .with_structured(json!({
+                            "code": "dispatch_failed",
+                            "phase": "verify",
+                            "retryable": false,
+                            "effect": "unverifiable",
+                            "dispatch_scope": "target"
+                        }))
+                    }
+                }
+
+                let observed =
+                    tokio::task::spawn_blocking(move || crate::atspi::text_value(pid, idx)).await;
+                match observed {
+                    Ok(Ok(observed)) if observed == replacement => ToolResult::text(format!(
+                        "Set value of element [{idx}] through focused keyboard delivery."
+                    ))
+                    .with_structured(json!({
+                        "path": "key_events_fg",
+                        "verified": true,
+                        "effect": "confirmed",
+                        "delivery_mode": "foreground",
+                        "dispatch_scope": "target"
+                    })),
+                    Ok(Ok(observed)) => ToolResult::error(format!(
+                        "set_value foreground delivery was not confirmed: expected {replacement:?}, observed {observed:?}"
+                    ))
+                    .with_structured(json!({
+                        "code": "dispatch_failed",
+                        "phase": "verify",
+                        "retryable": false,
+                        "effect": "unverifiable",
+                        "dispatch_scope": "target"
+                    })),
+                    Ok(Err(error)) => ToolResult::error(format!(
+                        "set_value foreground delivery could not be read back: {error}"
+                    ))
+                    .with_structured(json!({
+                        "code": "dispatch_failed",
+                        "phase": "verify",
+                        "retryable": false,
+                        "effect": "unverifiable",
+                        "dispatch_scope": "target"
+                    })),
+                    Err(error) => ToolResult::error(format!(
+                        "set_value verification worker failed: {error}"
+                    ))
+                    .with_structured(json!({
+                        "code": "dispatch_failed",
+                        "phase": "verify",
+                        "retryable": false,
+                        "effect": "unverifiable",
+                        "dispatch_scope": "target"
+                    })),
+                }
+            }
+            Ok(Err(crate::atspi::native::SetValueFailure::AfterDispatch(detail))) => {
+                ToolResult::error(detail).with_structured(json!({
+                    "code": "dispatch_failed",
+                    "phase": "verify",
+                    "retryable": false,
+                    "effect": "unverifiable",
+                    "dispatch_scope": "target"
+                }))
+            }
+            Err(error) => ToolResult::error(format!(
+                "set_value worker failed after native dispatch became possible: {error}"
+            ))
+            .with_structured(json!({
+                "code": "dispatch_failed",
+                "phase": "verify",
+                "retryable": false,
+                "effect": "unverifiable",
+                "dispatch_scope": "target"
+            })),
+        }
+    }
+}
+
+// ── select_text ──────────────────────────────────────────────────────────────
+
+pub struct SelectTextTool;
+static SELECT_TEXT_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+
+#[async_trait]
+impl Tool for SelectTextTool {
+    fn def(&self) -> &ToolDef {
+        SELECT_TEXT_DEF.get_or_init(|| ToolDef {
+            name: "select_text".into(),
+            description: "Select one exact occurrence of text in a Linux AT-SPI text element, or place the caret immediately before or after it. Optional prefix and suffix context disambiguate repeated text. The operation is exact-window targeted, background-only, Unicode-character correct, and confirmed only by exact AT-SPI range/caret read-back."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["pid", "text"],
+                "properties": {
+                    "session": cua_driver_core::tool_schema::session_schema(),
+                    "pid": {"type": "integer"},
+                    "window_id": {
+                        "type": "integer",
+                        "description": "Required when element_index is used; optional when element_token is supplied."
+                    },
+                    "element_index": cua_driver_core::tool_schema::element_index_schema(),
+                    "element_token": cua_driver_core::tool_schema::element_token_schema(),
+                    "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
+                    "text": {"type": "string", "minLength": 1},
+                    "prefix": {"type": "string", "minLength": 1},
+                    "suffix": {"type": "string", "minLength": 1},
+                    "selection_type": {
+                        "type": "string",
+                        "enum": ["text", "cursor_before", "cursor_after"],
+                        "default": "text"
+                    }
+                },
+                "additionalProperties": false
+            }),
+            read_only: false,
+            destructive: true,
+            idempotent: true,
+            open_world: true,
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let pid = match args.require_u32("pid") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let text = match args.require_str("text") {
+            Ok(value) if !value.is_empty() => value,
+            Ok(_) => return ToolResult::error("select_text requires non-empty text"),
+            Err(error) => return error,
+        };
+        let prefix = args.opt_str("prefix");
+        let suffix = args.opt_str("suffix");
+        if prefix.as_ref().is_some_and(String::is_empty)
+            || suffix.as_ref().is_some_and(String::is_empty)
+        {
+            return ToolResult::error("select_text prefix/suffix cannot be empty strings");
+        }
+        let selection_type = match args.opt_str("selection_type").as_deref() {
+            None | Some("text") => crate::atspi::native::TextSelectionType::Text,
+            Some("cursor_before") => crate::atspi::native::TextSelectionType::CursorBefore,
+            Some("cursor_after") => crate::atspi::native::TextSelectionType::CursorAfter,
+            Some(other) => {
+                return ToolResult::error(format!(
+                    "select_text selection_type must be text, cursor_before, or cursor_after; got {other:?}"
+                ))
+            }
+        };
+        let resolved = match cua_driver_core::element_token::resolve_element_args(
+            pid as i32,
+            args.opt_u64("element_index").map(|value| value as usize),
+            args.opt_str("element_token").as_deref(),
+            args.opt_str("snapshot_id").as_deref(),
+            args.opt_u64("window_id").map(|value| value as u32),
+            "select_text",
+        ) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let element_index = match resolved {
+            cua_driver_core::element_token::ResolvedElement::Element {
+                window_id: Some(_),
+                element_index,
+                ..
+            } => element_index,
+            cua_driver_core::element_token::ResolvedElement::Element {
+                window_id: None, ..
+            } => {
+                return ToolResult::error(
+                    "select_text requires window_id when element_index is used",
+                )
+            }
+            cua_driver_core::element_token::ResolvedElement::None => {
+                return ToolResult::error(
+                    "select_text requires element_index (+ window_id) or element_token",
+                )
+            }
+        };
+        let request = crate::atspi::native::TextSelectionRequest {
+            text,
+            prefix,
+            suffix,
+            selection_type,
+        };
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::atspi::native::select_text(pid, element_index, request)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(crate::atspi::native::TextSelectionOutcome::Confirmed { start, end })) => {
+                ToolResult::text(format!(
+                    "Selected text on [{element_index}] at AT-SPI character range ({start}, {end})."
+                ))
+                .with_structured(json!({
+                    "path": "atspi",
+                    "verified": true,
+                    "effect": "confirmed",
+                    "dispatch_scope": "target",
+                    "character_range": {"start": start, "end": end}
+                }))
+            }
+            Ok(Ok(crate::atspi::native::TextSelectionOutcome::Unverifiable {
+                start,
+                end,
+                detail,
+            })) => ToolResult::text(detail).with_structured(json!({
+                "path": "atspi",
+                "verified": false,
+                "effect": "unverifiable",
+                "dispatch_scope": "target",
+                "character_range": {"start": start, "end": end}
+            })),
+            Ok(Err(crate::atspi::native::TextSelectionFailure::Refused(detail))) => {
+                ToolResult::error(detail)
+                    .with_structured(json!({"effect": "refused", "dispatch_scope": "target"}))
+            }
+            Ok(Err(crate::atspi::native::TextSelectionFailure::AfterDispatch(detail))) => {
+                ToolResult::error(detail).with_structured(json!({
+                    "path": "atspi",
+                    "effect": "unverifiable",
+                    "dispatch_scope": "target"
+                }))
+            }
+            Err(error) => ToolResult::error(format!(
+                "select_text worker failed after native dispatch became possible: {error}"
+            ))
+            .with_structured(json!({
+                "path": "atspi",
+                "effect": "unverifiable",
+                "dispatch_scope": "target"
+            })),
         }
     }
 }
@@ -4923,8 +5765,9 @@ impl Tool for DragTool {
         DRAG_DEF.get_or_init(|| ToolDef {
             name: "drag".into(),
             description: "Press-drag-release gesture from (from_x, from_y) to (to_x, to_y) in \
-                          window-local screenshot pixels via XSendEvent (ButtonPress + MotionNotify × steps + ButtonRelease). \
-                          duration_ms (default 500), steps (default 20). No focus steal.".into(),
+                          window-local screenshot pixels. input_route=dom_event dispatches through an exact unique \
+                          Chromium CDP page without changing focus or the hardware pointer; the default native route \
+                          retains the platform delivery_mode behavior. duration_ms defaults to 500 and steps to 20.".into(),
             input_schema: json!({"type":"object","required":["from_x","from_y","to_x","to_y"],"properties":{
                 "session": cua_driver_core::tool_schema::session_schema(),
                 "cursor_id":{"type":"string","description":"Optional multi-cursor instance id. Default: 'default'."},
@@ -4940,6 +5783,7 @@ impl Tool for DragTool {
                 "button": cua_driver_core::tool_schema::button_schema(),
                 "from_zoom":{"type":"boolean"},
                 "scope":{"type":"string","enum":["window","desktop"],"default":"window"},
+                "input_route":{"type":"string","enum":["native","dom_event"],"default":"native","description":"Linux web drag routing. dom_event requires an exact unique CDP page."},
                 "delivery_mode": crate::input::delivery::delivery_mode_schema()
             },"additionalProperties":false}),
             read_only: false, destructive: true, idempotent: false, open_world: true,
@@ -5014,17 +5858,29 @@ impl Tool for DragTool {
             None => return ToolResult::error("window_id is required on Linux."),
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
-        if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
-            return refusal;
-        }
-        if let Some(refusal) = unavailable_webkit_background(pid, delivery) {
-            return refusal;
-        }
-        if let Some(refusal) = unavailable_gtk_pointer_background(pid, delivery) {
-            return refusal;
-        }
-        if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
-            return refusal;
+        let input_route = args.str_or("input_route", "native");
+        let dom_event_route = match input_route.as_str() {
+            "native" => false,
+            "dom_event" => true,
+            value => {
+                return ToolResult::error(format!(
+                    "input_route must be native or dom_event, got {value:?}"
+                ))
+            }
+        };
+        if !dom_event_route {
+            if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
+                return refusal;
+            }
+            if let Some(refusal) = unavailable_webkit_background(pid, delivery) {
+                return refusal;
+            }
+            if let Some(refusal) = unavailable_gtk_pointer_background(pid, delivery) {
+                return refusal;
+            }
+            if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
+                return refusal;
+            }
         }
 
         let coerce = |key: &str| -> Option<f64> {
@@ -5075,6 +5931,10 @@ impl Tool for DragTool {
             from_y *= ratio;
             to_x *= ratio;
             to_y *= ratio;
+        }
+
+        if dom_event_route {
+            return chromium_dom_event_drag(pid, from_x, from_y, to_x, to_y).await;
         }
 
         crate::overlay::send_command_for(
@@ -7899,6 +8759,7 @@ pub fn build_registry_with_provider(
         &pid_window_candidates,
     ));
     r.register(pid_window_guarded(SetValueTool, &pid_window_candidates));
+    r.register(pid_window_guarded(SelectTextTool, &pid_window_candidates));
     r.register(pid_window_guarded(ScrollTool, &pid_window_candidates));
     cua_driver_core::clipboard::register_clipboard_tools(
         &mut r,
@@ -7962,8 +8823,49 @@ pub fn build_registry_with_provider(
 
 #[cfg(test)]
 mod click_button_schema_tests {
-    use super::{chromium_background_must_refuse, maps_indicate_gtk, ClickTool};
+    use super::{
+        build_registry, chromium_background_must_refuse, chromium_debugging_port_from_cmdline,
+        maps_indicate_gtk, snapshot_index_extent, ClickTool,
+    };
     use cua_driver_core::tool::Tool;
+    use serde_json::Value;
+
+    #[test]
+    fn sparse_window_scoped_indices_register_the_application_wide_extent() {
+        let nodes = [
+            crate::atspi::AtspiNode {
+                element_index: Some(22),
+                role: "text".into(),
+                name: None,
+                value: None,
+                checked: None,
+                enabled: Some(true),
+                selected: None,
+                description: None,
+                actions: vec![],
+                element_key: 22,
+                depth: 1,
+                parent_element_index: None,
+                in_web_content: false,
+            },
+            crate::atspi::AtspiNode {
+                element_index: Some(23),
+                role: "text".into(),
+                name: None,
+                value: None,
+                checked: None,
+                enabled: Some(true),
+                selected: None,
+                description: None,
+                actions: vec![],
+                element_key: 23,
+                depth: 2,
+                parent_element_index: Some(22),
+                in_web_content: false,
+            },
+        ];
+        assert_eq!(snapshot_index_extent(&nodes), 24);
+    }
 
     /// Surface 5: schema must advertise the three canonical button values and
     /// describe the back-compat default. Linux already routed button=middle/right
@@ -8000,6 +8902,25 @@ mod click_button_schema_tests {
     }
 
     #[test]
+    fn linux_registry_publishes_the_cross_platform_select_text_tool() {
+        let registry = build_registry(false);
+        let definition = registry
+            .get_def("select_text")
+            .expect("Linux must advertise select_text to the public Python facade");
+        assert!(definition.idempotent);
+        assert_eq!(
+            definition
+                .input_schema
+                .get("properties")
+                .and_then(|properties| properties.get("selection_type"))
+                .and_then(|selection_type| selection_type.get("enum"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn chromium_background_requires_focus_free_inject_mode() {
         assert!(chromium_background_must_refuse(false, false, true));
         assert!(!chromium_background_must_refuse(false, true, true));
@@ -8018,6 +8939,24 @@ mod click_button_schema_tests {
         assert!(!maps_indicate_gtk(
             "7f00-7f01 r-xp /usr/lib/x86_64-linux-gnu/libgdk_pixbuf-2.0.so"
         ));
+    }
+
+    #[test]
+    fn fixed_chromium_debugging_port_is_parsed_without_accepting_ambiguous_dynamic_ports() {
+        assert_eq!(
+            chromium_debugging_port_from_cmdline(
+                b"/opt/app\0--remote-debugging-port=19323\0--other\0"
+            ),
+            Some(19323)
+        );
+        assert_eq!(
+            chromium_debugging_port_from_cmdline(b"/opt/app\0--remote-debugging-port\019324\0"),
+            Some(19324)
+        );
+        assert_eq!(
+            chromium_debugging_port_from_cmdline(b"/opt/app\0--remote-debugging-port=0\0"),
+            None
+        );
     }
 }
 

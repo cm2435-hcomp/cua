@@ -8,6 +8,8 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 
+pub mod minimized_recovery;
+
 #[derive(Debug, Clone)]
 pub struct WindowInfo {
     /// X11 Window (XID) cast to u64.
@@ -46,6 +48,19 @@ pub fn window_belongs_to_pid(xid: u64, pid: u32) -> bool {
     window_owner_matches(get_window_pid(&conn, xid).ok().flatten(), pid)
 }
 
+pub fn active_window_id() -> Option<u64> {
+    let (conn, screen_num) = RustConnection::connect(None).ok()?;
+    let root = conn.setup().roots[screen_num].root;
+    let atom = get_atom(&conn, "_NET_ACTIVE_WINDOW").ok()?;
+    let reply = conn
+        .get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?;
+    let active = reply.value32()?.next().map(u64::from);
+    active
+}
+
 fn window_owner_matches(owner: Option<u32>, requested_pid: u32) -> bool {
     owner == Some(requested_pid)
 }
@@ -74,11 +89,18 @@ fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
         let app_name = get_window_class(&conn, xid)
             .map(|(instance, class)| if class.is_empty() { instance } else { class })
             .unwrap_or_default();
-        let is_on_screen = conn
+        let mapped = conn
             .get_window_attributes(xid)
             .ok()
             .and_then(|cookie| cookie.reply().ok())
             .is_some_and(|attributes| attributes.map_state == MapState::VIEWABLE);
+        // Mutter keeps the reparented X11 client drawable viewable while the
+        // logical toplevel is minimized. `_NET_WM_STATE_HIDDEN`, not MapState,
+        // is therefore the authoritative EWMH minimized signal. Treat an
+        // unreadable state as off-screen rather than publishing a hidden
+        // window as safe for visible-window input.
+        let not_hidden = window_is_hidden(&conn, xid).ok() == Some(false);
+        let is_on_screen = mapped && not_hidden;
 
         let geom = conn.get_geometry(xid)?.reply().ok();
         let (x, y, w, h) = if let Some(g) = geom {
@@ -159,6 +181,22 @@ fn fallback_window_is_listable(map_state: MapState) -> bool {
 
 fn get_atom(conn: &RustConnection, name: &str) -> Result<Atom> {
     Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
+}
+
+fn window_is_hidden(conn: &RustConnection, window: Window) -> Result<bool> {
+    let state = get_atom(conn, "_NET_WM_STATE")?;
+    let hidden = get_atom(conn, "_NET_WM_STATE_HIDDEN")?;
+    let reply = conn
+        .get_property(false, window, state, AtomEnum::ATOM, 0, u32::MAX)?
+        .reply()?;
+    Ok(wm_state_contains_hidden(
+        hidden,
+        reply.value32().into_iter().flatten(),
+    ))
+}
+
+fn wm_state_contains_hidden(hidden: Atom, states: impl IntoIterator<Item = Atom>) -> bool {
+    states.into_iter().any(|state| state == hidden)
 }
 
 /// Ask the X11 window manager to set one exact top-level window frame, then
@@ -334,5 +372,12 @@ mod tests {
         let indices: Vec<_> = (0..3).map(z_index_from_bottom_to_top).collect();
         assert_eq!(indices, vec![0, 1, 2]);
         assert!(indices[2] > indices[0]);
+    }
+
+    #[test]
+    fn hidden_state_is_off_screen_even_when_mutter_keeps_client_mapped() {
+        assert!(wm_state_contains_hidden(7, [2, 7, 9]));
+        assert!(!wm_state_contains_hidden(7, [2, 8, 9]));
+        assert!(!wm_state_contains_hidden(7, []));
     }
 }

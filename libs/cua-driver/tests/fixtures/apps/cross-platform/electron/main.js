@@ -60,6 +60,17 @@ ipcMain.on('cua-e2e-sentinel-event', (_event, entry) => {
 let mainWindow;
 let sentinelHeartbeatTimer;
 
+if (sentinelMode && process.platform === 'linux') {
+  // The Linux X11 environment preflight uses this sentinel-only hook to prove
+  // its renderer journal catches leaked input. XTest delivery itself belongs
+  // to the behavior matrix and is not a prerequisite for trusting the oracle.
+  process.on('SIGUSR2', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'A' });
+    mainWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'A' });
+  });
+}
+
 function createWindow() {
   const fixedTitle = sentinelMode
     ? `CuaTestHarness Sentinel [cdp=${CDP_PORT}]`

@@ -151,6 +151,10 @@ pub fn background_unavailable_error(
     ))
     .with_structured(serde_json::json!({
         "code": reason.code(),
+        "phase": "preflight",
+        "retryable": false,
+        "effect": "refused",
+        "dispatch_scope": "target",
         "detail": detail,
         "suggestion": "Retry this action with delivery_mode:\"foreground\".",
         "escalation": {
@@ -229,6 +233,22 @@ mod tests {
         assert_eq!(
             r.structured_content.as_ref().unwrap()["code"],
             serde_json::json!("background_unavailable")
+        );
+        assert_eq!(
+            r.structured_content.as_ref().unwrap()["phase"],
+            serde_json::json!("preflight")
+        );
+        assert_eq!(
+            r.structured_content.as_ref().unwrap()["retryable"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            r.structured_content.as_ref().unwrap()["effect"],
+            serde_json::json!("refused")
+        );
+        assert_eq!(
+            r.structured_content.as_ref().unwrap()["dispatch_scope"],
+            serde_json::json!("target")
         );
         let text = match &r.content[0] {
             cua_driver_core::protocol::Content::Text { text, .. } => text,

@@ -45,6 +45,104 @@ pub async fn evaluate_targeted(
     Ok(format_cdp_result(&response))
 }
 
+/// Evaluate in the only page exposed by a debugging endpoint.
+///
+/// Generic window-scoped input does not carry a browser tab capability. It
+/// may therefore use CDP only when the endpoint exposes exactly one page;
+/// choosing the first of several pages could mutate the wrong tab.
+pub async fn evaluate_unique_page(
+    port: u16,
+    expression: &str,
+    await_promise: bool,
+) -> anyhow::Result<String> {
+    let pages = tokio::time::timeout(std::time::Duration::from_secs(10), cdp_wait_for_page(port))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("CDP /json discovery on port {port} timed out after 10 s")
+        })??;
+    let page = unique_page(&pages).map_err(|error| {
+        anyhow::anyhow!(
+            "CDP endpoint on port {port} cannot prove exact window-to-tab ownership: {error}"
+        )
+    })?;
+    let ws_url = page
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Page has no webSocketDebuggerUrl"))?;
+    let connection = legacy_pool().get(ws_url).await?;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        connection.call(
+            None,
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": expression,
+                "userGesture": true,
+                "awaitPromise": await_promise
+            }),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("CDP evaluate timed out after 30 s"))??;
+    Ok(format_cdp_result(&serde_json::json!({ "result": result })))
+}
+
+/// Insert text into the focused editable of the only page on an endpoint.
+///
+/// Window-scoped `type_text` has no tab capability, so this route is admitted
+/// only when CDP exposes exactly one page. The editable preflight and input
+/// dispatch share one page connection; multi-page endpoints fail closed.
+pub async fn insert_text_unique_page(port: u16, text: &str) -> anyhow::Result<()> {
+    let pages = tokio::time::timeout(std::time::Duration::from_secs(10), cdp_wait_for_page(port))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("CDP /json discovery on port {port} timed out after 10 s")
+        })??;
+    let page = unique_page(&pages).map_err(|error| {
+        anyhow::anyhow!(
+            "CDP endpoint on port {port} cannot prove exact window-to-tab ownership: {error}"
+        )
+    })?;
+    let ws_url = page
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Page has no webSocketDebuggerUrl"))?;
+    let connection = legacy_pool().get(ws_url).await?;
+    let focused = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        connection.call(
+            None,
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": "(() => { const e = document.activeElement; return !!e && (e instanceof HTMLInputElement || e instanceof HTMLTextAreaElement || e.isContentEditable); })()",
+                "returnByValue": true,
+                "userGesture": true
+            }),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("CDP focused-editable preflight timed out after 10 s"))??;
+    if focused
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        anyhow::bail!("the unique CDP page has no focused editable element");
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        connection.call(
+            None,
+            "Input.insertText",
+            serde_json::json!({ "text": text }),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("CDP Input.insertText timed out after 10 s"))??;
+    Ok(())
+}
+
 // ── High-level evaluate ───────────────────────────────────────────────────
 
 async fn cdp_evaluate(
@@ -105,6 +203,16 @@ fn pick_page<'a>(pages: &'a [Value], hint: Option<&str>) -> Option<&'a Value> {
             }
             Some(page)
         }
+    }
+}
+
+fn unique_page(pages: &[Value]) -> anyhow::Result<&Value> {
+    match pages {
+        [page] => Ok(page),
+        pages => anyhow::bail!(
+            "CDP endpoint does not expose exactly one page (observed {})",
+            pages.len()
+        ),
     }
 }
 
@@ -237,7 +345,7 @@ async fn cdp_list_pages(port: u16) -> anyhow::Result<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{evaluate, format_cdp_result, pick_page};
+    use super::{evaluate, format_cdp_result, insert_text_unique_page, pick_page, unique_page};
     use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -260,6 +368,17 @@ mod tests {
         );
         assert!(pick_page(&pages, Some("#missing")).is_none());
         assert!(pick_page(&pages, Some("app://fixture/")).is_none());
+    }
+
+    #[test]
+    fn unique_page_refuses_zero_or_multiple_pages_instead_of_guessing() {
+        let page = serde_json::json!({"type": "page"});
+        assert!(unique_page(&[]).is_err());
+        assert!(std::ptr::eq(
+            unique_page(std::slice::from_ref(&page)).unwrap(),
+            &page
+        ));
+        assert!(unique_page(&[page.clone(), page]).is_err());
     }
 
     #[test]
@@ -343,6 +462,63 @@ mod tests {
         });
 
         assert_eq!(evaluate(port, "1 + 1", true).await.unwrap(), "\"compat\"");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unique_page_text_insert_preflights_focus_and_uses_cdp_input() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut http, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = http.read(&mut request).await.unwrap();
+            let body = json!([{
+                "type": "page",
+                "url": "app://fixture/",
+                "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/type")
+            }])
+            .to_string();
+            http.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            for (expected_method, response) in [
+                (
+                    "Runtime.evaluate",
+                    json!({ "result": { "type": "boolean", "value": true } }),
+                ),
+                ("Input.insertText", json!({})),
+            ] {
+                let Message::Text(text) = websocket.next().await.unwrap().unwrap() else {
+                    panic!("expected {expected_method} request")
+                };
+                let call: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(call["method"], expected_method);
+                if expected_method == "Input.insertText" {
+                    assert_eq!(call["params"]["text"], "typed");
+                }
+                websocket
+                    .send(Message::Text(
+                        json!({ "id": call["id"], "result": response }).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        insert_text_unique_page(port, "typed").await.unwrap();
         server.await.unwrap();
     }
 }
