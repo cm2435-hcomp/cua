@@ -168,3 +168,18 @@ def test_release_installers_do_not_target_local_product_artifacts() -> None:
         assert "CuaDriverLocal" not in script
         assert ".cua-driver-local" not in script
         assert "cua-driver-local-serve" not in script
+
+
+def test_linux_release_and_local_installs_ship_the_x11_restore_helper() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    scripts_dir = repo_root / "libs/cua-driver/scripts"
+    local = (scripts_dir / "_install-local-rust.sh").read_text()
+    release = (scripts_dir / "_install-rust.sh").read_text()
+    workflow = (repo_root / ".github/workflows/cd-rust-cua-driver.yml").read_text()
+
+    assert 'SOURCE_X11_HELPER="$REPO_ROOT/../x11-helper"' in local
+    assert 'STAGED_X11_HELPER="$VERSIONED_DIR/x11-helper"' in local
+    assert 'SRC_X11_HELPER="$TMP_DIR/x11-helper"' in release
+    assert 'mkdir -p "$VERSIONED_DIR/x11-helper"' in release
+    assert 'cp -R ../x11-helper "release/${STAGE}/x11-helper"' in workflow
+    assert "cua_driver_abi.h wayland-helper x11-helper" in workflow

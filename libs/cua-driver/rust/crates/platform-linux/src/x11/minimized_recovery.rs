@@ -286,11 +286,25 @@ fn first_u32(raw: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    const HELPER_SOURCE: &str =
+        include_str!("../../../../../x11-helper/winrestore@cua/extension.js");
+    const HELPER_METADATA: &str =
+        include_str!("../../../../../x11-helper/winrestore@cua/metadata.json");
+
     #[test]
     fn dbus_scalar_parsers_are_exact() {
         assert_eq!(quoted("(':1.42',)"), Some(":1.42".to_owned()));
         assert_eq!(first_u32("(uint32 157360,)"), Some(157360));
         assert_eq!(quoted("(nothing,)"), None);
+    }
+
+    #[test]
+    fn bundled_helper_requires_exact_pid_xid_and_title() {
+        assert!(HELPER_SOURCE.contains("RestoreAsync([pid, xid, title], invocation)"));
+        assert!(HELPER_SOURCE.contains("xWindowId(window) === xid"));
+        assert!(HELPER_SOURCE.contains("global.display.focus_window === focusedBefore"));
+        assert!(!HELPER_SOURCE.contains("GetWindows"));
+        assert!(HELPER_METADATA.contains("\"version\": 2"));
     }
 
     #[test]
