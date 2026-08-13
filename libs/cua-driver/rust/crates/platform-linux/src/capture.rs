@@ -1,9 +1,14 @@
 //! Window screenshot on Linux.
 //!
-//! Strategy (in order of preference) for per-window X11 capture:
+//! Exact per-window X11 capture first names the target's XComposite backing
+//! pixmap, then reads that one occlusion-independent drawable with:
 //! 1. Persistent MIT-SHM (`shm_get_image`) via x11rb — warm path, no subprocess
 //! 2. Persistent plain `XGetImage` via x11rb — still in-process
-//! 3. `import -window <xid> png:-` (ImageMagick compatibility fallback)
+//!
+//! Direct-window and ImageMagick grabs are not exact-window fallbacks: on a
+//! covered X11 window they can return the unrelated pixels currently covering
+//! the target's screen rectangle. If XComposite cannot provide a named pixmap,
+//! the observation fails instead of publishing plausible but wrong pixels.
 //!
 //! Main-display capture keeps its own dispatch (Wayland cascade → ImageMagick →
 //! root `XGetImage`). Wayland-native per-window paths are not routed into XShm.
@@ -24,7 +29,9 @@ use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection as _;
-use x11rb::protocol::xproto::{Format, ImageOrder, Setup, VisualClass, Visualtype};
+use x11rb::protocol::xproto::{
+    Format, GetGeometryReply, ImageOrder, Pixmap, Setup, VisualClass, Visualtype, Window,
+};
 
 /// Max edge length accepted for a single SHM/XGetImage capture (px).
 const MAX_CAPTURE_DIM: u32 = 16_384;
@@ -36,12 +43,9 @@ const XSHM_INIT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Capture a window by X11 XID. Returns raw PNG bytes.
 pub fn screenshot_window_bytes(xid: u64) -> Result<Vec<u8>> {
-    capture_window_with_backends(
-        xid,
-        capture_via_xshm,
-        capture_via_persistent_xgetimage,
-        capture_via_import,
-    )
+    with_named_window_pixmap(xid, |drawable| {
+        capture_window_with_backends(drawable, capture_via_xshm, capture_via_persistent_xgetimage)
+    })
 }
 
 /// Capture a window by X11 XID. Returns (base64_png, width, height).
@@ -54,38 +58,32 @@ pub fn screenshot_window(xid: u64) -> Result<(String, u32, u32)> {
 /// Ordered window-capture backend cascade.
 ///
 /// Non-empty XShm success returns immediately; otherwise try non-empty
-/// XGetImage; otherwise ImageMagick. If all fail or return empty, the final
-/// error preserves all three contexts. Closures are `FnOnce` only (no
+/// XGetImage on the same named pixmap. If both fail or return empty, the final
+/// error preserves both contexts. Closures are `FnOnce` only (no
 /// `Send`/`Sync` bounds) so unit tests can drive them with `Rc`/`Cell`.
 fn capture_window_with_backends(
-    xid: u64,
-    xshm: impl FnOnce(u64) -> Result<Vec<u8>>,
-    xgetimage: impl FnOnce(u64) -> Result<Vec<u8>>,
-    imagemagick: impl FnOnce(u64) -> Result<Vec<u8>>,
+    drawable: ExactCaptureDrawable,
+    xshm: impl FnOnce(ExactCaptureDrawable) -> Result<Vec<u8>>,
+    xgetimage: impl FnOnce(ExactCaptureDrawable) -> Result<Vec<u8>>,
 ) -> Result<Vec<u8>> {
-    let xshm_err = match xshm(xid) {
+    let xshm_err = match xshm(drawable) {
         Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
         Ok(_) => "XShm returned empty image".to_string(),
         Err(e) => format!("{e:#}"),
     };
 
-    let xgetimage_err = match xgetimage(xid) {
+    let xgetimage_err = match xgetimage(drawable) {
         Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
         Ok(_) => "XGetImage returned empty image".to_string(),
         Err(e) => format!("{e:#}"),
     };
 
-    let imagemagick_err = match imagemagick(xid) {
-        Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
-        Ok(_) => "ImageMagick returned empty image".to_string(),
-        Err(e) => format!("{e:#}"),
-    };
-
     Err(anyhow!(
-        "all Linux window capture backends failed\n- XShm: {xshm_err}\n- XGetImage: {xgetimage_err}\n- ImageMagick: {imagemagick_err}"
+        "all exact XComposite drawable readers failed\n- XShm: {xshm_err}\n- XGetImage: {xgetimage_err}"
     ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn capture_via_import(xid: u64) -> Result<Vec<u8>> {
     let out = Command::new("import")
         .args(["-window", &xid.to_string(), "png:-"])
@@ -299,6 +297,291 @@ fn current_display() -> String {
 
 fn lock_mutex<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+// ── persistent XComposite exact-window source ────────────────────────────
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactDrawableGeometry {
+    width: u16,
+    height: u16,
+    depth: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactCaptureDrawable {
+    xid: u64,
+    visual_id: u32,
+}
+
+impl From<&GetGeometryReply> for ExactDrawableGeometry {
+    fn from(reply: &GetGeometryReply) -> Self {
+        Self {
+            width: reply.width,
+            height: reply.height,
+            depth: reply.depth,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RedirectOwnership {
+    Existing,
+    TemporaryAutomatic,
+}
+
+struct XCompositeSession {
+    display: String,
+    conn: x11rb::rust_connection::RustConnection,
+}
+
+struct NamedWindowPixmap<'a> {
+    conn: &'a x11rb::rust_connection::RustConnection,
+    target: Window,
+    pixmap: Pixmap,
+    target_geometry: ExactDrawableGeometry,
+    target_visual: u32,
+    pixmap_live: bool,
+    redirect_live: bool,
+}
+
+fn xcomposite_state() -> &'static Mutex<Option<XCompositeSession>> {
+    static STATE: OnceLock<Mutex<Option<XCompositeSession>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn ensure_xcomposite_ready(guard: &mut Option<XCompositeSession>, display: &str) -> Result<()> {
+    if guard
+        .as_ref()
+        .is_some_and(|session| session.display == display)
+    {
+        return Ok(());
+    }
+    *guard = Some(XCompositeSession::connect(display.to_string())?);
+    Ok(())
+}
+
+impl XCompositeSession {
+    fn connect(display: String) -> Result<Self> {
+        use x11rb::protocol::composite::ConnectionExt as _;
+
+        let (conn, _) = x11rb::rust_connection::RustConnection::connect(Some(&display))
+            .map_err(|e| anyhow!("X11 connect for XComposite: {e}"))?;
+        let version = conn
+            .composite_query_version(0, 4)
+            .map_err(|e| anyhow!("XComposite QueryVersion request: {e}"))?
+            .reply()
+            .map_err(|e| anyhow!("XComposite QueryVersion reply: {e}"))?;
+        if version.major_version == 0 && version.minor_version < 2 {
+            bail!(
+                "XComposite {}.{} cannot name window pixmaps (requires >= 0.2)",
+                version.major_version,
+                version.minor_version
+            );
+        }
+        Ok(Self { display, conn })
+    }
+
+    fn geometry(&self, drawable: u32, label: &str) -> Result<ExactDrawableGeometry> {
+        use x11rb::protocol::xproto::ConnectionExt as _;
+
+        let reply = self
+            .conn
+            .get_geometry(drawable)
+            .map_err(|e| anyhow!("{label} GetGeometry request for 0x{drawable:x}: {e}"))?
+            .reply()
+            .map_err(|e| anyhow!("{label} GetGeometry reply for 0x{drawable:x}: {e}"))?;
+        Ok(ExactDrawableGeometry::from(&reply))
+    }
+
+    fn name_window_pixmap(&self, target: Window) -> Result<NamedWindowPixmap<'_>> {
+        use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
+        use x11rb::protocol::xproto::ConnectionExt as _;
+
+        let target_geometry = self.geometry(target, "target window")?;
+        let target_visual = self
+            .conn
+            .get_window_attributes(target)
+            .map_err(|e| anyhow!("target GetWindowAttributes request for 0x{target:x}: {e}"))?
+            .reply()
+            .map_err(|e| anyhow!("target GetWindowAttributes reply for 0x{target:x}: {e}"))?
+            .visual;
+        checked_capture_dimensions(
+            u32::from(target_geometry.width),
+            u32::from(target_geometry.height),
+        )?;
+        let mut pixmap = self
+            .conn
+            .generate_id()
+            .map_err(|e| anyhow!("generate XComposite named-pixmap id: {e}"))?;
+
+        let existing_name = self
+            .conn
+            .composite_name_window_pixmap(target, pixmap)
+            .map_err(|e| anyhow!("XComposite NameWindowPixmap request: {e}"))?
+            .check();
+
+        let redirect = match existing_name {
+            Ok(()) => RedirectOwnership::Existing,
+            Err(existing_error) => {
+                self.conn
+                    .composite_redirect_window(target, Redirect::AUTOMATIC)
+                    .map_err(|e| {
+                        anyhow!(
+                            "XComposite automatic RedirectWindow request after existing-redirection naming failed ({existing_error}): {e}"
+                        )
+                    })?
+                    .check()
+                    .map_err(|e| {
+                        anyhow!(
+                            "XComposite automatic RedirectWindow reply after existing-redirection naming failed ({existing_error}): {e}"
+                        )
+                    })?;
+                // A failed NameWindowPixmap request consumes the generated
+                // resource id from x11rb's client-side allocator. Retry with a
+                // fresh id after redirection rather than reusing that request's
+                // failed output id.
+                pixmap = self
+                    .conn
+                    .generate_id()
+                    .map_err(|e| anyhow!("generate redirected XComposite pixmap id: {e}"))?;
+                if let Err(second_error) = self
+                    .conn
+                    .composite_name_window_pixmap(target, pixmap)
+                    .map_err(|e| anyhow!("XComposite NameWindowPixmap retry request: {e}"))?
+                    .check()
+                {
+                    if let Ok(cookie) = self
+                        .conn
+                        .composite_unredirect_window(target, Redirect::AUTOMATIC)
+                    {
+                        let _ = cookie.check();
+                    }
+                    bail!(
+                        "XComposite NameWindowPixmap for target 0x{target:x} failed before and after owned automatic redirect using pixmap 0x{pixmap:x} (first: {existing_error}; second: {second_error})"
+                    );
+                }
+                RedirectOwnership::TemporaryAutomatic
+            }
+        };
+
+        Ok(NamedWindowPixmap {
+            conn: &self.conn,
+            target,
+            pixmap,
+            target_geometry,
+            target_visual,
+            pixmap_live: true,
+            redirect_live: redirect == RedirectOwnership::TemporaryAutomatic,
+        })
+    }
+}
+
+impl NamedWindowPixmap<'_> {
+    fn release_parts(&mut self) -> Vec<String> {
+        use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
+        use x11rb::protocol::xproto::ConnectionExt as _;
+
+        let mut errors = Vec::new();
+        if self.pixmap_live {
+            match self.conn.free_pixmap(self.pixmap) {
+                Ok(cookie) => match cookie.check() {
+                    Ok(()) => self.pixmap_live = false,
+                    Err(error) => errors.push(format!(
+                        "FreePixmap reply for XComposite pixmap 0x{:x}: {error}",
+                        self.pixmap
+                    )),
+                },
+                Err(error) => errors.push(format!(
+                    "FreePixmap request for XComposite pixmap 0x{:x}: {error}",
+                    self.pixmap
+                )),
+            }
+        }
+        if self.redirect_live {
+            match self
+                .conn
+                .composite_unredirect_window(self.target, Redirect::AUTOMATIC)
+            {
+                Ok(cookie) => match cookie.check() {
+                    Ok(()) => self.redirect_live = false,
+                    Err(error) => errors.push(format!(
+                        "XComposite UnredirectWindow reply for target 0x{:x}: {error}",
+                        self.target
+                    )),
+                },
+                Err(error) => errors.push(format!(
+                    "XComposite UnredirectWindow request for target 0x{:x}: {error}",
+                    self.target
+                )),
+            }
+        }
+        errors
+    }
+
+    fn release(mut self) -> Result<()> {
+        let errors = self.release_parts();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("XComposite capture cleanup failed: {}", errors.join("; "))
+        }
+    }
+}
+
+impl Drop for NamedWindowPixmap<'_> {
+    fn drop(&mut self) {
+        let _ = self.release_parts();
+    }
+}
+
+fn with_named_window_pixmap<T>(
+    xid: u64,
+    capture: impl FnOnce(ExactCaptureDrawable) -> Result<T>,
+) -> Result<T> {
+    let target = xid_to_window(xid)?;
+    let display = current_display();
+    let mut guard = lock_mutex(xcomposite_state());
+    ensure_xcomposite_ready(&mut guard, &display)
+        .map_err(|e| anyhow!("exact XComposite source unavailable for DISPLAY={display}: {e:#}"))?;
+    let session = guard
+        .as_ref()
+        .ok_or_else(|| anyhow!("internal: XComposite session missing after initialization"))?;
+    let source = session.name_window_pixmap(target)?;
+    let pixmap_geometry = session.geometry(source.pixmap, "named pixmap")?;
+
+    let operation = if pixmap_geometry != source.target_geometry {
+        Err(anyhow!(
+            "XComposite named pixmap geometry {:?} does not match target window geometry {:?}",
+            pixmap_geometry,
+            source.target_geometry
+        ))
+    } else {
+        capture(ExactCaptureDrawable {
+            xid: u64::from(source.pixmap),
+            visual_id: source.target_visual,
+        })
+        .and_then(|value| {
+            let target_after = session.geometry(target, "post-capture target window")?;
+            if target_after != source.target_geometry {
+                bail!(
+                    "target window geometry raced during capture: before {:?}, after {:?}",
+                    source.target_geometry,
+                    target_after
+                );
+            }
+            Ok(value)
+        })
+    };
+    let cleanup = source.release();
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(anyhow!(
+            "exact XComposite capture failed ({error:#}); cleanup also failed ({cleanup_error:#})"
+        )),
+    }
 }
 
 // ── persistent MIT-SHM session ────────────────────────────────────────────
@@ -522,7 +805,16 @@ impl XShmSession {
     }
 
     /// Geometry + SHM request/reply + copy into owned Vec. Caller encodes off-lock.
+    #[cfg(test)]
     fn capture_raw(&mut self, xid: u64) -> Result<RawFrame> {
+        self.capture_raw_with_visual(xid, None)
+    }
+
+    fn capture_raw_with_visual(
+        &mut self,
+        xid: u64,
+        expected_visual: Option<u32>,
+    ) -> Result<RawFrame> {
         use x11rb::protocol::shm::ConnectionExt as _;
         use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
 
@@ -593,11 +885,12 @@ impl XShmSession {
                 .ok_or_else(|| anyhow!("SHM buffer missing after get_image"))?;
             buf.map[..size].to_vec()
         };
+        let visual = exact_capture_visual(reply.visual, expected_visual)?;
         Ok(RawFrame {
             data,
             w,
             h,
-            decoder: self.pixels.decoder(w, h, reply.depth, reply.visual)?,
+            decoder: self.pixels.decoder(w, h, reply.depth, visual)?,
         })
     }
 }
@@ -614,17 +907,43 @@ fn xshm_state() -> &'static Mutex<XShmState> {
     STATE.get_or_init(|| Mutex::new(XShmState::Uninit))
 }
 
-fn capture_via_xshm(xid: u64) -> Result<Vec<u8>> {
+fn exact_capture_visual(reply_visual: u32, expected_visual: Option<u32>) -> Result<u32> {
+    match (reply_visual, expected_visual) {
+        (0, Some(expected)) => Ok(expected),
+        (0, None) => bail!("X11 image reply omitted visual id without an exact target visual"),
+        (actual, Some(expected)) if actual != expected => {
+            bail!("X11 image visual 0x{actual:x} does not match exact target visual 0x{expected:x}")
+        }
+        (actual, _) => Ok(actual),
+    }
+}
+
+fn capture_via_xshm(drawable: ExactCaptureDrawable) -> Result<Vec<u8>> {
     let display = current_display();
     let mut guard = lock_mutex(xshm_state());
-    let frame = capture_raw_via_xshm_state(&mut guard, &display, xid)?;
+    let frame = capture_raw_via_xshm_state_with_visual(
+        &mut guard,
+        &display,
+        drawable.xid,
+        Some(drawable.visual_id),
+    )?;
 
     // Release the session mutex before pixel conversion and PNG encode.
     drop(guard);
     packed_zpixmap_to_png(&frame.data, frame.w, frame.h, frame.decoder)
 }
 
+#[cfg(test)]
 fn capture_raw_via_xshm_state(guard: &mut XShmState, display: &str, xid: u64) -> Result<RawFrame> {
+    capture_raw_via_xshm_state_with_visual(guard, display, xid, None)
+}
+
+fn capture_raw_via_xshm_state_with_visual(
+    guard: &mut XShmState,
+    display: &str,
+    xid: u64,
+    expected_visual: Option<u32>,
+) -> Result<RawFrame> {
     // Init backoff for this DISPLAY — no per-frame reprobe while active.
     // Expired same-DISPLAY / different-DISPLAY Unsupported → Uninit (probeable).
     if let Err(reason) = guard.consume_init_backoff(display, Instant::now()) {
@@ -651,7 +970,7 @@ fn capture_raw_via_xshm_state(guard: &mut XShmState, display: &str, xid: u64) ->
             XShmState::Ready(session) => session,
             _ => bail!("internal: XShm state not Ready after ensure"),
         };
-        session.capture_raw(xid)
+        session.capture_raw_with_visual(xid, expected_visual)
     };
 
     match first {
@@ -668,7 +987,7 @@ fn capture_raw_via_xshm_state(guard: &mut XShmState, display: &str, xid: u64) ->
                             return Err(anyhow!("internal: XShm not Ready after reconnect"));
                         }
                     };
-                    session.capture_raw(xid)
+                    session.capture_raw_with_visual(xid, expected_visual)
                 }
                 Err(e) => Err(e),
             };
@@ -719,7 +1038,7 @@ fn xgetimage_state() -> &'static Mutex<Option<XGetImageSession>> {
     STATE.get_or_init(|| Mutex::new(None))
 }
 
-fn capture_via_persistent_xgetimage(xid: u64) -> Result<Vec<u8>> {
+fn capture_via_persistent_xgetimage(drawable: ExactCaptureDrawable) -> Result<Vec<u8>> {
     let display = current_display();
     let mut guard = lock_mutex(xgetimage_state());
 
@@ -727,7 +1046,7 @@ fn capture_via_persistent_xgetimage(xid: u64) -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("XGetImage connect: {e:#}"))?;
 
     let first = match guard.as_mut() {
-        Some(session) => session.capture_raw(xid),
+        Some(session) => session.capture_raw_with_visual(drawable.xid, Some(drawable.visual_id)),
         None => Err(anyhow!("internal: XGetImage session missing after ensure")),
     };
 
@@ -739,9 +1058,11 @@ fn capture_via_persistent_xgetimage(xid: u64) -> Result<Vec<u8>> {
             ensure_xgetimage_ready(&mut guard, &display)
                 .map_err(|e| anyhow!("XGetImage reconnect after error ({first_err:#}): {e:#}"))?;
             match guard.as_mut() {
-                Some(session) => session.capture_raw(xid).map_err(|e| {
-                    anyhow!("XGetImage failed after reconnect (first: {first_err:#}): {e:#}")
-                })?,
+                Some(session) => session
+                    .capture_raw_with_visual(drawable.xid, Some(drawable.visual_id))
+                    .map_err(|e| {
+                        anyhow!("XGetImage failed after reconnect (first: {first_err:#}): {e:#}")
+                    })?,
                 None => {
                     bail!("XGetImage session missing after reconnect (first: {first_err:#})")
                 }
@@ -776,7 +1097,16 @@ impl XGetImageSession {
         })
     }
 
+    #[cfg(test)]
     fn capture_raw(&mut self, xid: u64) -> Result<RawFrame> {
+        self.capture_raw_with_visual(xid, None)
+    }
+
+    fn capture_raw_with_visual(
+        &mut self,
+        xid: u64,
+        expected_visual: Option<u32>,
+    ) -> Result<RawFrame> {
         use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
 
         let window = xid_to_window(xid)?;
@@ -819,11 +1149,12 @@ impl XGetImageSession {
             );
         }
 
+        let visual = exact_capture_visual(img.visual, expected_visual)?;
         Ok(RawFrame {
             data: img.data,
             w,
             h,
-            decoder: self.pixels.decoder(w, h, img.depth, img.visual)?,
+            decoder: self.pixels.decoder(w, h, img.depth, visual)?,
         })
     }
 }
@@ -1217,59 +1548,68 @@ mod tests {
 
         let xshm_calls = Rc::new(Cell::new(0u32));
         let xgetimage_calls = Rc::new(Cell::new(0u32));
-        let imagemagick_calls = Rc::new(Cell::new(0u32));
 
         let xshm_calls_c = Rc::clone(&xshm_calls);
         let xgetimage_calls_c = Rc::clone(&xgetimage_calls);
-        let imagemagick_calls_c = Rc::clone(&imagemagick_calls);
         let png_ret = png.clone();
 
         let result = capture_window_with_backends(
-            42,
-            move |xid| {
+            ExactCaptureDrawable {
+                xid: 42,
+                visual_id: 7,
+            },
+            move |drawable| {
                 xshm_calls_c.set(xshm_calls_c.get() + 1);
-                assert_eq!(xid, 42);
+                assert_eq!(
+                    drawable,
+                    ExactCaptureDrawable {
+                        xid: 42,
+                        visual_id: 7,
+                    }
+                );
                 Ok(png_ret)
             },
             move |_xid| {
                 xgetimage_calls_c.set(xgetimage_calls_c.get() + 1);
                 Err(anyhow::anyhow!("XGetImage must not be invoked"))
             },
-            move |_xid| {
-                imagemagick_calls_c.set(imagemagick_calls_c.get() + 1);
-                Err(anyhow::anyhow!("ImageMagick must not be invoked"))
-            },
         );
 
         assert_eq!(result.expect("xshm success"), png);
         assert_eq!(xshm_calls.get(), 1);
         assert_eq!(xgetimage_calls.get(), 0);
-        assert_eq!(imagemagick_calls.get(), 0);
     }
 
     #[test]
     fn capture_cascade_preserves_every_backend_error() {
         let err = capture_window_with_backends(
-            42,
+            ExactCaptureDrawable {
+                xid: 42,
+                visual_id: 7,
+            },
             |_| Err(anyhow!("shm transport disconnected")),
             |_| Err(anyhow!("get-image bad drawable")),
-            |_| Err(anyhow!("import executable unavailable")),
         )
         .expect_err("all failures must be returned");
         let message = format!("{err:#}");
         assert!(message.contains("shm transport disconnected"));
         assert!(message.contains("get-image bad drawable"));
-        assert!(message.contains("import executable unavailable"));
     }
 
     #[test]
-    fn empty_fast_paths_fall_through_to_imagemagick() {
+    fn empty_xshm_falls_through_to_xgetimage_on_the_same_drawable() {
         let png = vec![1, 2, 3];
         let result = capture_window_with_backends(
-            42,
+            ExactCaptureDrawable {
+                xid: 42,
+                visual_id: 7,
+            },
             |_| Ok(Vec::new()),
-            |_| Ok(Vec::new()),
-            |_| Ok(png.clone()),
+            |drawable| {
+                assert_eq!(drawable.xid, 42);
+                assert_eq!(drawable.visual_id, 7);
+                Ok(png.clone())
+            },
         )
         .expect("fallback succeeds");
         assert_eq!(result, png);
@@ -1346,7 +1686,11 @@ mod tests {
             0,
             WindowClass::INPUT_OUTPUT,
             screen.root_visual,
-            &CreateWindowAux::new().background_pixel(0x0011_2233),
+            &CreateWindowAux::new()
+                .background_pixel(0x0011_2233)
+                // Live capture fixtures must become viewable synchronously
+                // even when the test runs inside a managed desktop session.
+                .override_redirect(1),
         )
         .expect("create_window request")
         .check()
@@ -1418,6 +1762,41 @@ mod tests {
             .expect("fixture sync reply");
     }
 
+    fn paint_live_fixture_solid(fixture: &LiveFixture, width: u16, height: u16, pixel: u32) {
+        use x11rb::protocol::xproto::{ConnectionExt as _, CreateGCAux, Rectangle};
+
+        let gc = fixture.conn.generate_id().expect("generate solid GC id");
+        fixture
+            .conn
+            .create_gc(gc, fixture.window, &CreateGCAux::new().foreground(pixel))
+            .expect("create solid GC request")
+            .check()
+            .expect("create solid GC reply");
+        fixture
+            .conn
+            .poly_fill_rectangle(
+                fixture.window,
+                gc,
+                &[Rectangle {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }],
+            )
+            .expect("paint solid fixture request")
+            .check()
+            .expect("paint solid fixture reply");
+        fixture.conn.free_gc(gc).expect("free solid GC request");
+        fixture.conn.flush().expect("flush solid fixture paint");
+        fixture
+            .conn
+            .get_input_focus()
+            .expect("solid fixture sync request")
+            .reply()
+            .expect("solid fixture sync reply");
+    }
+
     fn raw_frame_png(frame: RawFrame) -> Vec<u8> {
         packed_zpixmap_to_png(&frame.data, frame.w, frame.h, frame.decoder)
             .expect("encode raw frame")
@@ -1426,6 +1805,153 @@ mod tests {
     fn percentile_micros(samples: &mut [u128], percentile: usize) -> u128 {
         samples.sort_unstable();
         samples[(samples.len() - 1) * percentile / 100]
+    }
+
+    /// Exact-window capture must read the target's redirected backing pixmap,
+    /// not the root pixels currently covering its screen rectangle.
+    #[test]
+    #[ignore = "requires a live X11 server with XComposite and MIT-SHM"]
+    fn live_xcomposite_preserves_occluded_window_pixels() {
+        use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
+        use x11rb::protocol::xproto::{
+            ConfigureWindowAux, ConnectionExt as _, MapState, StackMode,
+        };
+
+        const WIDTH: u16 = 173;
+        const HEIGHT: u16 = 97;
+        const COVER_PIXEL: u32 = 0x00e2_b124;
+
+        let display = std::env::var("DISPLAY").expect("DISPLAY must be set");
+        let background = create_live_fixture(&display, WIDTH, HEIGHT);
+
+        // Mimic a compositor that already owns automatic redirection. Repaint
+        // after redirect so the named pixmap has a deterministic complete frame.
+        background
+            .conn
+            .composite_redirect_window(background.window, Redirect::AUTOMATIC)
+            .expect("compositor redirect request")
+            .check()
+            .expect("compositor redirect reply");
+        paint_live_fixture(&background, WIDTH, HEIGHT);
+        let expected = screenshot_window_bytes(u64::from(background.window))
+            .expect("baseline exact-window capture");
+
+        let cover = create_live_fixture(&display, WIDTH, HEIGHT);
+        paint_live_fixture_solid(&cover, WIDTH, HEIGHT, COVER_PIXEL);
+        cover
+            .conn
+            .configure_window(
+                cover.window,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )
+            .expect("raise cover request")
+            .check()
+            .expect("raise cover reply");
+        cover.conn.flush().expect("flush cover raise");
+        cover
+            .conn
+            .get_input_focus()
+            .expect("cover stack sync request")
+            .reply()
+            .expect("cover stack sync reply");
+
+        // Positive control: both windows are viewable direct children of the
+        // root, and X11 stacking places the differently colored cover above
+        // the target. QueryTree children are bottom-to-top.
+        let root = cover.conn.setup().roots[0].root;
+        for (label, window) in [("background", background.window), ("cover", cover.window)] {
+            let attributes = cover
+                .conn
+                .get_window_attributes(window)
+                .unwrap_or_else(|error| panic!("{label} attributes request: {error}"))
+                .reply()
+                .unwrap_or_else(|error| panic!("{label} attributes reply: {error}"));
+            assert_eq!(attributes.map_state, MapState::VIEWABLE, "{label}");
+        }
+        let tree = cover
+            .conn
+            .query_tree(root)
+            .expect("root QueryTree request")
+            .reply()
+            .expect("root QueryTree reply");
+        let background_stack = tree
+            .children
+            .iter()
+            .position(|window| *window == background.window)
+            .expect("background in root stack");
+        let cover_stack = tree
+            .children
+            .iter()
+            .position(|window| *window == cover.window)
+            .expect("cover in root stack");
+        assert!(
+            cover_stack > background_stack,
+            "cover must be stacked above background"
+        );
+        let cover_png = screenshot_window_bytes(u64::from(cover.window))
+            .expect("cover exact-window positive control");
+        let cover_rgba = decode_png_rgba(&cover_png);
+        assert_eq!(&cover_rgba[0..4], &[0xe2, 0xb1, 0x24, 0xff]);
+
+        let covered = screenshot_window_bytes(u64::from(background.window))
+            .expect("covered exact-window capture");
+        assert_eq!(
+            decode_png_rgba(&covered),
+            decode_png_rgba(&expected),
+            "covered target capture returned the covering window's root pixels"
+        );
+
+        // Production capture must not unredirect a compositor-owned window.
+        let verification_pixmap = background
+            .conn
+            .generate_id()
+            .expect("generate compositor verification pixmap");
+        background
+            .conn
+            .composite_name_window_pixmap(background.window, verification_pixmap)
+            .expect("verify compositor redirect request")
+            .check()
+            .expect("production capture removed compositor-owned redirect");
+        background
+            .conn
+            .free_pixmap(verification_pixmap)
+            .expect("free compositor verification pixmap request")
+            .check()
+            .expect("free compositor verification pixmap reply");
+        background
+            .conn
+            .composite_unredirect_window(background.window, Redirect::AUTOMATIC)
+            .expect("compositor unredirect request")
+            .check()
+            .expect("compositor unredirect reply");
+
+        // On an otherwise unredirected X server the production helper may own
+        // a temporary automatic redirect, but it must release it before return.
+        let cleanup_display = format!(":{}", 200 + std::process::id() % 1000);
+        let mut cleanup_server = XvfbServer::start(&cleanup_display);
+        let temporary = create_live_fixture(&cleanup_display, WIDTH, HEIGHT);
+        let cleanup_session =
+            XCompositeSession::connect(cleanup_display).expect("connect cleanup XComposite");
+        let source = cleanup_session
+            .name_window_pixmap(temporary.window)
+            .expect("temporary-redirect source");
+        assert!(source.redirect_live, "test requires helper-owned redirect");
+        source.release().expect("release temporary redirect source");
+        let stale_pixmap = temporary
+            .conn
+            .generate_id()
+            .expect("generate post-capture pixmap id");
+        let still_redirected = temporary
+            .conn
+            .composite_name_window_pixmap(temporary.window, stale_pixmap)
+            .expect("post-capture NameWindowPixmap request")
+            .check();
+        assert!(
+            still_redirected.is_err(),
+            "temporary automatic redirect leaked after exact capture"
+        );
+        drop(temporary);
+        cleanup_server.stop();
     }
 
     /// Live correctness and bounded-performance evidence against three Xvfb

@@ -1597,46 +1597,62 @@ pub mod linux {
         target: Window,
     ) -> Result<bool, ObserverError> {
         let target_bounds = absolute_bounds(connection, target, root)?;
-        if target_bounds.width <= 4 || target_bounds.height <= 4 {
+        let root_geometry = connection
+            .get_geometry(root)
+            .map_err(x11_error("request X11 root geometry"))?
+            .reply()
+            .map_err(x11_error("read X11 root geometry"))?;
+        let root_bounds = Rectangle {
+            x: 0,
+            y: 0,
+            width: root_geometry.width,
+            height: root_geometry.height,
+        };
+        let Some(visible_bounds) = rectangle_intersection(target_bounds, root_bounds) else {
+            return Ok(false);
+        };
+        if visible_bounds.width <= 4 || visible_bounds.height <= 4 {
             return Ok(false);
         }
-        let mut cover = None;
-        for (x, y) in sample_points(target_bounds) {
+        let mut covers = [0; 5];
+        for (slot, (x, y)) in covers.iter_mut().zip(sample_points(visible_bounds)) {
             let child = connection
                 .translate_coordinates(root, root, x, y)
                 .map_err(x11_error("request X11 occlusion point"))?
                 .reply()
                 .map_err(x11_error("read X11 occlusion point"))?
                 .child;
-            if child == 0 || child == target {
-                return Ok(false);
-            }
-            match cover {
-                Some(expected) if expected != child => return Ok(false),
-                None => cover = Some(child),
-                _ => {}
-            }
+            *slot = child;
         }
-        let Some(cover) = cover else {
-            return Ok(false);
-        };
-        let cover_bounds = absolute_bounds(connection, cover, root)?;
-        Ok(rectangle_fully_contains(cover_bounds, target_bounds, 2))
+        Ok(samples_are_occluded(target, covers))
     }
 
-    fn rectangle_fully_contains(cover: Rectangle, target: Rectangle, tolerance: i32) -> bool {
-        let cover_left = i32::from(cover.x);
-        let cover_top = i32::from(cover.y);
-        let cover_right = cover_left + i32::from(cover.width);
-        let cover_bottom = cover_top + i32::from(cover.height);
-        let target_left = i32::from(target.x);
-        let target_top = i32::from(target.y);
-        let target_right = target_left + i32::from(target.width);
-        let target_bottom = target_top + i32::from(target.height);
-        cover_left <= target_left + tolerance
-            && cover_top <= target_top + tolerance
-            && cover_right >= target_right - tolerance
-            && cover_bottom >= target_bottom - tolerance
+    fn rectangle_intersection(left: Rectangle, right: Rectangle) -> Option<Rectangle> {
+        let left_x = i32::from(left.x);
+        let left_y = i32::from(left.y);
+        let right_x = i32::from(right.x);
+        let right_y = i32::from(right.y);
+        let x1 = left_x.max(right_x);
+        let y1 = left_y.max(right_y);
+        let x2 = (left_x + i32::from(left.width)).min(right_x + i32::from(right.width));
+        let y2 = (left_y + i32::from(left.height)).min(right_y + i32::from(right.height));
+        (x2 > x1 && y2 > y1).then_some(Rectangle {
+            x: x1.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            y: y1.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            width: u16::try_from(x2 - x1).unwrap_or(u16::MAX),
+            height: u16::try_from(y2 - y1).unwrap_or(u16::MAX),
+        })
+    }
+
+    fn samples_are_occluded(target: Window, covers: [Window; 5]) -> bool {
+        // XTranslateCoordinates returns the top-most root child at each point.
+        // Different windows may jointly cover the target (for example a
+        // fullscreen sentinel plus a notification above it). Requiring one
+        // identical child at every point falsely calls the lower target
+        // visible even though none of its sampled surface is exposed.
+        covers
+            .into_iter()
+            .all(|cover| cover != 0 && cover != target)
     }
 
     fn sample_points(bounds: Rectangle) -> [(i16, i16); 5] {
@@ -1704,27 +1720,48 @@ pub mod linux {
         }
 
         #[test]
-        fn x11_partial_overlap_is_not_full_occlusion() {
-            let target = Rectangle {
-                x: 100,
-                y: 100,
-                width: 400,
-                height: 300,
-            };
-            let partial = Rectangle {
-                x: 0,
-                y: 0,
-                width: 350,
-                height: 900,
-            };
-            let full = Rectangle {
-                x: 0,
-                y: 0,
-                width: 1280,
-                height: 900,
-            };
-            assert!(!rectangle_fully_contains(partial, target, 2));
-            assert!(rectangle_fully_contains(full, target, 2));
+        fn x11_occlusion_accepts_distinct_windows_covering_every_sample() {
+            assert!(samples_are_occluded(10, [20, 20, 30, 20, 20]));
+            assert!(!samples_are_occluded(10, [20, 20, 10, 20, 20]));
+            assert!(!samples_are_occluded(10, [20, 20, 0, 20, 20]));
+        }
+
+        #[test]
+        fn x11_occlusion_samples_only_the_on_screen_target_surface() {
+            let visible = rectangle_intersection(
+                Rectangle {
+                    x: 0,
+                    y: 14,
+                    width: 1064,
+                    height: 560,
+                },
+                Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 1024,
+                    height: 768,
+                },
+            )
+            .expect("partially visible target");
+            assert_eq!(
+                (visible.x, visible.y, visible.width, visible.height),
+                (0, 14, 1024, 560)
+            );
+            assert!(rectangle_intersection(
+                Rectangle {
+                    x: 1100,
+                    y: 0,
+                    width: 200,
+                    height: 200,
+                },
+                Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 1024,
+                    height: 768,
+                },
+            )
+            .is_none());
         }
 
         #[test]

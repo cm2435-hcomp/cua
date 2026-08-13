@@ -220,8 +220,18 @@ pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
 /// Set the text value of element `idx` within pid's app tree via AT-SPI.
 /// Tries `EditableText.set_text_contents(value)` first, then
 /// `Value.set_current_value(float)`.
-pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
-    native::set_value(pid, idx, value)
+pub fn set_value(
+    pid: u32,
+    xid: u64,
+    idx: usize,
+    value: &str,
+) -> std::result::Result<(), native::SetValueFailure> {
+    native::set_value(pid, xid, idx, value)
+}
+
+/// Read the exact indexed Text-interface value without changing focus.
+pub fn text_value(pid: u32, idx: usize) -> Result<String> {
+    native::text_value(pid, idx)
 }
 
 /// Insert `text` into a GUI app's editable field via AT-SPI EditableText —

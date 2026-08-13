@@ -24,11 +24,15 @@ function record(kind, details = {}) {
 if (sentinelMode) {
   window.addEventListener('DOMContentLoaded', () => {
     document.body.innerHTML = `
-      <main style="min-height:100vh;background:#146c43;color:white;display:grid;place-content:center;text-align:center;font:24px system-ui">
+      <main id="cua-occlusion-sentinel" tabindex="-1" style="min-height:100vh;background:#146c43;color:white;display:grid;place-content:center;text-align:center;font:24px system-ui">
         <h1 style="font-size:52px;margin:0 0 16px">CUA OCCLUSION SENTINEL</h1>
         <p>CUA_OCCLUSION_SENTINEL_v1</p>
       </main>
     `;
+    // X11 can focus the native BrowserWindow while Chromium has no focused
+    // renderer widget. Make the full-page sentinel the explicit keyboard
+    // owner so a real XTest leak reaches the window-level key listeners.
+    document.getElementById('cua-occlusion-sentinel').focus({ preventScroll: true });
     record('ready');
     // Electron can already own native/DOM focus before this renderer's focus
     // listener is ready. Re-activating an already focused window does not

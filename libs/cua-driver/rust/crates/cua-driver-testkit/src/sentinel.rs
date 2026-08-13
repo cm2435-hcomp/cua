@@ -111,19 +111,19 @@ impl ForegroundSentinel {
             try_activate_native_foreground(driver, target)?;
             // Electron may already be focused before its preload listener is ready.
             // The compositor observation is the authoritative Wayland focus gate.
-            wait_for_native_focus_stable(target);
+            try_wait_for_native_focus_stable(target)?;
         } else {
             wait_for_journal(&journal_path, focus_deadline, r#""kind":"ready""#, "ready");
             try_activate_native_foreground(driver, target)?;
-            wait_for_native_focus_stable(target);
-            // On macOS the Electron renderer can report `document.hasFocus()`
-            // as false at DOMContentLoaded, then become natively focused
-            // without emitting a later DOM `focus` event. Require the setup
-            // click below to reach the WebContents instead: that proves the
-            // renderer is the input target before the journal is reset.
-            #[cfg(not(target_os = "macos"))]
+            try_wait_for_native_focus_stable(target)?;
+            // Electron can report `document.hasFocus()` as false at
+            // DOMContentLoaded, then become natively focused without giving
+            // its WebContents keyboard focus. Require the setup click below
+            // to reach the renderer on macOS and Linux before the journal is
+            // reset. Windows has its own physical-focus setup path.
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             wait_for_journal(&journal_path, focus_deadline, r#""kind":"focus""#, "focus");
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             wait_for_journal(
                 &journal_path,
                 focus_deadline,
@@ -211,6 +211,16 @@ impl ForegroundSentinel {
         wait_for_event(&self.journal_path, "heartbeat", Duration::from_secs(2))?;
         reset_journal(&self.journal_path)?;
 
+        #[cfg(target_os = "linux")]
+        {
+            // Recorder startup may change the native foreground after launch.
+            // Reacquire and click the sentinel now so the desktop-scoped XTest
+            // canary below has one exact, freshly established input owner.
+            try_activate_native_foreground(driver, self.target)?;
+            wait_for_native_focus_stable(self.target);
+            reset_journal(&self.journal_path)?;
+        }
+
         let canary_key = if std::env::var("CUA_E2E_WAYLAND_SESSION")
             .is_ok_and(|session| session == "cua-compositor")
         {
@@ -221,21 +231,7 @@ impl ForegroundSentinel {
         } else {
             "a"
         };
-        let leaked_key = driver.call(
-            "press_key",
-            serde_json::json!({
-                "pid": self.target.pid,
-                "window_id": self.target.native_id,
-                "key": canary_key,
-                "delivery_mode": "foreground",
-            }),
-        );
-        if leaked_key.is_error() {
-            return Err(format!(
-                "foreground input canary could not inject a key: {}",
-                leaked_key.text()
-            ));
-        }
+        inject_foreground_input_canary(driver, self.target, canary_key)?;
         wait_for_event(&self.journal_path, "keydown", Duration::from_secs(2))?;
         let (_, leaked_input_violations) = self.observe();
         if !leaked_input_violations
@@ -326,8 +322,33 @@ impl ForegroundSentinel {
         driver: &mut impl Driver,
         target: TargetWindow,
     ) -> Result<(), String> {
-        activate_native_foreground(driver, self.target);
-        wait_for_native_focus_stable(self.target);
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            let mut last_error = None;
+            for _ in 0..2 {
+                if let Err(error) = try_activate_native_foreground(driver, self.target) {
+                    last_error = Some(error);
+                    continue;
+                }
+                match try_wait_for_native_focus_stable(self.target) {
+                    Ok(()) => {
+                        last_error = None;
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            if let Some(error) = last_error {
+                return Err(format!(
+                    "could not re-establish the foreground sentinel before observation: {error}"
+                ));
+            }
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            activate_native_foreground(driver, self.target);
+            wait_for_native_focus_stable(self.target);
+        }
         std::thread::sleep(Duration::from_millis(100));
         reset_journal(&self.journal_path)?;
         // Windows establishes focus with a physical click. Its DOM `click`
@@ -496,20 +517,58 @@ fn try_activate_native_foreground(
     })?;
     #[cfg(target_os = "windows")]
     physically_focus_windows_sentinel(target);
-    #[cfg(target_os = "macos")]
-    focus_macos_sentinel_contents(driver, target)?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    focus_sentinel_contents(driver, target)?;
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn focus_macos_sentinel_contents(
+fn inject_foreground_input_canary(
     driver: &mut impl Driver,
     target: TargetWindow,
+    key: &str,
 ) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if !is_wayland_session() {
+        // The sentinel installs this signal hook only in its Linux test
+        // process. It injects a renderer key event without making XTest
+        // delivery a prerequisite for trusting the no-leak journal.
+        let status = unsafe { libc::kill(target.pid as i32, libc::SIGUSR2) };
+        return if status == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "foreground input canary could not signal sentinel pid {}: {}",
+                target.pid,
+                std::io::Error::last_os_error()
+            ))
+        };
+    }
+
+    let response = driver.call(
+        "press_key",
+        serde_json::json!({
+            "pid": target.pid,
+            "window_id": target.native_id,
+            "key": key,
+            "delivery_mode": "foreground",
+        }),
+    );
+    if response.is_error() {
+        Err(format!(
+            "foreground input canary could not inject a key: {}",
+            response.text()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn focus_sentinel_contents(driver: &mut impl Driver, target: TargetWindow) -> Result<(), String> {
     // A native app activation can leave Electron's renderer without keyboard
-    // focus even though WindowServer reports its window at the front. This
-    // bounded setup click lands well inside every canonical sentinel window
-    // and is cleared from the journal before any behavioral action begins.
+    // focus even though the native window is frontmost. This bounded setup
+    // click lands well inside every canonical sentinel window and is cleared
+    // from the journal before any behavioral action begins.
     let response = driver.call(
         "click",
         serde_json::json!({
@@ -517,7 +576,7 @@ fn focus_macos_sentinel_contents(
             "window_id": target.native_id,
             "x": 320.0,
             "y": 240.0,
-            "delivery_mode": "background",
+            "delivery_mode": if cfg!(target_os = "linux") { "foreground" } else { "background" },
         }),
     );
     if response.is_error() {
@@ -962,6 +1021,11 @@ fn physically_focus_windows_sentinel(target: TargetWindow) {
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn wait_for_native_focus_stable(target: TargetWindow) {
+    try_wait_for_native_focus_stable(target).unwrap_or_else(|error| panic!("{error}"));
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn try_wait_for_native_focus_stable(target: TargetWindow) -> Result<(), String> {
     use crate::observer::{ObserverBackend, TargetZ};
 
     let backend = NativeObserver::new();
@@ -975,15 +1039,14 @@ fn wait_for_native_focus_stable(target: TargetWindow) {
         if foreground {
             let since = stable_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= Duration::from_millis(300) {
-                return;
+                return Ok(());
             }
         } else {
             stable_since = None;
         }
-        assert!(
-            Instant::now() < deadline,
-            "foreground sentinel did not remain natively focused"
-        );
+        if Instant::now() >= deadline {
+            return Err("foreground sentinel did not remain natively focused".to_owned());
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -1018,6 +1081,11 @@ fn wait_for_native_focus_lost(_target: TargetWindow) -> Result<(), String> {
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn wait_for_native_focus_stable(_target: TargetWindow) {}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn try_wait_for_native_focus_stable(_target: TargetWindow) -> Result<(), String> {
+    Ok(())
+}
 
 pub fn run_with_background_oracles<D: Driver + BehaviorRecording, R>(
     driver: &mut D,

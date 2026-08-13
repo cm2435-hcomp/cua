@@ -980,7 +980,8 @@ pub fn with_x11_foreground<T>(
     if display.is_null() {
         return body();
     }
-    let prior = ewmh_active_window(display);
+    let saved_focus = save_focus_state(display);
+    let prior = saved_focus.ewmh_active;
     ewmh_activate_window(display, xid as x11::xlib::Window, prior.unwrap_or(0));
     unsafe {
         x11::xlib::XSync(display, 0);
@@ -997,29 +998,79 @@ pub fn with_x11_foreground<T>(
     // foreground key/hotkey rung actually reaches the target. Guarded against
     // BadMatch on a not-yet-viewable window — Xlib's default handler would exit
     // the process — reusing the scoped `ignore_x_error` pattern used elsewhere.
-    unsafe {
-        let prev_handler = x11::xlib::XSetErrorHandler(Some(ignore_x_error));
-        x11::xlib::XSetInputFocus(
-            display,
-            xid as x11::xlib::Window,
-            x11::xlib::RevertToParent,
-            x11::xlib::CurrentTime,
-        );
-        x11::xlib::XSync(display, 0);
-        x11::xlib::XSetErrorHandler(prev_handler);
-    }
-    let result = body();
-    // Restore the prior active window (brief swap, like macOS/Windows).
-    if let Some(p) = prior {
-        ewmh_activate_window(display, p, xid as x11::xlib::Window);
+    // Do not overwrite a focus transfer that the WM already completed. GNOME
+    // focuses Chromium's renderer child, and forcing the top-level XID here
+    // discards the page's focused DOM control even though the app is active.
+    // KWin's raise-only case still needs the explicit top-level fallback.
+    if !x11_focus_belongs_to_window(display, xid as x11::xlib::Window) {
         unsafe {
+            let prev_handler = x11::xlib::XSetErrorHandler(Some(ignore_x_error));
+            x11::xlib::XSetInputFocus(
+                display,
+                xid as x11::xlib::Window,
+                x11::xlib::RevertToParent,
+                x11::xlib::CurrentTime,
+            );
             x11::xlib::XSync(display, 0);
+            x11::xlib::XSetErrorHandler(prev_handler);
         }
     }
+    let result = body();
+    // The WM can process focus side effects from the injected event after a
+    // one-shot EWMH restore request. Use the same bounded stable restoration
+    // gate as the MPX pointer routes, which journals both EWMH and core focus
+    // and does not return until the prior active window holds across repeated
+    // checks (or the bounded failure is reported in telemetry).
+    restore_focus_state(display, &saved_focus);
     unsafe {
         x11::xlib::XCloseDisplay(display);
     }
     result
+}
+
+fn x11_focus_belongs_to_window(
+    display: *mut x11::xlib::Display,
+    target: x11::xlib::Window,
+) -> bool {
+    unsafe {
+        let prev_handler = x11::xlib::XSetErrorHandler(Some(ignore_x_error));
+        let mut focused = 0;
+        let mut revert = 0;
+        x11::xlib::XGetInputFocus(display, &mut focused, &mut revert);
+        x11::xlib::XSync(display, 0);
+        let mut current = focused;
+        let mut belongs = false;
+        for _ in 0..64 {
+            if current == target {
+                belongs = true;
+                break;
+            }
+            if current == 0 || current == x11::xlib::PointerRoot as x11::xlib::Window {
+                break;
+            }
+            let mut root = 0;
+            let mut parent = 0;
+            let mut children = ptr::null_mut();
+            let mut child_count = 0;
+            let queried = x11::xlib::XQueryTree(
+                display,
+                current,
+                &mut root,
+                &mut parent,
+                &mut children,
+                &mut child_count,
+            );
+            if !children.is_null() {
+                x11::xlib::XFree(children.cast());
+            }
+            if queried == 0 || parent == 0 || parent == current {
+                break;
+            }
+            current = parent;
+        }
+        x11::xlib::XSetErrorHandler(prev_handler);
+        belongs
+    }
 }
 
 /// Activate `xid` and LEAVE it active (no restore) — the persistent foreground
@@ -1300,6 +1351,158 @@ pub fn send_parallel_virtual_pointer_drags(drags: &[(String, VirtualPointerDrag)
     unsafe {
         x11::xlib::XCloseDisplay(display);
     }
+    result
+}
+
+/// Run one window-scoped drag through the MPX/uinput pipeline.
+///
+/// This is deliberately the same delivery primitive as
+/// [`send_parallel_virtual_pointer_drags`], rather than XTEST: the dedicated
+/// master pointer supplies real XI2 input to Chromium/GTK while the shield
+/// grab keeps the window manager from focusing the target and the user's core
+/// pointer remains untouched.
+pub fn send_virtual_pointer_drag(cursor_id: &str, drag: &VirtualPointerDrag) -> Result<()> {
+    if drag.path.len() < 2 {
+        bail!("virtual pointer drag requires at least two path points");
+    }
+
+    let display = open_display()?;
+    supports_parallel_pointer_injection(display)?;
+    let saved_focus = save_focus_state(display);
+    let ids = match ensure_master_pointer(cursor_id) {
+        Ok(ids) => ids,
+        Err(error) => {
+            unsafe { x11::xlib::XCloseDisplay(display) };
+            return Err(error);
+        }
+    };
+    let device = unsafe { x11::xinput::XOpenDevice(display, ids.pointer_id as _) };
+    if device.is_null() {
+        forget_master_pointer(cursor_id);
+        restore_focus_state(display, &saved_focus);
+        unsafe { x11::xlib::XCloseDisplay(display) };
+        bail!("XOpenDevice failed for MPX pointer {}", ids.pointer_id);
+    }
+
+    let window = drag.target_window as x11::xlib::Window;
+    let mut shield_installed = false;
+    let mut pressed = false;
+    let result = (|| -> Result<()> {
+        let opcode = xinput_opcode(display)
+            .ok_or_else(|| anyhow!("no-focus-steal drag requires XInput/XI2 shield grabs"))?;
+        install_shield_grab(display, ids.pointer_id, window, drag.button)
+            .with_context(|| format!("shield grab failed for '{cursor_id}'"))?;
+        shield_installed = true;
+
+        let (cum, total) = path_cumulative(&drag.path);
+        let start = drag.path[0];
+        let mut axes = [start.0, start.1];
+        let motion_status = unsafe {
+            x11::xtest::XTestFakeDeviceMotionEvent(
+                display,
+                device,
+                0,
+                0,
+                axes.as_mut_ptr(),
+                axes.len() as i32,
+                0,
+            )
+        };
+        if motion_status == 0 {
+            bail!("XTestFakeDeviceMotionEvent failed for '{cursor_id}'");
+        }
+        let press_status = unsafe {
+            x11::xtest::XTestFakeDeviceButtonEvent(
+                display,
+                device,
+                drag.button as u32,
+                1,
+                ptr::null_mut(),
+                0,
+                0,
+            )
+        };
+        if press_status == 0 {
+            bail!("XTestFakeDeviceButtonEvent press failed for '{cursor_id}'");
+        }
+        pressed = true;
+        unsafe { x11::xlib::XFlush(display) };
+
+        let mut pending = std::collections::HashSet::from([ids.pointer_id]);
+        replay_shielded_presses(display, opcode, &mut pending, Duration::from_millis(1000));
+        if !pending.is_empty() {
+            bail!("shield replay timed out before XI_ButtonPress arrived for '{cursor_id}'");
+        }
+
+        let steps = drag.steps.max(1);
+        let delay = if steps > 1 {
+            Duration::from_millis(drag.duration_ms / steps as u64)
+        } else {
+            Duration::from_millis(drag.duration_ms)
+        };
+        for step in 1..=steps {
+            let point = point_on_path(&drag.path, &cum, total, step as f64 / steps as f64);
+            axes = [point.0, point.1];
+            let status = unsafe {
+                x11::xtest::XTestFakeDeviceMotionEvent(
+                    display,
+                    device,
+                    0,
+                    0,
+                    axes.as_mut_ptr(),
+                    axes.len() as i32,
+                    0,
+                )
+            };
+            if status == 0 {
+                bail!("XTestFakeDeviceMotionEvent failed for '{cursor_id}'");
+            }
+            unsafe { x11::xlib::XFlush(display) };
+            if !delay.is_zero() {
+                sleep(delay);
+            }
+        }
+
+        let release_status = unsafe {
+            x11::xtest::XTestFakeDeviceButtonEvent(
+                display,
+                device,
+                drag.button as u32,
+                0,
+                ptr::null_mut(),
+                0,
+                0,
+            )
+        };
+        if release_status == 0 {
+            bail!("XTestFakeDeviceButtonEvent release failed for '{cursor_id}'");
+        }
+        pressed = false;
+        unsafe { x11::xlib::XSync(display, 0) };
+        Ok(())
+    })();
+
+    if pressed {
+        unsafe {
+            x11::xtest::XTestFakeDeviceButtonEvent(
+                display,
+                device,
+                drag.button as u32,
+                0,
+                ptr::null_mut(),
+                0,
+                0,
+            );
+            x11::xlib::XSync(display, 0);
+        }
+    }
+    if shield_installed {
+        remove_shield_grab(display, ids.pointer_id, window, drag.button);
+    }
+    unsafe { x11::xinput::XCloseDevice(display, device) };
+    forget_master_pointer(cursor_id);
+    restore_focus_state(display, &saved_focus);
+    unsafe { x11::xlib::XCloseDisplay(display) };
     result
 }
 

@@ -12,7 +12,10 @@
 //! `perform_action`, `set_value`, and `get_element_bounds` index into that same
 //! ordered set.
 
-use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -344,10 +347,17 @@ impl RawObjectRef {
     }
 }
 
-/// Read Accessible.GetChildren without deserializing the bus-name field as a
+/// Read an accessible's children without deserializing the bus-name field as a
 /// `UniqueName`. WebKitGTK's embedded WebProcess exposes a well-known name
 /// containing a UUID; D-Bus can address it, but the stricter AT-SPI wrapper
 /// rejects it as an invalid unique name.
+///
+/// WebKitGTK also reports the process-boundary child through `ChildCount` and
+/// `GetChildAtIndex`, while returning an empty `GetChildren` array for that
+/// same object. Prefer the bulk method when it is complete, but fall back to
+/// the indexed protocol whenever it under-reports the advertised child count.
+/// This mirrors libatspi/pyatspi traversal and keeps the remote WebProcess
+/// subtree visible without special-casing an application name.
 async fn raw_children(
     conn: &atspi::zbus::Connection,
     oref: &RawObjectRef,
@@ -364,13 +374,35 @@ async fn raw_children(
         .call("GetChildren", &())
         .await
         .map_err(|e| anyhow!("Accessible.GetChildren failed: {e}"))?;
-    Ok(refs
-        .into_iter()
-        .map(|(name, path)| RawObjectRef {
-            name,
-            path: path.to_string(),
-        })
-        .collect())
+    let child_count = proxy
+        .get_property::<i32>("ChildCount")
+        .await
+        .unwrap_or(refs.len() as i32)
+        .max(0) as usize;
+    if refs.len() >= child_count {
+        return Ok(refs
+            .into_iter()
+            .map(|(name, path)| RawObjectRef {
+                name,
+                path: path.to_string(),
+            })
+            .collect());
+    }
+
+    let mut indexed = Vec::with_capacity(child_count);
+    for index in 0..child_count {
+        let (name, path): (String, atspi::zbus::zvariant::OwnedObjectPath) = proxy
+            .call("GetChildAtIndex", &(index as i32,))
+            .await
+            .map_err(|e| anyhow!("Accessible.GetChildAtIndex({index}) failed: {e}"))?;
+        if path.as_str() != "/org/a11y/atspi/null" {
+            indexed.push(RawObjectRef {
+                name,
+                path: path.to_string(),
+            });
+        }
+    }
+    Ok(indexed)
 }
 
 /// Resolve the process id behind an application accessible's D-Bus name.
@@ -596,6 +628,23 @@ fn correlate_frame_to_window(
     Some(best_ordinal)
 }
 
+/// Prefer an exact native/AT-SPI title join when it identifies one top-level.
+/// Geometry remains the fallback for apps whose accessibility title differs
+/// from the window-manager title. This is essential for two same-sized,
+/// overlapping editor windows: geometry alone correctly refuses the tie, but
+/// each frame still publishes the exact distinct document title.
+fn correlate_frame_title(candidates: &[(usize, String)], target_title: &str) -> Option<usize> {
+    let target = target_title.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let matches: Vec<usize> = candidates
+        .iter()
+        .filter_map(|(ordinal, title)| (title.trim() == target).then_some(*ordinal))
+        .collect();
+    (matches.len() == 1).then(|| matches[0])
+}
+
 /// Resolve native window `xid` to the ordinal of the application top-level that
 /// renders it, or `None` when that cannot be proven. `None` means the walk stays
 /// application-wide: callers that merely want a tree carry on, and callers that
@@ -606,16 +655,21 @@ async fn resolve_window_frame(
     xid: u64,
     seeds: &[RawObjectRef],
 ) -> Option<usize> {
+    // Validate the exact native identity even for a single accessible frame.
+    // Otherwise a window that closes between the caller's X11 preflight and
+    // this walk can leave one sibling behind; blindly returning frame zero
+    // would then let the stale window id name that sibling.
+    let window = crate::x11::list_windows(Some(pid))
+        .into_iter()
+        .find(|candidate| candidate.xid == xid)?;
     if seeds.len() == 1 {
         // One top-level: the caller's window is the only thing this
         // application could be showing, and no geometry round-trip can make
         // that more certain.
         return Some(0);
     }
-    let window = crate::x11::list_windows(Some(pid))
-        .into_iter()
-        .find(|candidate| candidate.xid == xid)?;
     let mut candidates: Vec<(usize, (i32, i32, i32, i32))> = Vec::new();
+    let mut title_candidates: Vec<(usize, String)> = Vec::new();
     for (ordinal, oref) in seeds.iter().enumerate() {
         let Some(Ok(acc)) = call(accessible_for(conn, oref)).await else {
             continue;
@@ -632,6 +686,9 @@ async fn resolve_window_frame(
         ) {
             continue;
         }
+        if let Some(Ok(title)) = call(acc.name()).await {
+            title_candidates.push((ordinal, title));
+        }
         let Some(Ok(proxies)) = call(acc.proxies()).await else {
             continue;
         };
@@ -642,7 +699,8 @@ async fn resolve_window_frame(
             candidates.push((ordinal, extents));
         }
     }
-    let resolved = correlate_frame_to_window(&candidates, &window);
+    let resolved = correlate_frame_title(&title_candidates, &window.title)
+        .or_else(|| correlate_frame_to_window(&candidates, &window));
     if resolved.is_none() {
         dlog!(
             "could not correlate xid {xid} to one of pid {pid}'s {} top-level frame(s); \
@@ -2329,69 +2387,376 @@ fn select_click_target(
     best_active.or(best_passive).map(|(_, idx)| idx)
 }
 
-pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
-    bounded(
-        async {
-            let conn = shared_connection().await?;
-            let visited = collect_visited(conn, pid)
-                .await?
-                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
-            let action_nodes: Vec<&Visited> = visited.iter().filter(|v| is_indexable(v)).collect();
-            let target = action_nodes.get(idx).ok_or_else(|| {
-                anyhow!("element {idx} not found (total: {})", action_nodes.len())
-            })?;
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum SetValueFailure {
+    Stale(String),
+    NeedsForeground(String),
+    Refused(String),
+    AfterDispatch(String),
+}
 
-            let proxies = target
-                .acc
-                .proxies()
-                .await
-                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+fn validate_scoped_action_index(
+    action_node_frames: &[usize],
+    idx: usize,
+    xid: u64,
+    scoped_frame: Option<usize>,
+) -> std::result::Result<(), String> {
+    let Some(actual_frame) = action_node_frames.get(idx).copied() else {
+        return Err(format!(
+            "element {idx} not found (total: {})",
+            action_node_frames.len()
+        ));
+    };
+    if xid == 0 {
+        return Ok(());
+    }
+    let expected_frame = scoped_frame
+        .ok_or_else(|| format!("exact window {xid} no longer resolves to an AT-SPI top-level"))?;
+    if actual_frame != expected_frame {
+        return Err(format!(
+            "element {idx} now belongs to a different top-level than exact window {xid}"
+        ));
+    }
+    Ok(())
+}
 
-            // SetValue is a focus-free accessibility operation. Do not call
-            // Component.GrabFocus here: GTK may activate and raise the entire
-            // toplevel in response, violating the background contract. Toolkits
-            // that expose EditableText only while focused must return an honest
-            // unsupported error rather than changing desktop focus implicitly.
-            if let Ok(et) = proxies.editable_text().await {
-                // Replace whole contents (parity with the Windows/macOS set_value,
-                // which overwrite rather than insert at the caret).
-                if et.set_text_contents(value).await.unwrap_or(false) {
-                    return Ok(());
-                }
-                // Some toolkits reject SetTextContents but accept an insert at the
-                // caret offset; clear-then-insert as a fallback.
-                let off = match proxies.text().await {
-                    Ok(tp) => tp.caret_offset().await.unwrap_or(0),
-                    Err(_) => 0,
+async fn set_value_inner(
+    pid: u32,
+    xid: u64,
+    idx: usize,
+    replacement: String,
+    dispatched: Arc<AtomicBool>,
+) -> std::result::Result<(), SetValueFailure> {
+    let stale = |detail: String| SetValueFailure::Stale(detail);
+    let refuse = |detail: String| SetValueFailure::Refused(detail);
+    let after_dispatch = |detail: String| SetValueFailure::AfterDispatch(detail);
+    let conn = shared_connection()
+        .await
+        .map_err(|error| refuse(format!("AT-SPI connection unavailable: {error}")))?;
+    let (visited, scoped_frame) = collect_visited_bounded(conn, pid, xid, None, None)
+        .await
+        .map_err(|error| refuse(format!("AT-SPI tree unavailable: {error}")))?
+        .ok_or_else(|| refuse(format!("no AT-SPI application for pid {pid}")))?;
+    let action_nodes: Vec<&Visited> = visited.iter().filter(|node| is_indexable(node)).collect();
+    let action_node_frames: Vec<usize> =
+        action_nodes.iter().map(|node| node.frame_ordinal).collect();
+    validate_scoped_action_index(&action_node_frames, idx, xid, scoped_frame).map_err(stale)?;
+    let target = action_nodes
+        .get(idx)
+        .expect("validated action index must resolve");
+
+    if !target.has_editable && !target.has_value {
+        return Err(SetValueFailure::NeedsForeground(format!(
+            "element {idx} exposes neither EditableText nor Value; replacement requires focused keyboard input"
+        )));
+    }
+    let proxies = target
+        .acc
+        .proxies()
+        .await
+        .map_err(|error| refuse(format!("interface proxies unavailable: {error}")))?;
+
+    // SetValue is a focus-free accessibility operation. Do not call
+    // Component.GrabFocus here: GTK may activate and raise the entire
+    // toplevel in response, violating the background contract.
+    if target.has_editable {
+        let editable = proxies
+            .editable_text()
+            .await
+            .map_err(|error| refuse(format!("EditableText unavailable: {error}")))?;
+        dispatched.store(true, Ordering::SeqCst);
+        let accepted = editable
+            .set_text_contents(&replacement)
+            .await
+            .map_err(|error| after_dispatch(format!("SetTextContents failed: {error}")))?;
+        return if accepted {
+            Ok(())
+        } else {
+            Err(after_dispatch("SetTextContents returned false".into()))
+        };
+    }
+
+    let numeric: f64 = replacement.parse().map_err(|_| {
+        refuse(format!(
+            "value '{replacement}' is not numeric for a Value element"
+        ))
+    })?;
+    let value_proxy = proxies
+        .value()
+        .await
+        .map_err(|error| refuse(format!("Value unavailable: {error}")))?;
+    dispatched.store(true, Ordering::SeqCst);
+    value_proxy
+        .set_current_value(numeric)
+        .await
+        .map_err(|error| after_dispatch(format!("SetCurrentValue failed: {error}")))
+}
+
+async fn text_value_inner(pid: u32, idx: usize) -> Result<String> {
+    let conn = shared_connection().await?;
+    let visited = collect_visited(conn, pid)
+        .await?
+        .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+    let action_nodes: Vec<&Visited> = visited.iter().filter(|node| is_indexable(node)).collect();
+    let target = action_nodes
+        .get(idx)
+        .ok_or_else(|| anyhow!("element {idx} not found (total: {})", action_nodes.len()))?;
+    let proxies = target.acc.proxies().await?;
+    let text = proxies.text().await?;
+    let character_count = text.character_count().await?;
+    Ok(text.get_text(0, character_count).await?)
+}
+
+/// Read the exact indexed Text-interface value for post-input verification.
+/// This never mutates focus or application state.
+pub fn text_value(pid: u32, idx: usize) -> Result<String> {
+    runtime().block_on(async move {
+        tokio::time::timeout(OP_TIMEOUT, text_value_inner(pid, idx))
+            .await
+            .map_err(|_| anyhow!("text_value timed out for pid {pid}"))?
+    })
+}
+
+/// Replace one exact indexed value without changing desktop focus. Failures
+/// retain whether an AT-SPI write had become possible, so callers can safely
+/// distinguish a pre-dispatch capability refusal from an ambiguous effect.
+pub fn set_value(
+    pid: u32,
+    xid: u64,
+    idx: usize,
+    value: &str,
+) -> std::result::Result<(), SetValueFailure> {
+    let dispatched = Arc::new(AtomicBool::new(false));
+    let dispatched_for_call = dispatched.clone();
+    let replacement = value.to_owned();
+    runtime().block_on(async move {
+        match tokio::time::timeout(
+            OP_TIMEOUT,
+            set_value_inner(pid, xid, idx, replacement, dispatched_for_call),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) if dispatched.load(Ordering::SeqCst) => Err(SetValueFailure::AfterDispatch(
+                format!("set_value timed out for pid {pid} after AT-SPI dispatch became possible"),
+            )),
+            Err(_) => Err(SetValueFailure::Refused(format!(
+                "set_value timed out for pid {pid} before AT-SPI dispatch"
+            ))),
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextSelectionType {
+    Text,
+    CursorBefore,
+    CursorAfter,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextSelectionRequest {
+    pub text: String,
+    pub prefix: Option<String>,
+    pub suffix: Option<String>,
+    pub selection_type: TextSelectionType,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum TextSelectionOutcome {
+    Confirmed {
+        start: i32,
+        end: i32,
+    },
+    Unverifiable {
+        start: i32,
+        end: i32,
+        detail: String,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum TextSelectionFailure {
+    Refused(String),
+    AfterDispatch(String),
+}
+
+fn resolve_text_selection_offsets(
+    document: &str,
+    request: &TextSelectionRequest,
+) -> std::result::Result<(i32, i32), String> {
+    let matches: Vec<_> = document
+        .char_indices()
+        .filter_map(|(start, _)| {
+            let tail = &document[start..];
+            if !tail.starts_with(&request.text) {
+                return None;
+            }
+            let end = start + request.text.len();
+            let prefix_matches = request
+                .prefix
+                .as_ref()
+                .is_none_or(|prefix| document[..start].ends_with(prefix));
+            let suffix_matches = request
+                .suffix
+                .as_ref()
+                .is_none_or(|suffix| document[end..].starts_with(suffix));
+            (prefix_matches && suffix_matches).then_some((start, end))
+        })
+        .collect();
+    let (byte_start, byte_end) = match matches.as_slice() {
+        [] => return Err("requested text/context is absent from the exact AT-SPI text".into()),
+        [only] => *only,
+        _ => return Err("requested text/context is ambiguous in the exact AT-SPI text".into()),
+    };
+    let character_start = document[..byte_start].chars().count();
+    let character_end = document[..byte_end].chars().count();
+    let (start, end) = match request.selection_type {
+        TextSelectionType::Text => (character_start, character_end),
+        TextSelectionType::CursorBefore => (character_start, character_start),
+        TextSelectionType::CursorAfter => (character_end, character_end),
+    };
+    Ok((
+        i32::try_from(start).map_err(|_| "selection start exceeds AT-SPI offset limits")?,
+        i32::try_from(end).map_err(|_| "selection end exceeds AT-SPI offset limits")?,
+    ))
+}
+
+async fn select_text_inner(
+    pid: u32,
+    idx: usize,
+    request: TextSelectionRequest,
+    dispatched: Arc<AtomicBool>,
+) -> std::result::Result<TextSelectionOutcome, TextSelectionFailure> {
+    let refuse = |detail: String| TextSelectionFailure::Refused(detail);
+    let conn = shared_connection()
+        .await
+        .map_err(|error| refuse(format!("AT-SPI connection unavailable: {error}")))?;
+    let visited = collect_visited(conn, pid)
+        .await
+        .map_err(|error| refuse(format!("AT-SPI tree unavailable: {error}")))?
+        .ok_or_else(|| refuse(format!("no AT-SPI application for pid {pid}")))?;
+    let action_nodes: Vec<&Visited> = visited.iter().filter(|node| is_indexable(node)).collect();
+    let target = action_nodes.get(idx).ok_or_else(|| {
+        refuse(format!(
+            "element {idx} not found (total: {})",
+            action_nodes.len()
+        ))
+    })?;
+    let proxies = target
+        .acc
+        .proxies()
+        .await
+        .map_err(|error| refuse(format!("interface proxies unavailable: {error}")))?;
+    let text = proxies
+        .text()
+        .await
+        .map_err(|error| refuse(format!("Text interface unavailable: {error}")))?;
+    let character_count = text
+        .character_count()
+        .await
+        .map_err(|error| refuse(format!("Text.CharacterCount failed: {error}")))?;
+    let document = text
+        .get_text(0, character_count)
+        .await
+        .map_err(|error| refuse(format!("Text.GetText failed: {error}")))?;
+    let (start, end) = resolve_text_selection_offsets(&document, &request).map_err(refuse)?;
+    let existing_selections = text
+        .get_n_selections()
+        .await
+        .map_err(|error| refuse(format!("Text.GetNSelections failed: {error}")))?;
+    if existing_selections > 1 {
+        return Err(refuse(format!(
+            "select_text requires at most one existing selection; observed {existing_selections}"
+        )));
+    }
+
+    dispatched.store(true, Ordering::SeqCst);
+    let accepted = match request.selection_type {
+        TextSelectionType::Text if existing_selections == 0 => text.add_selection(start, end).await,
+        TextSelectionType::Text => text.set_selection(0, start, end).await,
+        TextSelectionType::CursorBefore | TextSelectionType::CursorAfter => {
+            text.set_caret_offset(start).await
+        }
+    }
+    .map_err(|error| {
+        TextSelectionFailure::AfterDispatch(format!("AT-SPI selection write failed: {error}"))
+    })?;
+    if !accepted {
+        return Err(TextSelectionFailure::AfterDispatch(
+            "AT-SPI selection write returned false".into(),
+        ));
+    }
+
+    let verification = match request.selection_type {
+        TextSelectionType::Text => {
+            async {
+                let count = text.get_n_selections().await?;
+                let range = if count == 1 {
+                    Some(text.get_selection(0).await?)
+                } else {
+                    None
                 };
-                let len = value.chars().count() as i32;
-                if et.insert_text(off, value, len).await.unwrap_or(false) {
-                    return Ok(());
-                }
+                let selected = text.get_text(start, end).await?;
+                Ok::<_, zbus::Error>(
+                    count == 1 && range == Some((start, end)) && selected == request.text,
+                )
             }
-            if target.has_value {
-                let v: f64 = value
-                    .parse()
-                    .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
-                proxies
-                    .value()
-                    .await
-                    .map_err(|e| anyhow!("Value unavailable: {e}"))?
-                    .set_current_value(v)
-                    .await
-                    .map_err(|e| anyhow!("setCurrentValue failed: {e}"))?;
-                return Ok(());
+            .await
+        }
+        TextSelectionType::CursorBefore | TextSelectionType::CursorAfter => {
+            async {
+                let caret = text.caret_offset().await?;
+                let count = text.get_n_selections().await?;
+                Ok::<_, zbus::Error>(caret == start && count == 0)
             }
-            Err(anyhow!(
-                "element {idx} exposes neither EditableText nor Value"
-            ))
-        },
-        || {
-            Err(anyhow!(
-                "set_value timed out for pid {pid} (app unresponsive to AT-SPI)"
-            ))
-        },
-    )
+            .await
+        }
+    };
+    match verification {
+        Ok(true) => Ok(TextSelectionOutcome::Confirmed { start, end }),
+        Ok(false) => Ok(TextSelectionOutcome::Unverifiable {
+            start,
+            end,
+            detail: "AT-SPI selection write completed but exact read-back did not match".into(),
+        }),
+        Err(error) => Ok(TextSelectionOutcome::Unverifiable {
+            start,
+            end,
+            detail: format!("AT-SPI selection write completed but exact read-back failed: {error}"),
+        }),
+    }
+}
+
+/// Select one exact occurrence of text, or place the caret beside it, through
+/// the target element's AT-SPI Text interface. Failures remain classified by
+/// whether a D-Bus write had become possible so callers never replay an
+/// ambiguous effect.
+pub fn select_text(
+    pid: u32,
+    idx: usize,
+    request: TextSelectionRequest,
+) -> std::result::Result<TextSelectionOutcome, TextSelectionFailure> {
+    let dispatched = Arc::new(AtomicBool::new(false));
+    let dispatched_for_call = dispatched.clone();
+    runtime().block_on(async move {
+        match tokio::time::timeout(
+            OP_TIMEOUT,
+            select_text_inner(pid, idx, request, dispatched_for_call),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) if dispatched.load(Ordering::SeqCst) => {
+                Err(TextSelectionFailure::AfterDispatch(format!(
+                    "select_text timed out for pid {pid} after AT-SPI dispatch became possible"
+                )))
+            }
+            Err(_) => Err(TextSelectionFailure::Refused(format!(
+                "select_text timed out for pid {pid} before AT-SPI dispatch"
+            ))),
+        }
+    })
 }
 
 pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> {
@@ -2903,7 +3268,7 @@ async fn element_bounds_for_visited(
 
 #[cfg(test)]
 mod frame_correlation_tests {
-    use super::{correlate_frame_to_window, FRAME_MATCH_TOLERANCE_PX};
+    use super::{correlate_frame_title, correlate_frame_to_window, FRAME_MATCH_TOLERANCE_PX};
     use crate::x11::WindowInfo;
 
     fn window(x: i32, y: i32, width: u32, height: u32) -> WindowInfo {
@@ -2963,6 +3328,28 @@ mod frame_correlation_tests {
     }
 
     #[test]
+    fn exact_unique_title_disambiguates_equal_geometry_windows() {
+        let candidates = [
+            (0usize, "a.txt (/tmp) - gedit".to_owned()),
+            (1usize, "b.txt (/tmp) - gedit".to_owned()),
+        ];
+        assert_eq!(
+            correlate_frame_title(&candidates, "b.txt (/tmp) - gedit"),
+            Some(1)
+        );
+        assert_eq!(correlate_frame_title(&candidates, "unknown - gedit"), None);
+    }
+
+    #[test]
+    fn duplicate_titles_refuse_instead_of_guessing() {
+        let candidates = [
+            (0usize, "Untitled - gedit".to_owned()),
+            (1usize, "Untitled - gedit".to_owned()),
+        ];
+        assert_eq!(correlate_frame_title(&candidates, "Untitled - gedit"), None);
+    }
+
+    #[test]
     fn refuses_when_no_frame_is_close_enough() {
         let candidates = [(0usize, (0, 0, 200, 200))];
         assert_eq!(
@@ -3011,7 +3398,9 @@ mod coord_tests {
         activation_index, before_snapshot_deadline, combine_wayland_content_offsets,
         is_activation_action, is_enabled_state, is_indexable_capabilities, is_passive_role,
         is_web_process_bus, prefer_authoritative_wayland_origin, rebase_renderer_window_offset,
-        screen_extent_rebase, select_click_target, ApplicationSelection,
+        resolve_text_selection_offsets, screen_extent_rebase, select_click_target,
+        validate_scoped_action_index, ApplicationSelection, TextSelectionRequest,
+        TextSelectionType,
     };
     use atspi::{State, StateSet};
     use std::time::Duration;
@@ -3032,6 +3421,53 @@ mod coord_tests {
         }
 
         assert_eq!(selection.into_selected(), Ok(Some("live-tree")));
+    }
+
+    #[test]
+    fn exact_window_set_value_rejects_missing_or_sibling_element_indices() {
+        // Indices remain application-wide so a window-scoped observation can
+        // address the same node later. The actuator must still prove that the
+        // cached index belongs to the exact frame it observed; otherwise a
+        // closed first window could shift the index onto a surviving sibling.
+        let frames = [0, 0, 1, 1];
+        assert!(validate_scoped_action_index(&frames, 2, 0x222, Some(1)).is_ok());
+        assert!(validate_scoped_action_index(&frames, 0, 0x222, Some(1)).is_err());
+        assert!(validate_scoped_action_index(&frames, 2, 0x222, None).is_err());
+        assert!(validate_scoped_action_index(&frames, 8, 0x222, Some(1)).is_err());
+        // Raw app-scoped callers retain their previous index contract.
+        assert!(validate_scoped_action_index(&frames, 0, 0, None).is_ok());
+    }
+
+    #[test]
+    fn text_selection_offsets_are_unicode_exact_and_context_disambiguates() {
+        let request = TextSelectionRequest {
+            text: "TARGET".into(),
+            prefix: Some("🙂 ".into()),
+            suffix: Some(" end".into()),
+            selection_type: TextSelectionType::Text,
+        };
+        assert_eq!(
+            resolve_text_selection_offsets("TARGET first; 🙂 TARGET end", &request),
+            Ok((16, 22))
+        );
+
+        let cursor = TextSelectionRequest {
+            text: "🙂".into(),
+            prefix: None,
+            suffix: None,
+            selection_type: TextSelectionType::CursorAfter,
+        };
+        assert_eq!(resolve_text_selection_offsets("a🙂b", &cursor), Ok((2, 2)));
+
+        let ambiguous = TextSelectionRequest {
+            text: "repeat".into(),
+            prefix: None,
+            suffix: None,
+            selection_type: TextSelectionType::CursorBefore,
+        };
+        assert!(resolve_text_selection_offsets("repeat repeat", &ambiguous)
+            .expect_err("ambiguous text must refuse")
+            .contains("ambiguous"));
     }
 
     #[test]

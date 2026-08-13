@@ -38,7 +38,12 @@ class HarnessWindow(Gtk.Window):
         super().__init__(title="CuaTestHarness GTK3")
         # Keep the nested scroll viewport visible on the canonical 1024x768
         # desktop; the outer scroller still exposes controls below it.
-        self.set_default_size(560, 720)
+        # Leave room for Mutter's server-side decorations inside the canonical
+        # 1024x768 work area. A 720px client plus the title bar can extend past
+        # the 741px work area, which makes a maximized foreground sentinel
+        # unable to geometrically occlude the disposable target. The outer
+        # scroller keeps the complete control catalog reachable at this size.
+        self.set_default_size(560, 680)
         self.counter = 0
         self.clicks = 0
         self._last_action = "none"
