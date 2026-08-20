@@ -48,7 +48,8 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # Newer toolcache builds require glibc newer than Debian 11's 2.31.
+          python-version: "3.12.7"
 
       - name: Build pinned native payload
         working-directory: source/libs/cua-driver/rust
@@ -119,9 +120,15 @@ jobs:
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
 
+      - name: Ensure both macOS Rust targets are installed
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustup target list --installed | grep -Fx aarch64-apple-darwin
+          rustup target list --installed | grep -Fx x86_64-apple-darwin
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.7"
 
       - name: Build pinned universal native payload
         working-directory: source/libs/cua-driver/rust
