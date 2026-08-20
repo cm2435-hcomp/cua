@@ -14,8 +14,8 @@ env:
   SOURCE_SHA: 38320b1214f3540d8987e7e7f246486cb39c726c
 
 jobs:
-  build-linux:
-    name: linux-x86_64
+  build-linux-native:
+    name: linux-x86_64 native payload
     runs-on: ubuntu-latest
     container:
       image: debian:11
@@ -46,10 +46,6 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Build pinned native payload
         working-directory: source/libs/cua-driver/rust
         env:
@@ -59,11 +55,54 @@ jobs:
             -p cua-driver -p cua-driver-sdk \
             --release --features cua-driver/portal-input \
             --target x86_64-unknown-linux-gnu
-          mkdir -p ../python/src/cua_driver/bin
+          mkdir -p ../../../../native-linux
           cp target/x86_64-unknown-linux-gnu/release/cua-driver \
-            ../python/src/cua_driver/bin/cua-driver
+            ../../../../native-linux/cua-driver
           cp target/x86_64-unknown-linux-gnu/release/libcua_driver_sdk.so \
-            ../python/src/cua_driver/libcua_driver_sdk.so
+            ../../../../native-linux/libcua_driver_sdk.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-x86_64-payload
+          path: native-linux/*
+          if-no-files-found: error
+          retention-days: 1
+
+  build-linux:
+    name: linux-x86_64
+    needs: build-linux-native
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out packaging tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: tooling
+          persist-credentials: false
+
+      - name: Check out pinned native source
+        uses: actions/checkout@v4
+        with:
+          ref: 8662ab0e110fa2dee791a6a27f4726e404a6568c
+          path: source
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-linux-x86_64-payload
+          path: native-linux
+
+      - name: Stage pinned native payload
+        run: |
+          mkdir -p source/libs/cua-driver/python/src/cua_driver/bin
+          cp native-linux/cua-driver \
+            source/libs/cua-driver/python/src/cua_driver/bin/cua-driver
+          cp native-linux/libcua_driver_sdk.so \
+            source/libs/cua-driver/python/src/cua_driver/libcua_driver_sdk.so
 
       - name: Install private packaging tools
         run: python -m pip install --upgrade build hatchling pydantic
@@ -119,6 +158,15 @@ jobs:
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
 
+      - name: Ensure both macOS Rust targets are installed
+        run: |
+          toolchain=$(awk -F'"' '/channel/{print $2}' source/libs/cua-driver/rust/rust-toolchain.toml)
+          rustup target add --toolchain "$toolchain" \
+            aarch64-apple-darwin x86_64-apple-darwin
+          rustup target list --installed --toolchain "$toolchain" | \
+            grep -Fx aarch64-apple-darwin
+          rustup target list --installed --toolchain "$toolchain" | \
+            grep -Fx x86_64-apple-darwin
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
