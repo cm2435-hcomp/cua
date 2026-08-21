@@ -83,7 +83,7 @@ jobs:
       - name: Check out pinned native source
         uses: actions/checkout@v4
         with:
-          ref: 8662ab0e110fa2dee791a6a27f4726e404a6568c
+          ref: 38320b1214f3540d8987e7e7f246486cb39c726c
           path: source
           persist-credentials: false
 
