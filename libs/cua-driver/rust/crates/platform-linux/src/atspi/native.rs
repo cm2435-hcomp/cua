@@ -352,12 +352,10 @@ impl RawObjectRef {
 /// containing a UUID; D-Bus can address it, but the stricter AT-SPI wrapper
 /// rejects it as an invalid unique name.
 ///
-/// WebKitGTK also reports the process-boundary child through `ChildCount` and
-/// `GetChildAtIndex`, while returning an empty `GetChildren` array for that
-/// same object. Prefer the bulk method when it is complete, but fall back to
-/// the indexed protocol whenever it under-reports the advertised child count.
-/// This mirrors libatspi/pyatspi traversal and keeps the remote WebProcess
-/// subtree visible without special-casing an application name.
+/// A WebKitGTK WebProcess can under-report descendants through `GetChildren`
+/// while advertising them through `ChildCount` and `GetChildAtIndex`. Keep
+/// that indexed fallback on the WebProcess bus only. Querying those properties
+/// on ordinary Qt5 accessibles can execute unsafe toolkit bridge code.
 async fn raw_children(
     conn: &atspi::zbus::Connection,
     oref: &RawObjectRef,
@@ -374,6 +372,15 @@ async fn raw_children(
         .call("GetChildren", &())
         .await
         .map_err(|e| anyhow!("Accessible.GetChildren failed: {e}"))?;
+    if !is_web_process_bus(&oref.name) {
+        return Ok(refs
+            .into_iter()
+            .map(|(name, path)| RawObjectRef {
+                name,
+                path: path.to_string(),
+            })
+            .collect());
+    }
     let child_count = proxy
         .get_property::<i32>("ChildCount")
         .await
@@ -628,11 +635,9 @@ fn correlate_frame_to_window(
     Some(best_ordinal)
 }
 
-/// Prefer an exact native/AT-SPI title join when it identifies one top-level.
-/// Geometry remains the fallback for apps whose accessibility title differs
-/// from the window-manager title. This is essential for two same-sized,
-/// overlapping editor windows: geometry alone correctly refuses the tie, but
-/// each frame still publishes the exact distinct document title.
+/// Use an exact native/AT-SPI title join when geometry cannot identify one
+/// top-level. This disambiguates same-sized overlapping editor windows without
+/// interrogating unrelated top-level accessibility objects on the common path.
 fn correlate_frame_title(candidates: &[(usize, String)], target_title: &str) -> Option<usize> {
     let target = target_title.trim();
     if target.is_empty() {
@@ -669,7 +674,7 @@ async fn resolve_window_frame(
         return Some(0);
     }
     let mut candidates: Vec<(usize, (i32, i32, i32, i32))> = Vec::new();
-    let mut title_candidates: Vec<(usize, String)> = Vec::new();
+    let mut window_ordinals = Vec::new();
     for (ordinal, oref) in seeds.iter().enumerate() {
         let Some(Ok(acc)) = call(accessible_for(conn, oref)).await else {
             continue;
@@ -686,9 +691,7 @@ async fn resolve_window_frame(
         ) {
             continue;
         }
-        if let Some(Ok(title)) = call(acc.name()).await {
-            title_candidates.push((ordinal, title));
-        }
+        window_ordinals.push(ordinal);
         let Some(Ok(proxies)) = call(acc.proxies()).await else {
             continue;
         };
@@ -699,8 +702,25 @@ async fn resolve_window_frame(
             candidates.push((ordinal, extents));
         }
     }
-    let resolved = correlate_frame_title(&title_candidates, &window.title)
-        .or_else(|| correlate_frame_to_window(&candidates, &window));
+    let geometry_match = correlate_frame_to_window(&candidates, &window);
+    if geometry_match.is_some() {
+        return geometry_match;
+    }
+    let mut title_candidates = Vec::new();
+    if !window.title.trim().is_empty() {
+        for ordinal in window_ordinals {
+            let Some(oref) = seeds.get(ordinal) else {
+                continue;
+            };
+            let Some(Ok(acc)) = call(accessible_for(conn, oref)).await else {
+                continue;
+            };
+            if let Some(Ok(title)) = call(acc.name()).await {
+                title_candidates.push((ordinal, title));
+            }
+        }
+    }
+    let resolved = correlate_frame_title(&title_candidates, &window.title);
     if resolved.is_none() {
         dlog!(
             "could not correlate xid {xid} to one of pid {pid}'s {} top-level frame(s); \
