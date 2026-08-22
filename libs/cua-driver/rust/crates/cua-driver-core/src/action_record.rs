@@ -713,7 +713,7 @@ fn transport_from_legacy(
             }
         }
         "dom_event" => ActionTransport::BrowserCdpRuntimeFunction,
-        "cdp_insert_text" => ActionTransport::BrowserCdpInputKey,
+        "cdp_insert_text" | "browser_cdp_input_key" => ActionTransport::BrowserCdpInputKey,
         "trusted" => ActionTransport::BrowserCdpInputMouse,
         "chromium_cdp_scroll_gesture" => ActionTransport::BrowserCdpInputMouse,
         "key_events" | "key_events_fg" => {
@@ -1815,6 +1815,7 @@ mod tests {
             "cgevent_fg",
             "dom_event",
             "cdp_insert_text",
+            "browser_cdp_input_key",
             "trusted",
             "chromium_cdp_scroll_gesture",
             "key_events",
