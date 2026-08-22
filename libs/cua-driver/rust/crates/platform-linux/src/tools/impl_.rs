@@ -2231,9 +2231,19 @@ fn maps_indicate_gtk(maps: &str) -> bool {
     maps.contains("libgtk-3.so") || maps.contains("libgtk-4.so")
 }
 
+fn maps_indicate_qt_widgets(maps: &str) -> bool {
+    maps.contains("libQt5Widgets.so") || maps.contains("libQt6Widgets.so")
+}
+
 fn is_gtk_process(pid: u32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/maps"))
         .map(|maps| maps_indicate_gtk(&maps))
+        .unwrap_or(false)
+}
+
+fn is_focused_keyboard_toolkit_process(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/maps"))
+        .map(|maps| maps_indicate_gtk(&maps) || maps_indicate_qt_widgets(&maps))
         .unwrap_or(false)
 }
 
@@ -2264,17 +2274,18 @@ fn unavailable_webkit_keyboard_background(
         })
 }
 
-fn unavailable_gtk_keyboard_background(
+fn unavailable_toolkit_keyboard_background(
     pid: u32,
     delivery: crate::input::delivery::DeliveryMode,
 ) -> Option<ToolResult> {
-    (!delivery.is_foreground() && is_gtk_process(pid) && !crate::wayland::is_inject_mode()).then(
-        || {
-            crate::input::delivery::background_unavailable_error(
-                crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
-            )
-        },
-    )
+    (!delivery.is_foreground()
+        && is_focused_keyboard_toolkit_process(pid)
+        && !crate::wayland::is_inject_mode())
+    .then(|| {
+        crate::input::delivery::background_unavailable_error(
+            crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+        )
+    })
 }
 
 fn unavailable_gtk_pointer_background(
@@ -4108,7 +4119,7 @@ impl Tool for PressKeyTool {
         if let Some(refusal) = unavailable_webkit_keyboard_background(pid, delivery) {
             return refusal;
         }
-        if let Some(refusal) = unavailable_gtk_keyboard_background(pid, delivery) {
+        if let Some(refusal) = unavailable_toolkit_keyboard_background(pid, delivery) {
             return refusal;
         }
         if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
@@ -4451,7 +4462,7 @@ impl Tool for HotkeyTool {
         if let Some(refusal) = unavailable_webkit_keyboard_background(pid, delivery) {
             return refusal;
         }
-        if let Some(refusal) = unavailable_gtk_keyboard_background(pid, delivery) {
+        if let Some(refusal) = unavailable_toolkit_keyboard_background(pid, delivery) {
             return refusal;
         }
         if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
@@ -9027,7 +9038,8 @@ pub fn build_registry_with_provider(
 mod click_button_schema_tests {
     use super::{
         build_registry, chromium_background_must_refuse, chromium_debugging_port_from_cmdline,
-        maps_indicate_gtk, should_try_atspi_action, snapshot_index_extent, ClickTool,
+        maps_indicate_gtk, maps_indicate_qt_widgets, should_try_atspi_action,
+        snapshot_index_extent, ClickTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::Value;
@@ -9164,6 +9176,19 @@ mod click_button_schema_tests {
         ));
         assert!(!maps_indicate_gtk(
             "7f00-7f01 r-xp /usr/lib/x86_64-linux-gnu/libgdk_pixbuf-2.0.so"
+        ));
+    }
+
+    #[test]
+    fn qt_widget_process_maps_require_foreground_keyboard_delivery() {
+        assert!(maps_indicate_qt_widgets(
+            "7f /usr/lib/x86_64-linux-gnu/libQt5Widgets.so.5.15.13"
+        ));
+        assert!(maps_indicate_qt_widgets(
+            "7f /usr/lib/x86_64-linux-gnu/libQt6Widgets.so.6.4.2"
+        ));
+        assert!(!maps_indicate_qt_widgets(
+            "7f /usr/lib/x86_64-linux-gnu/libQt5Core.so.5.15.13"
         ));
     }
 
