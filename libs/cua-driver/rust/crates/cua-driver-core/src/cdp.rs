@@ -143,6 +143,78 @@ pub async fn insert_text_unique_page(port: u16, text: &str) -> anyhow::Result<()
     Ok(())
 }
 
+/// Press Enter in the focused control of the only page on an endpoint.
+///
+/// This is the exact background route for window-scoped Chromium key input.
+/// Other keys retain their platform input route until they have an equally
+/// precise CDP mapping.
+pub async fn press_enter_unique_page(port: u16) -> anyhow::Result<()> {
+    let pages = tokio::time::timeout(std::time::Duration::from_secs(10), cdp_wait_for_page(port))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("CDP /json discovery on port {port} timed out after 10 s")
+        })??;
+    let page = unique_page(&pages).map_err(|error| {
+        anyhow::anyhow!(
+            "CDP endpoint on port {port} cannot prove exact window-to-tab ownership: {error}"
+        )
+    })?;
+    let ws_url = page
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Page has no webSocketDebuggerUrl"))?;
+    let connection = legacy_pool().get(ws_url).await?;
+    let focused = connection
+        .call(
+            None,
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": "(() => { const e = document.activeElement; return !!e && e !== document.body && e !== document.documentElement; })()",
+                "returnByValue": true,
+                "userGesture": true
+            }),
+        )
+        .await?;
+    if focused
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        anyhow::bail!("the unique CDP page has no focused control");
+    }
+    for params in [
+        serde_json::json!({
+            "type": "keyDown",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13
+        }),
+        serde_json::json!({
+            "type": "char",
+            "key": "Enter",
+            "text": "\r",
+            "unmodifiedText": "\r"
+        }),
+        serde_json::json!({
+            "type": "keyUp",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13
+        }),
+    ] {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connection.call(None, "Input.dispatchKeyEvent", params),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("CDP Input.dispatchKeyEvent timed out after 10 s"))??;
+    }
+    Ok(())
+}
+
 // ── High-level evaluate ───────────────────────────────────────────────────
 
 async fn cdp_evaluate(
@@ -345,7 +417,10 @@ async fn cdp_list_pages(port: u16) -> anyhow::Result<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{evaluate, format_cdp_result, insert_text_unique_page, pick_page, unique_page};
+    use super::{
+        evaluate, format_cdp_result, insert_text_unique_page, pick_page, press_enter_unique_page,
+        unique_page,
+    };
     use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -519,6 +594,66 @@ mod tests {
         });
 
         insert_text_unique_page(port, "typed").await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unique_page_enter_requires_focus_and_dispatches_one_key_cycle() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut http, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = http.read(&mut request).await.unwrap();
+            let body = json!([{
+                "type": "page",
+                "url": "app://fixture/",
+                "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/enter")
+            }])
+            .to_string();
+            http.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            for expected_type in [None, Some("keyDown"), Some("char"), Some("keyUp")] {
+                let Message::Text(text) = websocket.next().await.unwrap().unwrap() else {
+                    panic!("expected CDP request")
+                };
+                let call: serde_json::Value = serde_json::from_str(&text).unwrap();
+                match expected_type {
+                    None => assert_eq!(call["method"], "Runtime.evaluate"),
+                    Some(event_type) => {
+                        assert_eq!(call["method"], "Input.dispatchKeyEvent");
+                        assert_eq!(call["params"]["type"], event_type);
+                        assert_eq!(call["params"]["key"], "Enter");
+                    }
+                }
+                let result = if expected_type.is_none() {
+                    json!({ "result": { "type": "boolean", "value": true } })
+                } else {
+                    json!({})
+                };
+                websocket
+                    .send(Message::Text(
+                        json!({ "id": call["id"], "result": result }).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        press_enter_unique_page(port).await.unwrap();
         server.await.unwrap();
     }
 }

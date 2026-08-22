@@ -4028,6 +4028,42 @@ impl Tool for PressKeyTool {
         // background path (the focus-click already handled fronting when fg). Pass x,y
         // (no element_index) for Chromium/Electron surfaces the AX path can't focus.
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if mods.is_empty() && matches!(key.to_ascii_lowercase().as_str(), "enter" | "return") {
+            if let Some(port) = chromium_debugging_port(pid) {
+                let focused = cua_driver_core::cdp::evaluate_unique_page(
+                    port,
+                    "(() => { const e = document.activeElement; return !!e && e !== document.body && e !== document.documentElement; })()",
+                    true,
+                )
+                .await;
+                if matches!(focused.as_deref(), Ok("true")) {
+                    return match cua_driver_core::cdp::press_enter_unique_page(port).await {
+                        Ok(()) => ToolResult::text(
+                            "Pressed Enter through the exact unique Chromium page.",
+                        )
+                        .with_structured(json!({
+                            "verified": false,
+                            "delivery_mode": "background",
+                            "path": "browser_cdp_input_key",
+                            "effect": "unverifiable",
+                            "hardware_cursor_warp_attempted": false
+                        })),
+                        Err(error) => ToolResult::error(format!(
+                            "Chromium CDP Enter delivery could not be reconciled: {error}"
+                        ))
+                        .with_structured(json!({
+                            "code": "dispatch_failed",
+                            "phase": "dispatch",
+                            "retryable": false,
+                            "effect": "unverifiable",
+                            "effect_may_have_occurred": true,
+                            "native_side_effect_started": true,
+                            "dispatch_scope": "target"
+                        })),
+                    };
+                }
+            }
+        }
         if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
             return refusal;
         }
