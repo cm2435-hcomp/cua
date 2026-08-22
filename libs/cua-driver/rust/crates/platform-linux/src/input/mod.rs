@@ -1022,8 +1022,25 @@ pub fn with_x11_foreground<T>(
     // and does not return until the prior active window holds across repeated
     // checks (or the bounded failure is reported in telemetry).
     restore_focus_state(display, &saved_focus);
+    let restored = match prior {
+        Some(previous) => {
+            ewmh_active_window(display) == Some(previous)
+                && x11_focus_belongs_to_window(display, previous)
+        }
+        None => {
+            saved_focus.core_focus == 0 || {
+                let mut focused = 0;
+                let mut revert = 0;
+                unsafe { x11::xlib::XGetInputFocus(display, &mut focused, &mut revert) };
+                focused == saved_focus.core_focus
+            }
+        }
+    };
     unsafe {
         x11::xlib::XCloseDisplay(display);
+    }
+    if !restored {
+        anyhow::bail!("foreground assistance could not restore the prior focused window");
     }
     result
 }
@@ -1709,28 +1726,23 @@ fn restore_focus_state(display: *mut x11::xlib::Display, saved: &SavedFocus) {
                 }
             } else {
                 stable = 0;
-                // MPX clicks can leave a core-protocol WM believing the
-                // dragged window is focused while the core focus never moved
-                // there: its XSetInputFocus for our activation is then a
-                // no-op, no FocusIn arrives, and its bookkeeping never
-                // updates. Bounce the core focus onto the window the WM
-                // believes active so the activation produces a real focus
-                // transition the WM can observe.
+                // GNOME can reject a remote EWMH activation while core focus
+                // remains on the assisted target. Move core focus to the
+                // exact saved window first so the WM observes a real FocusIn,
+                // then reassert its EWMH bookkeeping.
                 if attempt >= 2 {
-                    if let Some(now_win) = now {
-                        unsafe {
-                            let prev_handler = x11::xlib::XSetErrorHandler(Some(ignore_x_error));
-                            x11::xlib::XSetInputFocus(
-                                display,
-                                now_win,
-                                x11::xlib::RevertToParent,
-                                x11::xlib::CurrentTime,
-                            );
-                            x11::xlib::XSync(display, 0);
-                            x11::xlib::XSetErrorHandler(prev_handler);
-                        }
-                        sleep(Duration::from_millis(100));
+                    unsafe {
+                        let prev_handler = x11::xlib::XSetErrorHandler(Some(ignore_x_error));
+                        x11::xlib::XSetInputFocus(
+                            display,
+                            prev,
+                            x11::xlib::RevertToParent,
+                            x11::xlib::CurrentTime,
+                        );
+                        x11::xlib::XSync(display, 0);
+                        x11::xlib::XSetErrorHandler(prev_handler);
                     }
+                    sleep(Duration::from_millis(100));
                 }
                 ewmh_activate_window(display, prev, now.unwrap_or(0));
             }
