@@ -1790,6 +1790,10 @@ fn parse_mouse_button(name: &str) -> u8 {
     }
 }
 
+fn should_try_atspi_action(button: u8, count: usize, has_modifiers: bool, named: bool) -> bool {
+    !has_modifiers && (named || (button == 1 && count == 1))
+}
+
 /// Escalation hint for a non-AX / suspected-no-op surface — the cross-platform
 /// `escalation` field mirrored from macOS. The recommended next rung depends on
 /// the session type: X11 can pixel-target a specific window in the background,
@@ -2742,6 +2746,7 @@ impl Tool for ClickTool {
                     // [left,right,middle]); kept inline to carry the Linux/Wayland
                     // back-compat prose the click button-schema test asserts on.
                     "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button. Default: \"left\" (legacy back-compat). X11: routed via ButtonPress/Release with the matching evdev code. Native Wayland: only left-button is supported via the virtual-pointer protocol; right/middle return an error."},
+                    "action":{"type":"string","enum":["press","open","pick","confirm","cancel"],"description":"Optional portable accessibility action for an indexed element."},
                     "count":{"type":"integer"},
                     "modifier": cua_driver_core::tool_schema::modifier_schema(),
                     "from_zoom":{"type":"boolean","description":"Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space."},
@@ -2850,6 +2855,7 @@ impl Tool for ClickTool {
             button_str_raw.as_str()
         };
         let button = parse_mouse_button(button_str);
+        let requested_action = args.opt_str("action");
 
         // Surface 6: element_token / element_index precedence resolution.
         // We resolve before the legacy `opt_u64("element_index")` branch
@@ -2916,21 +2922,52 @@ impl Tool for ClickTool {
 
             // Chromium can execute a genuine AT-SPI action without focus. Try
             // that route before applying its background synthetic-input gate.
-            if modifiers.is_empty() {
-                let ax_result =
-                    tokio::task::spawn_blocking(move || crate::atspi::perform_action(pid, idx))
-                        .await;
-                if let Ok(Ok((_action, suspected_noop))) = ax_result {
-                    let mut structured = json!({
-                        "path": "ax",
-                        "verified": false,
-                        "effect": if suspected_noop { "suspected_noop" } else { "unverifiable" },
-                    });
-                    if suspected_noop {
-                        structured["escalation"] = non_ax_escalation();
+            if should_try_atspi_action(
+                button,
+                count,
+                !modifiers.is_empty(),
+                requested_action.is_some(),
+            ) {
+                let named_action = requested_action.is_some();
+                let ax_result = tokio::task::spawn_blocking(move || match requested_action {
+                    Some(action) => crate::atspi::perform_named_action(pid, idx, &action),
+                    None => crate::atspi::perform_action(pid, idx),
+                })
+                .await;
+                match ax_result {
+                    Ok(Ok((_action, suspected_noop))) => {
+                        let mut structured = json!({
+                            "path": "ax",
+                            "verified": false,
+                            "effect": if suspected_noop { "suspected_noop" } else { "unverifiable" },
+                        });
+                        if suspected_noop {
+                            structured["escalation"] = non_ax_escalation();
+                        }
+                        return ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
+                            .with_structured(structured);
                     }
-                    return ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
-                        .with_structured(structured);
+                    Ok(Err(error)) if named_action => {
+                        return ToolResult::error(format!(
+                            "click: requested portable action was not delivered: {error}"
+                        ))
+                        .with_structured(json!({
+                            "code": "unsupported_action",
+                            "effect": "refused",
+                            "native_side_effect_started": false,
+                        }));
+                    }
+                    Err(error) if named_action => {
+                        return ToolResult::error(format!(
+                            "click: requested portable action task failed: {error}"
+                        ))
+                        .with_structured(json!({
+                            "code": "unsupported_action",
+                            "effect": "refused",
+                            "native_side_effect_started": false,
+                        }));
+                    }
+                    _ => {}
                 }
             }
             if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
@@ -8990,7 +9027,7 @@ pub fn build_registry_with_provider(
 mod click_button_schema_tests {
     use super::{
         build_registry, chromium_background_must_refuse, chromium_debugging_port_from_cmdline,
-        maps_indicate_gtk, snapshot_index_extent, ClickTool,
+        maps_indicate_gtk, should_try_atspi_action, snapshot_index_extent, ClickTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::Value;
@@ -9064,6 +9101,30 @@ mod click_button_schema_tests {
             lc.contains("wayland"),
             "description should call out wayland fallback"
         );
+    }
+
+    #[test]
+    fn schema_advertises_only_portable_secondary_actions() {
+        let tool = ClickTool {
+            state: super::ToolState::new(),
+        };
+        let actions: Vec<&str> = tool.def().input_schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(actions, ["press", "open", "pick", "confirm", "cancel"]);
+    }
+
+    #[test]
+    fn only_plain_left_clicks_or_named_actions_use_atspi_action_dispatch() {
+        assert!(should_try_atspi_action(1, 1, false, false));
+        assert!(should_try_atspi_action(1, 1, false, true));
+        assert!(!should_try_atspi_action(3, 1, false, false));
+        assert!(!should_try_atspi_action(2, 1, false, false));
+        assert!(!should_try_atspi_action(1, 2, false, false));
+        assert!(!should_try_atspi_action(1, 1, true, false));
     }
 
     #[test]

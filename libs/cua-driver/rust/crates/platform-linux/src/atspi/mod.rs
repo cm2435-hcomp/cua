@@ -163,6 +163,13 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
     native::perform_action(pid, idx)
 }
 
+/// Perform one portable, explicitly requested AT-SPI action on an indexed
+/// element. The native action name is resolved by meaning rather than vector
+/// position so `pick` cannot silently degrade to the element's primary click.
+pub fn perform_named_action(pid: u32, idx: usize, action: &str) -> Result<(String, bool)> {
+    native::perform_named_action(pid, idx, action)
+}
+
 /// Give an indexed AT-SPI element keyboard focus without activating its window.
 pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
     native::focus_element(pid, idx)

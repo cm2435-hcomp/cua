@@ -1832,6 +1832,23 @@ fn activation_index(role: &str, actions: &[String]) -> Option<usize> {
     })
 }
 
+fn portable_action_index(role: &str, actions: &[String], requested: &str) -> Option<usize> {
+    if requested == "press" {
+        return activation_index(role, actions);
+    }
+    let aliases: &[&str] = match requested {
+        "open" => &["open", "jump"],
+        "pick" => &["pick", "select"],
+        "confirm" => &["confirm"],
+        "cancel" => &["cancel"],
+        _ => return None,
+    };
+    actions.iter().position(|action| {
+        let normalized = normalized_action_verb(action);
+        aliases.contains(&normalized.as_str())
+    })
+}
+
 fn is_menu_role(role: &str) -> bool {
     role.trim().to_ascii_lowercase().contains("menu")
 }
@@ -1988,6 +2005,49 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
         || {
             Err(anyhow!(
                 "perform_action timed out for pid {pid} (app unresponsive to AT-SPI)"
+            ))
+        },
+    )
+}
+
+pub fn perform_named_action(pid: u32, idx: usize, requested: &str) -> Result<(String, bool)> {
+    let requested = requested.to_owned();
+    bounded(
+        async {
+            let conn = shared_connection().await?;
+            let visited = collect_visited(conn, pid)
+                .await?
+                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+            let action_nodes: Vec<&Visited> = visited.iter().filter(|v| is_indexable(v)).collect();
+            let target = action_nodes.get(idx).ok_or_else(|| {
+                anyhow!("element {idx} not found (total: {})", action_nodes.len())
+            })?;
+            let chosen = portable_action_index(&target.role, &target.actions, &requested)
+                .ok_or_else(|| {
+                    anyhow!("element {idx} does not advertise portable action {requested:?}")
+                })?;
+            let action_proxy = target
+                .acc
+                .proxies()
+                .await
+                .map_err(|error| anyhow!("interface proxies unavailable: {error}"))?
+                .action()
+                .await
+                .map_err(|error| anyhow!("Action unavailable: {error}"))?;
+            let action = target.actions.get(chosen).cloned().unwrap_or_default();
+            let accepted = action_proxy
+                .do_action(chosen as i32)
+                .await
+                .map_err(|error| anyhow!("doAction failed: {error}"))?;
+            if !accepted {
+                anyhow::bail!("element {idx} rejected portable action {requested:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok((action, false))
+        },
+        || {
+            Err(anyhow!(
+                "perform_named_action timed out for pid {pid} (app unresponsive to AT-SPI)"
             ))
         },
     )
@@ -3417,10 +3477,10 @@ mod coord_tests {
     use super::{
         activation_index, before_snapshot_deadline, combine_wayland_content_offsets,
         is_activation_action, is_enabled_state, is_indexable_capabilities, is_passive_role,
-        is_web_process_bus, prefer_authoritative_wayland_origin, rebase_renderer_window_offset,
-        resolve_text_selection_offsets, screen_extent_rebase, select_click_target,
-        validate_scoped_action_index, ApplicationSelection, TextSelectionRequest,
-        TextSelectionType,
+        is_web_process_bus, portable_action_index, prefer_authoritative_wayland_origin,
+        rebase_renderer_window_offset, resolve_text_selection_offsets, screen_extent_rebase,
+        select_click_target, validate_scoped_action_index, ApplicationSelection,
+        TextSelectionRequest, TextSelectionType,
     };
     use atspi::{State, StateSet};
     use std::time::Duration;
@@ -3874,6 +3934,40 @@ mod coord_tests {
         let statisch = vec!["clickAncestor".to_owned(), "showContextMenu".to_owned()];
         assert_eq!(activation_index("entry", &entry), Some(0));
         assert_eq!(activation_index("static", &statisch), Some(0));
+    }
+
+    #[test]
+    fn portable_secondary_actions_select_the_requested_native_meaning() {
+        let actions = vec![
+            "click".to_owned(),
+            "select".to_owned(),
+            "jump".to_owned(),
+            "cancel".to_owned(),
+        ];
+        assert_eq!(
+            portable_action_index("list item", &actions, "press"),
+            Some(0)
+        );
+        assert_eq!(
+            portable_action_index("list item", &actions, "pick"),
+            Some(1)
+        );
+        assert_eq!(
+            portable_action_index("list item", &actions, "open"),
+            Some(2)
+        );
+        assert_eq!(
+            portable_action_index("list item", &actions, "cancel"),
+            Some(3)
+        );
+        assert_eq!(
+            portable_action_index("list item", &actions, "confirm"),
+            None
+        );
+        assert_eq!(
+            portable_action_index("list item", &actions, "showContextMenu"),
+            None
+        );
     }
 
     #[test]

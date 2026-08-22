@@ -983,8 +983,14 @@ pub fn with_x11_foreground<T>(
     let saved_focus = save_focus_state(display);
     let prior = saved_focus.ewmh_active;
     ewmh_activate_window(display, xid as x11::xlib::Window, prior.unwrap_or(0));
+    // Some WMs (observed on Openbox) update _NET_ACTIVE_WINDOW without raising
+    // the target. Foreground pointer delivery would then hit the covering
+    // window, so make the already-authorized foreground transition explicit.
     unsafe {
+        let prev_handler = x11::xlib::XSetErrorHandler(Some(ignore_x_error));
+        x11::xlib::XRaiseWindow(display, xid as x11::xlib::Window);
         x11::xlib::XSync(display, 0);
+        x11::xlib::XSetErrorHandler(prev_handler);
     }
     if settle_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(settle_ms));
