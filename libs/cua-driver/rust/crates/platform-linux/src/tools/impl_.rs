@@ -1969,6 +1969,24 @@ fn is_chromium_embedder(pid: u32) -> bool {
     false
 }
 
+fn is_standalone_chromium_browser(pid: u32) -> bool {
+    let Ok(executable) = fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    matches!(
+        executable.file_name().and_then(|name| name.to_str()),
+        Some(
+            "chrome"
+                | "google-chrome"
+                | "chromium"
+                | "chromium-browser"
+                | "brave-browser"
+                | "microsoft-edge"
+                | "microsoft-edge-stable"
+        )
+    )
+}
+
 fn chromium_debugging_port_from_cmdline(raw: &[u8]) -> Option<u16> {
     let mut args = raw
         .split(|byte| *byte == 0)
@@ -2066,6 +2084,98 @@ async fn chromium_dom_event_drag(
         )),
         Err(error) => ToolResult::error(format!("Chromium DOM drag failed: {error}")),
     }
+}
+
+async fn chromium_dom_set_value(
+    pid: u32,
+    idx: usize,
+    xid: Option<u64>,
+    value: &str,
+) -> Option<ToolResult> {
+    if !is_chromium_embedder(pid) {
+        return None;
+    }
+    let port = chromium_debugging_port(pid)?;
+    let coordinates =
+        tokio::task::spawn_blocking(move || resolve_element_local_coords(pid, idx, xid)).await;
+    let (_, x, y) = match coordinates {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            let message = format!(
+                "The exact Chromium field could not be resolved for background value delivery: {error}"
+            );
+            return Some(background_web_drag_unavailable(message));
+        }
+        Err(error) => {
+            return Some(background_web_drag_unavailable(format!(
+                "Chromium field resolution failed before value delivery: {error}"
+            )))
+        }
+    };
+    let encoded = serde_json::to_string(value).expect("a Rust string is valid JSON");
+    let script = format!(
+        r#"(() => {{
+          const raw = document.elementFromPoint({x}, {y});
+          const target = raw?.closest?.('input,textarea,[contenteditable="true"]');
+          if (!target) return 0;
+          const next = {encoded};
+          if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {{
+            const prototype = target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+            if (!setter) return 0;
+            setter.call(target, next);
+            target.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText', data: next}}));
+            target.dispatchEvent(new Event('change', {{bubbles: true}}));
+            return target.value === next ? 1 : -1;
+          }}
+          target.textContent = next;
+          target.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText', data: next}}));
+          target.dispatchEvent(new Event('change', {{bubbles: true}}));
+          return target.textContent === next ? 1 : -1;
+        }})()"#
+    );
+    Some(
+        match cua_driver_core::cdp::evaluate_unique_page(port, &script, true).await {
+            Ok(result) if result == "1" => ToolResult::text(
+                "Set and verified the value through the exact unique Chromium page.",
+            )
+            .with_structured(json!({
+                "path": "dom_event",
+                "input_route": "dom_event",
+                "effect": "verified",
+                "verified": true,
+                "delivery_mode": "background",
+                "hardware_cursor_warp_attempted": false
+            })),
+            Ok(result) if result == "0" => background_web_drag_unavailable(
+                "The exact CDP page did not expose an editable control at the addressed element",
+            ),
+            Ok(_) => ToolResult::error(
+                "Chromium received the value event but did not retain the requested value.",
+            )
+            .with_structured(json!({
+                "code": "verification_failed",
+                "phase": "verify",
+                "retryable": false,
+                "effect": "unverifiable",
+                "effect_may_have_occurred": true,
+                "native_side_effect_started": true,
+                "dispatch_scope": "target"
+            })),
+            Err(error) => ToolResult::error(format!(
+                "Chromium CDP value delivery could not be reconciled: {error}"
+            ))
+            .with_structured(json!({
+                "code": "dispatch_failed",
+                "phase": "dispatch",
+                "retryable": false,
+                "effect": "unverifiable",
+                "effect_may_have_occurred": true,
+                "native_side_effect_started": true,
+                "dispatch_scope": "target"
+            })),
+        },
+    )
 }
 
 fn is_webkitgtk_embedder(pid: u32) -> bool {
@@ -4504,6 +4614,25 @@ impl Tool for SetValueTool {
             }
         }
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if let Some(result) = chromium_dom_set_value(pid, idx, target_window_id, &value).await {
+            return result;
+        }
+        if is_standalone_chromium_browser(pid) {
+            return ToolResult::error(
+                "This Chromium field cannot be set safely through Linux accessibility: \
+                 the renderer acknowledges the value write without accepting it. Use a \
+                 browser-native page integration.",
+            )
+            .with_structured(json!({
+                "code": "unsupported_in_background",
+                "phase": "preflight",
+                "retryable": false,
+                "effect": "refused",
+                "effect_may_have_occurred": false,
+                "native_side_effect_started": false,
+                "dispatch_scope": "target"
+            }));
+        }
         let cursor_id = resolve_cursor_key(&args);
         let value_for_task = value.clone();
         // Pulse the agent cursor onto the target element before writing, so a
