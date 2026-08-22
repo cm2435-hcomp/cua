@@ -2735,6 +2735,7 @@ fn key_name_to_keysym(key: &str) -> Result<u32> {
         "comma" => 0x2C,
         "semicolon" => 0x3B,
         "colon" => 0x3A,
+        "grave" | "backtick" => 0x60,
         "underscore" => 0x5F,
         "parenleft" => 0x28,
         "parenright" => 0x29,
@@ -2961,9 +2962,9 @@ exit 0"#,
 #[cfg(test)]
 mod path_tests {
     use super::{
-        create_uinput_pointer, guarded_uinput_creation, is_uinput_unavailable, master_pointer_name,
-        modifiers_to_state, normalize_uinput_device_name, path_cumulative, point_on_path,
-        real_pointer_capabilities_available, sample_function, slave_pointer_name,
+        create_uinput_pointer, guarded_uinput_creation, is_uinput_unavailable, key_name_to_keysym,
+        master_pointer_name, modifiers_to_state, normalize_uinput_device_name, path_cumulative,
+        point_on_path, real_pointer_capabilities_available, sample_function, slave_pointer_name,
         EVDEV_UINPUT_NAME_MAX_BYTES, UINPUT_POINTER_SUFFIX,
     };
     use x11rb::protocol::xproto::KeyButMask;
@@ -2980,6 +2981,12 @@ mod path_tests {
             modifiers_to_state(&["control", "alt"]),
             KeyButMask::from(u16::from(KeyButMask::CONTROL) | u16::from(KeyButMask::MOD1))
         );
+    }
+
+    #[test]
+    fn x11_key_names_accept_the_portable_grave_alias() {
+        assert_eq!(key_name_to_keysym("grave").unwrap(), u32::from(b'`'));
+        assert_eq!(key_name_to_keysym("backtick").unwrap(), u32::from(b'`'));
     }
 
     #[test]
