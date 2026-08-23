@@ -1,5 +1,7 @@
 use async_trait::async_trait;
+use core_foundation::base::{CFRelease, CFTypeRef};
 use cua_driver_core::{
+    ax_tree_revision::{AxTreeRevision, ObservedAxNode},
     protocol::{Content, ToolResult},
     tool::{Tool, ToolDef},
 };
@@ -65,11 +67,10 @@ fn def() -> &'static ToolDef {
             element_index values are unchanged, the complete snapshot remains actionable, \
             and `element_count` continues to report its total size; \
             `filtered_element_count` reports the projected response size.\n\n\
-            Optional `max_elements` / `max_depth` bound the AX walk to mitigate \
-            context-window blow-up on Electron / Obsidian / large web apps that \
-            produce 10k+ element trees. When applied, BOTH the markdown \
-            and the structured elements are truncated identically. Omit both for \
-            current default behaviour (≤2 000 elements, depth ≤25).".into(),
+            Optional diagnostic `max_elements` / `max_depth` bounds explicitly \
+            truncate the AX walk. Omit them for the production provider: healthy \
+            large collections use the platform's explicit visible-child subset \
+            instead of a global element cap.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["pid", "window_id"],
@@ -90,12 +91,17 @@ fn def() -> &'static ToolDef {
                 "max_elements": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Cap on the total number of AX nodes walked. Truncates depth-first; markdown and structured elements truncate together. Omit for the default (2 000). Lower this for Electron / Obsidian / large web apps that produce 10k+ element trees and blow context windows."
+                    "description": "Explicit diagnostic cap on AX nodes walked. Truncates depth-first; markdown and structured elements truncate together. Omit for the complete production provider."
                 },
                 "max_depth": {
                     "type": "integer",
                     "minimum": 1,
                     "description": "Cap on the AX-tree walk depth. Nodes whose rendered indent would exceed this are omitted. Omit for the default (25). Lower this for deep menu/Electron trees."
+                },
+                "ax_tree_mode": {
+                    "type": "string",
+                    "enum": ["full", "diff_if_available"],
+                    "description": "Default full. diff_if_available additionally returns a signed-compatible native AX revision update while keeping tree_markdown and elements complete for existing consumers."
                 }
             },
             "additionalProperties": false
@@ -232,6 +238,8 @@ impl Tool for GetWindowStateTool {
             .get("_observation_only")
             .and_then(|value| value.as_bool())
             == Some(true);
+        let diff_if_available =
+            args.opt_str("ax_tree_mode").as_deref() == Some("diff_if_available") && query.is_none();
         // Optional caps — when omitted, fall back to the defaults baked into
         // the AX walker (#22865). minimum:1 keyed in the schema, but defend
         // against 0 here as well so a misbehaving client can't disable the
@@ -248,23 +256,34 @@ impl Tool for GetWindowStateTool {
             .unwrap_or(crate::ax::tree::DEFAULT_MAX_DEPTH);
 
         // Always walk the AX tree (perception returns both tree + screenshot).
-        let tree_result = {
+        let (tree_result, ax_cache_status) = {
             let q = query.clone();
+            let provider = self.state.ax_tree_provider.clone();
             // Keep the product deadline below the public client's 25-second
             // deadline so callers receive a structured driver error. The AX
             // walker also applies a native per-element messaging timeout because
             // dropping a spawn_blocking JoinHandle cannot cancel a blocked AX call.
             let walk_future = tokio::task::spawn_blocking(move || {
-                crate::ax::tree::walk_tree_bounded(
+                provider.observe(
                     pid,
-                    Some(window_id),
+                    window_id,
                     q.as_deref(),
                     max_elements,
                     max_depth,
+                    diff_if_available,
+                    observation_only,
                 )
             });
             match tokio::time::timeout(std::time::Duration::from_secs(20), walk_future).await {
-                Ok(Ok(r)) => Some(r),
+                Ok(Ok(provider_tree)) => {
+                    tracing::debug!(
+                        pid,
+                        window_id,
+                        cache_status = provider_tree.cache_status,
+                        "macOS AX provider observation"
+                    );
+                    (Some(provider_tree.result), provider_tree.cache_status)
+                }
                 Ok(Err(e)) => {
                     return observation_error(
                         format!("AX tree walk failed: {e}"),
@@ -278,11 +297,8 @@ impl Tool for GetWindowStateTool {
                     return observation_error(
                         format!(
                             "AX tree walk for pid={pid} timed out after 20 s. \
-                             The app (likely Arc, Electron, or Safari with many tabs) has a \
-                             pathologically large accessibility tree. \
-                             Workaround: re-call with a depth-limited scan \
-                             (max_elements / max_depth), then act by pixel (x,y) off \
-                             the screenshot if the tree stays unusable."
+                             No partial tree was published and the retained provider \
+                             was not advanced. Observe again after the app settles."
                         ),
                         "ui_not_settled",
                         "settle",
@@ -305,22 +321,6 @@ impl Tool for GetWindowStateTool {
         // `window_scope` is None only when no window_id was requested, which
         // this tool never does — so treat that as resolved.
         let scope_matched = window_scope.as_ref().is_none_or(|s| s.is_matched());
-
-        // Update element cache — ONLY for a resolved window scope. Caching an
-        // unresolved scope's nodes under (pid, window_id) is what turned a
-        // wrong-surface snapshot into a wrong-surface *action*: a follow-up
-        // click(element_index=N) picked whatever the walk happened to return.
-        // For an unresolved scope, replace any prior entry with an empty
-        // snapshot so a stale index map cannot be clicked through either.
-        if !observation_only {
-            if let Some(ref r) = tree_result {
-                if scope_matched {
-                    self.state.element_cache.update(pid, window_id, &r.nodes);
-                } else {
-                    self.state.element_cache.update(pid, window_id, &[]);
-                }
-            }
-        }
 
         // Capture the screenshot and deliver it alongside the tree — the
         // grounding frame the agent cross-checks the (sometimes-lying) tree
@@ -503,6 +503,30 @@ impl Tool for GetWindowStateTool {
             .as_ref()
             .map(|r| r.tree_markdown.clone())
             .unwrap_or_default();
+        let ax_tree_update = tree_result.as_ref().and_then(|result| {
+            if observation_only || !scope_matched || result.truncated {
+                return None;
+            }
+            let roots = revision_forest(&result.nodes);
+            let focused_render_id = unsafe {
+                crate::ax::exact_target::focused_element_in_window(pid, window_id).map(|element| {
+                    let render_id = crate::ax::tree::render_identity(element);
+                    CFRelease(element as CFTypeRef);
+                    render_id
+                })
+            };
+            let window = format!("Window: \"{window_id}\"");
+            let mut revisions = self.state.ax_revisions.lock().unwrap();
+            if diff_if_available {
+                if let Some(revision) = revisions.get_mut(&(pid, window_id)) {
+                    return Some(revision.append(roots, &window, focused_render_id.as_ref()));
+                }
+            }
+            let (revision, update) =
+                AxTreeRevision::new(roots, &window, focused_render_id.as_ref());
+            revisions.insert((pid, window_id), revision);
+            Some(update)
+        });
 
         // Surface 6: register a snapshot in the global token registry so
         // every actionable element gets an opaque `element_token` keyed
@@ -540,11 +564,25 @@ impl Tool for GetWindowStateTool {
             (None, Some(r)) if scope_matched => build_elements_array(&r.nodes),
             _ => Vec::new(),
         };
-        let elements_json = cua_driver_core::element_query::project_elements_for_query(
+        let mut elements_json = cua_driver_core::element_query::project_elements_for_query(
             elements_json,
             query.as_deref(),
             &tree_md,
         );
+        if let Some(update) = &ax_tree_update {
+            let revision_ids = update
+                .elements
+                .iter()
+                .map(|element| (element.action_index, element.element_id))
+                .collect::<std::collections::HashMap<_, _>>();
+            for element in &mut elements_json {
+                if let Some(element_index) = element["element_index"].as_u64() {
+                    if let Some(revision_id) = revision_ids.get(&(element_index as usize)) {
+                        element["revision_id"] = serde_json::json!(revision_id);
+                    }
+                }
+            }
+        }
         let filtered_element_count = elements_json.len();
         // The structured array intentionally contains only actionable nodes,
         // and AX child reads can fail independently of the element/depth caps.
@@ -555,6 +593,7 @@ impl Tool for GetWindowStateTool {
         let mut structured = serde_json::json!({
             "window_id": window_id,
             "pid": pid,
+            "ax_tree_cache_status": ax_cache_status,
             "element_count": element_count,
             "total_element_count": element_count,
             "returned_element_count": filtered_element_count,
@@ -568,6 +607,15 @@ impl Tool for GetWindowStateTool {
         });
         if query.is_some() {
             structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
+        }
+        if let Some(update) = ax_tree_update {
+            structured["ax_tree_update_kind"] = serde_json::json!(match update.kind {
+                cua_driver_core::ax_tree_revision::AxTreeUpdateKind::Full => "full",
+                cua_driver_core::ax_tree_revision::AxTreeUpdateKind::Diff => "diff",
+                cua_driver_core::ax_tree_revision::AxTreeUpdateKind::NoChange => "no_change",
+            });
+            structured["ax_tree_lineage_id"] = serde_json::json!(update.lineage_id.to_string());
+            structured["ax_tree_update"] = serde_json::json!(update.text);
         }
         // Surface 6: an opaque snapshot identifier consumers can log
         // alongside the per-element tokens for debug correlation. Same value
@@ -689,6 +737,41 @@ impl Tool for GetWindowStateTool {
             action_record: None,
         }
     }
+}
+
+fn revision_forest(nodes: &[crate::ax::tree::AXNode]) -> Vec<ObservedAxNode<usize>> {
+    fn siblings(
+        nodes: &[crate::ax::tree::AXNode],
+        cursor: &mut usize,
+        depth: usize,
+    ) -> Vec<ObservedAxNode<usize>> {
+        let mut result = Vec::new();
+        while *cursor < nodes.len() && nodes[*cursor].depth == depth {
+            let node = &nodes[*cursor];
+            *cursor += 1;
+            let children = if *cursor < nodes.len() && nodes[*cursor].depth > depth {
+                let child_depth = nodes[*cursor].depth;
+                siblings(nodes, cursor, child_depth)
+            } else {
+                Vec::new()
+            };
+            result.push(ObservedAxNode {
+                render_id: node.render_id,
+                text: crate::ax::tree::revision_node_text(node),
+                detail_text: None,
+                action_index: node.element_index,
+                children,
+            });
+        }
+        result
+    }
+
+    let mut cursor = 0;
+    siblings(
+        nodes,
+        &mut cursor,
+        nodes.first().map_or(0, |node| node.depth),
+    )
 }
 
 fn observation_error(
@@ -1099,6 +1182,7 @@ mod tests {
         frame: Option<[f64; 4]>,
     ) -> AXNode {
         AXNode {
+            render_id: idx.unwrap_or_default(),
             element_index: idx,
             role: role.into(),
             subrole: None,
@@ -1119,7 +1203,28 @@ mod tests {
             enabled: None,
             selected: None,
             in_web_content: false,
+            selectable: false,
+            available_child_subset: None,
         }
+    }
+
+    #[test]
+    fn revision_forest_preserves_native_hierarchy_and_action_indices() {
+        let mut window = node(Some(0), "AXWindow", Some("Doc"), 0, None, None);
+        window.render_id = 10;
+        let mut label = node(None, "AXStaticText", Some("Hint"), 1, Some(0), None);
+        label.render_id = 11;
+        let mut button = node(Some(1), "AXButton", Some("OK"), 1, Some(0), None);
+        button.render_id = 12;
+        let mut menu = node(None, "AXMenuBar", None, 0, None, None);
+        menu.render_id = 20;
+
+        let roots = revision_forest(&[window, label, button, menu]);
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].render_id, 10);
+        assert_eq!(roots[0].children.len(), 2);
+        assert_eq!(roots[0].children[1].action_index, Some(1));
+        assert_eq!(roots[1].render_id, 20);
     }
 
     #[test]

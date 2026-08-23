@@ -48,7 +48,10 @@ use cua_driver_core::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{ax::cache::ElementCache, cursor::state::CursorRegistry};
+use crate::{
+    ax::{cache::ElementCache, tree_provider::MacAxTreeProvider},
+    cursor::state::CursorRegistry,
+};
 
 fn pid_window_target_candidates(pid: i64) -> Vec<WindowTargetCandidate> {
     let Ok(pid) = i32::try_from(pid) else {
@@ -742,6 +745,12 @@ impl Default for SessionConfigRegistry {
 /// Shared state passed to all tools.
 pub struct ToolState {
     pub element_cache: Arc<ElementCache>,
+    pub ax_tree_provider: Arc<MacAxTreeProvider>,
+    pub ax_revisions: Arc<
+        std::sync::Mutex<
+            HashMap<(i32, u32), cua_driver_core::ax_tree_revision::AxTreeRevision<usize>>,
+        >,
+    >,
     pub cursor_registry: Arc<CursorRegistry>,
     pub zoom_registry: Arc<ZoomRegistry>,
     pub resize_registry: Arc<ResizeRegistry>,
@@ -779,8 +788,11 @@ impl ToolState {
         host_owns_permission_ux: bool,
         host_bundle_id: Option<String>,
     ) -> Self {
+        let element_cache = Arc::new(ElementCache::new());
         Self {
-            element_cache: Arc::new(ElementCache::new()),
+            element_cache: element_cache.clone(),
+            ax_tree_provider: Arc::new(MacAxTreeProvider::new(element_cache)),
+            ax_revisions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cursor_registry: Arc::new(CursorRegistry::new()),
             zoom_registry: Arc::new(ZoomRegistry::new()),
             resize_registry: Arc::new(ResizeRegistry::new()),

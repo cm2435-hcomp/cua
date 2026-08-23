@@ -23,6 +23,16 @@ use std::os::raw::{c_int, c_void};
 pub struct __AXUIElement(c_void);
 pub type AXUIElementRef = *mut __AXUIElement;
 
+#[repr(C)]
+pub struct __AXObserver(c_void);
+pub type AXObserverRef = *mut __AXObserver;
+pub type AXObserverCallback = unsafe extern "C" fn(
+    observer: AXObserverRef,
+    element: AXUIElementRef,
+    notification: CFStringRef,
+    refcon: *mut c_void,
+);
+
 // ── AXError ──────────────────────────────────────────────────────────────────
 
 pub type AXError = c_int;
@@ -33,6 +43,7 @@ pub const kAXErrorCannotComplete: AXError = -25204;
 pub const kAXErrorAttributeUnsupported: AXError = -25205;
 pub const kAXErrorNoValue: AXError = -25212;
 pub const kAXErrorAPIDisabled: AXError = -25211;
+pub const kAXErrorNotificationAlreadyRegistered: AXError = -25210;
 
 // ── AXValue opaque type ──────────────────────────────────────────────────────
 
@@ -91,6 +102,20 @@ extern "C" {
     ) -> AXError;
     pub fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> AXError;
     pub fn AXUIElementGetTypeID() -> CFTypeID;
+    pub fn AXObserverCreate(
+        application: i32,
+        callback: AXObserverCallback,
+        observer: *mut AXObserverRef,
+    ) -> AXError;
+    pub fn AXObserverAddNotification(
+        observer: AXObserverRef,
+        element: AXUIElementRef,
+        notification: CFStringRef,
+        refcon: *mut c_void,
+    ) -> AXError;
+    pub fn AXObserverGetRunLoopSource(
+        observer: AXObserverRef,
+    ) -> core_foundation::runloop::CFRunLoopSourceRef;
     pub fn AXIsProcessTrusted() -> bool;
     /// `AXIsProcessTrustedWithOptions(options)` — when called with
     /// `{kAXTrustedCheckOptionPrompt: true}` raises the system Accessibility
@@ -808,7 +833,19 @@ pub fn focused_window_id_of_pid(pid: i32) -> Option<u32> {
 ///
 /// `element` must be valid, and the caller must release every returned element.
 pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
-    let attr = CFStr::new("AXChildren");
+    copy_element_array_attr(element, "AXChildren")
+}
+
+/// Copy an AX array-valued attribute containing accessibility elements.
+///
+/// # Safety
+///
+/// `element` must be valid, and the caller must release every returned element.
+pub unsafe fn copy_element_array_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Vec<AXUIElementRef> {
+    let attr = CFStr::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err != kAXErrorSuccess || value.is_null() {
@@ -1043,30 +1080,7 @@ pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
 ///
 /// `element` must be valid, and the caller must release every returned element.
 pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
-    let attr = CFStr::new("AXWindows");
-    let mut value: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    if err != kAXErrorSuccess || value.is_null() {
-        return vec![];
-    }
-    let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
-    if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
-        CFRelease(value);
-        return vec![];
-    }
-    let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
-    let ax_type_id = AXUIElementGetTypeID();
-    (0..arr.len())
-        .filter_map(|i| {
-            let item = *arr.get(i)?;
-            if core_foundation::base::CFGetTypeID(item) == ax_type_id {
-                CFRetain(item);
-                Some(item as AXUIElementRef)
-            } else {
-                None
-            }
-        })
-        .collect()
+    copy_element_array_attr(element, "AXWindows")
 }
 
 #[cfg(test)]

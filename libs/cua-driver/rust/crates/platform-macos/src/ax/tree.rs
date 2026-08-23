@@ -15,6 +15,23 @@ use super::bindings::*;
 use super::window_scope::{decide_window_scope, TopLevelCandidate, WindowScope};
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 
+unsafe extern "C" {
+    fn CFHash(value: CFTypeRef) -> usize;
+}
+
+pub(crate) unsafe fn render_identity(element: AXUIElementRef) -> usize {
+    CFHash(element as CFTypeRef)
+}
+
+const VISIBLE_CHILDREN_THRESHOLD: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AvailableChildSubset {
+    pub start: usize,
+    pub end: usize,
+    pub total: usize,
+}
+
 /// Default maximum depth for AX tree walks. Deep menus and complex web views
 /// can nest deeply; 25 covers realistic app chrome without exploding on
 /// pathological trees (mirrors Swift reference implementation).
@@ -24,15 +41,11 @@ use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 /// Obsidian, large web apps — issue #22865).
 pub const DEFAULT_MAX_DEPTH: usize = 25;
 
-/// Default maximum total nodes visited during a single AX walk. Chromium-family
-/// apps (Arc, VS Code, Chrome) can expose thousands of nodes; capping at 2 000
-/// keeps the walk bounded while still covering realistic app chrome.
-/// When the cap is hit the walk stops early and the partial tree is returned
-/// with a warning line appended (mirrors Swift reference implementation).
-///
-/// Callers can override per-call via `walk_tree`'s `max_elements` parameter
-/// (issue #22865).
-pub const DEFAULT_MAX_ELEMENTS: usize = 2_000;
+/// A normal observation has no global element cap. Signed Swift returned 1,818
+/// lines for a healthy Chrome tree and switches large native collections to
+/// their explicit visible subset instead of truncating the whole tree. Callers
+/// may still request an explicit diagnostic bound through `max_elements`.
+pub const DEFAULT_MAX_ELEMENTS: usize = usize::MAX;
 
 /// Bound each native AX request. Tokio cannot cancel a blocked
 /// `AXUIElementCopyAttributeValue` after `spawn_blocking` starts, so the native
@@ -47,6 +60,9 @@ unsafe fn set_messaging_timeout(element: AXUIElementRef) {
 /// A single node in the AX tree.
 #[derive(Debug, Clone)]
 pub struct AXNode {
+    /// Stable Core Foundation identity used only to match this AX element
+    /// across independent observations.
+    pub render_id: usize,
     /// 0-based index (Some = actionable, None = non-actionable display-only node)
     pub element_index: Option<usize>,
     pub role: String,
@@ -94,6 +110,10 @@ pub struct AXNode {
     /// This trust marker is independent of actionable ancestry because
     /// AXWebArea is commonly non-actionable and therefore has no element index.
     pub in_web_content: bool,
+    pub selectable: bool,
+    /// The signed helper switches to AXVisibleChildren once an element has 100
+    /// children. `end` is exclusive, matching its `showing 0-7` rendering.
+    pub available_child_subset: Option<AvailableChildSubset>,
 }
 
 #[derive(Default)]
@@ -102,7 +122,6 @@ struct ControlState {
     value_description: Option<String>,
     min_value: Option<f64>,
     max_value: Option<f64>,
-    enabled: Option<bool>,
     selected: Option<bool>,
 }
 
@@ -191,7 +210,6 @@ unsafe fn read_screen_rect(element: AXUIElementRef) -> Option<[f64; 4]> {
 unsafe fn read_actionable_control_state(
     element: AXUIElementRef,
     value_state: Option<String>,
-    enabled: Option<bool>,
 ) -> ControlState {
     const ATTRIBUTES: [&str; 4] = [
         "AXValueDescription",
@@ -221,7 +239,6 @@ unsafe fn read_actionable_control_state(
                 .filter(|value| !value.is_empty()),
             min_value: values.number(1).or_else(|| scalar_number(1, "AXMinValue")),
             max_value: values.number(2).or_else(|| scalar_number(2, "AXMaxValue")),
-            enabled,
             selected: values.boolean(3).or_else(|| {
                 values
                     .needs_scalar_fallback(3)
@@ -237,7 +254,6 @@ unsafe fn read_actionable_control_state(
             .filter(|value| !value.is_empty()),
         min_value: copy_number_attr(element, "AXMinValue"),
         max_value: copy_number_attr(element, "AXMaxValue"),
-        enabled,
         selected: copy_bool_attr(element, "AXSelected"),
     }
 }
@@ -266,10 +282,29 @@ fn role_supports_value_addressing(role: &str) -> bool {
     )
 }
 
+fn role_is_descriptive_container(role: &str) -> bool {
+    matches!(
+        role,
+        "AXScrollArea"
+            | "AXTable"
+            | "AXOutline"
+            | "AXRow"
+            | "AXCell"
+            | "AXScrollBar"
+            | "AXValueIndicator"
+            | "AXSplitGroup"
+            | "AXTabGroup"
+            | "AXToolbar"
+            | "AXMenuBar"
+            | "AXMenu"
+    )
+}
+
 fn is_addressable(actions_present: bool, value_settable: bool, enabled: Option<bool>) -> bool {
     (actions_present || value_settable) && enabled != Some(false)
 }
 
+#[derive(Clone)]
 pub struct TreeWalkResult {
     pub tree_markdown: String,
     pub nodes: Vec<AXNode>,
@@ -476,7 +511,8 @@ pub fn walk_tree_bounded(
     }
 
     let truncated_flag = truncated;
-    let raw_markdown = render_lines(&lines);
+    nodes = flatten_repetitive_static_text(nodes);
+    let raw_markdown = render_nodes(&nodes);
     let mut tree_markdown = if let Some(q) = query {
         filter_tree(&raw_markdown, q)
     } else {
@@ -531,15 +567,15 @@ unsafe fn walk_element(
 
     let presentation = read_presentation_state(element);
     let role = presentation.role;
+    let (children, available_child_subset) = children_for_walk(element, &role);
 
     let in_web_content = in_web_content || is_web_content_role(&role);
 
     // Skip pure layout containers that have no interesting content.
-    if role == "AXScrollArea" || role == "AXGroup" {
+    if role == "AXGroup" {
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
-        let children = copy_children(element);
         for child in children {
             walk_element(
                 child,
@@ -606,9 +642,16 @@ unsafe fn walk_element(
         None
     };
     let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
+    let selectable = role == "AXRow" && is_attribute_settable(element, "AXSelected");
 
-    if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
-        let children = copy_children(element);
+    if !is_actionable
+        && !has_content
+        && available_child_subset.is_none()
+        && !role_is_descriptive_container(&role)
+        && enabled != Some(false)
+        && role != "AXWindow"
+        && role != "AXSheet"
+    {
         for child in children {
             walk_element(
                 child,
@@ -639,7 +682,7 @@ unsafe fn walk_element(
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty());
     let control_state = read_control_state_if_actionable(is_actionable, || {
-        read_actionable_control_state(element, value_state, enabled)
+        read_actionable_control_state(element, value_state)
     });
     let node = if is_actionable {
         let idx = *counter;
@@ -648,6 +691,7 @@ unsafe fn walk_element(
         // releases the per-child ref at the end of the caller's loop.
         CFRetain(element as CFTypeRef);
         AXNode {
+            render_id: render_identity(element),
             element_index: Some(idx),
             role: role.clone(),
             subrole: subrole.clone(),
@@ -677,12 +721,15 @@ unsafe fn walk_element(
             value_description: control_state.value_description.clone(),
             min_value: control_state.min_value,
             max_value: control_state.max_value,
-            enabled: control_state.enabled,
+            enabled,
             selected: control_state.selected,
             in_web_content,
+            selectable,
+            available_child_subset,
         }
     } else {
         AXNode {
+            render_id: render_identity(element),
             element_index: None,
             role: role.clone(),
             subrole,
@@ -712,9 +759,11 @@ unsafe fn walk_element(
             value_description: control_state.value_description.clone(),
             min_value: control_state.min_value,
             max_value: control_state.max_value,
-            enabled: control_state.enabled,
+            enabled,
             selected: control_state.selected,
             in_web_content,
+            selectable,
+            available_child_subset,
         }
     };
 
@@ -727,7 +776,6 @@ unsafe fn walk_element(
     lines.push((depth, line));
     nodes.push(node);
 
-    let children = copy_children(element);
     for child in children {
         walk_element(
             child,
@@ -744,6 +792,88 @@ unsafe fn walk_element(
         );
         CFRelease(child as CFTypeRef);
     }
+}
+
+unsafe fn children_for_walk(
+    element: AXUIElementRef,
+    role: &str,
+) -> (Vec<AXUIElementRef>, Option<AvailableChildSubset>) {
+    // Closed menu-bar items expose their complete disabled submenu through
+    // AXChildren. The signed helper renders the item only. An actually open
+    // menu arrives as its own AXMenu surface and is still walked normally.
+    if role == "AXMenuBarItem" {
+        return (Vec::new(), None);
+    }
+
+    let row_collection = matches!(role, "AXTable" | "AXOutline");
+    let children = if row_collection {
+        copy_element_array_attr(element, "AXRows")
+    } else {
+        copy_children(element)
+    };
+    if children.len() < VISIBLE_CHILDREN_THRESHOLD {
+        return (children, None);
+    }
+
+    let visible = copy_element_array_attr(
+        element,
+        if row_collection {
+            "AXVisibleRows"
+        } else {
+            "AXVisibleChildren"
+        },
+    );
+    if visible.is_empty() {
+        return (children, None);
+    }
+
+    let start = visible
+        .first()
+        .and_then(|first| {
+            children
+                .iter()
+                .position(|child| CFEqual(*child as CFTypeRef, *first as CFTypeRef) != 0)
+        })
+        .unwrap_or(0);
+    for child in children {
+        CFRelease(child as CFTypeRef);
+    }
+    let end = start + visible.len();
+    (
+        visible,
+        Some(AvailableChildSubset {
+            start,
+            end,
+            total: VISIBLE_CHILDREN_THRESHOLD,
+        }),
+    )
+}
+
+fn flatten_repetitive_static_text(nodes: Vec<AXNode>) -> Vec<AXNode> {
+    let mut flattened: Vec<AXNode> = Vec::with_capacity(nodes.len());
+    let mut repetition_key: Option<(usize, Option<String>, Option<String>, String)> = None;
+    for node in nodes {
+        let node_key = (node.role == "AXStaticText" && node.element_index.is_none())
+            .then(|| {
+                Some((
+                    node.depth,
+                    node.title.clone(),
+                    node.description.clone(),
+                    node.value.clone()?,
+                ))
+            })
+            .flatten();
+        if node_key.is_some() && node_key == repetition_key {
+            let previous = flattened.last_mut().expect("repetition has a prior node");
+            let value = previous.value.as_mut().expect("checked above");
+            value.push(' ');
+            value.push_str(node.value.as_deref().expect("checked above"));
+        } else {
+            repetition_key = node_key;
+            flattened.push(node);
+        }
+    }
+    flattened
 }
 
 fn is_web_content_role(role: &str) -> bool {
@@ -771,14 +901,14 @@ mod web_content_role_tests {
 }
 
 fn format_node_line(node: &AXNode) -> String {
-    let mut parts = String::new();
+    let prefix = node
+        .element_index
+        .map_or_else(|| "- ".to_string(), |idx| format!("- [{idx}] "));
+    format!("{prefix}{}", revision_node_text(node))
+}
 
-    // Common prefix (with or without index).
-    if let Some(idx) = node.element_index {
-        parts.push_str(&format!("- [{}] {}", idx, node.role));
-    } else {
-        parts.push_str(&format!("- {}", node.role));
-    }
+pub(crate) fn revision_node_text(node: &AXNode) -> String {
+    let mut parts = node.role.clone();
 
     // AXTitle → "title"
     if let Some(t) = &node.title {
@@ -792,6 +922,18 @@ fn format_node_line(node: &AXNode) -> String {
     // where AXTitle="" but AXDescription="2".
     if let Some(d) = &node.description {
         parts.push_str(&format!(" ({})", d));
+    }
+    if let Some(subset) = node.available_child_subset {
+        parts.push_str(&format!(
+            " (showing {}-{} of {} items)",
+            subset.start, subset.end, subset.total
+        ));
+    }
+    if node.selectable {
+        parts.push_str(" (selectable)");
+    }
+    if node.enabled == Some(false) {
+        parts.push_str(" (disabled)");
     }
 
     // Bracketed metadata block (identifier, help, actions).
@@ -835,6 +977,73 @@ fn render_lines(lines: &[(usize, String)]) -> String {
         out.push('\n');
     }
     out
+}
+
+pub(crate) fn render_nodes(nodes: &[AXNode]) -> String {
+    render_lines(
+        &nodes
+            .iter()
+            .map(|node| (node.depth, format_node_line(node)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Refresh the render fields of one retained node after a value/title AX
+/// notification. Returns false when the callback element no longer has the
+/// cached identity or role, requiring a complete resynchronization.
+///
+/// # Safety
+/// `element` must remain retained for the duration of this call.
+pub(crate) unsafe fn refresh_cached_node(node: &mut AXNode, element: AXUIElementRef) -> bool {
+    if render_identity(element) != node.render_id {
+        return false;
+    }
+    set_messaging_timeout(element);
+    let presentation = read_presentation_state(element);
+    if presentation.role != node.role {
+        return false;
+    }
+
+    let copied_value = presentation.copied_value;
+    let value = copied_value
+        .as_ref()
+        .and_then(|copied| copied.string_value.clone())
+        .filter(|value| !value.trim().is_empty())
+        .or(presentation.placeholder)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let value_state = copied_value
+        .map(|copied| copied.state_value)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| value.clone())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let control_state = read_control_state_if_actionable(node.element_index.is_some(), || {
+        read_actionable_control_state(element, value_state)
+    });
+
+    node.title = presentation
+        .title
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    node.subrole = presentation.subrole;
+    node.value = value;
+    node.description = presentation
+        .description
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    node.identifier = presentation.identifier;
+    node.help = presentation
+        .help
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    node.frame = read_screen_rect(element);
+    node.value_state = control_state.value_state;
+    node.value_description = control_state.value_description;
+    node.min_value = control_state.min_value;
+    node.max_value = control_state.max_value;
+    node.selected = control_state.selected;
+    true
 }
 
 /// Filter the tree markdown to lines matching `query` plus their ancestor chain.
@@ -900,6 +1109,62 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
+    fn display_node(role: &str, value: Option<&str>, depth: usize) -> AXNode {
+        AXNode {
+            render_id: 0,
+            element_index: None,
+            role: role.to_owned(),
+            subrole: None,
+            title: None,
+            value: value.map(str::to_owned),
+            description: None,
+            identifier: None,
+            help: None,
+            actions: Vec::new(),
+            element_ptr: 0,
+            depth,
+            parent_element_index: None,
+            frame: None,
+            value_state: None,
+            value_description: None,
+            min_value: None,
+            max_value: None,
+            enabled: None,
+            selected: None,
+            in_web_content: false,
+            selectable: false,
+            available_child_subset: None,
+        }
+    }
+
+    #[test]
+    fn signed_provider_fixture_flattens_repetition_and_renders_visible_subset() {
+        let repeated = (0..3)
+            .map(|_| display_node("AXStaticText", Some("repeated fixture text"), 1))
+            .collect();
+        let flattened = flatten_repetitive_static_text(repeated);
+        assert_eq!(flattened.len(), 1);
+        assert_eq!(
+            flattened[0].value.as_deref(),
+            Some("repeated fixture text repeated fixture text repeated fixture text")
+        );
+
+        let mut table = display_node("AXTable", None, 1);
+        table.available_child_subset = Some(AvailableChildSubset {
+            start: 0,
+            end: 7,
+            total: VISIBLE_CHILDREN_THRESHOLD,
+        });
+        assert_eq!(
+            revision_node_text(&table),
+            "AXTable (showing 0-7 of 100 items)"
+        );
+
+        let mut disabled = display_node("AXButton", None, 1);
+        disabled.enabled = Some(false);
+        assert_eq!(revision_node_text(&disabled), "AXButton (disabled)");
+    }
+
     #[test]
     fn writable_value_controls_are_addressable_without_actions() {
         assert!(is_addressable(false, true, Some(true)));
@@ -929,21 +1194,21 @@ mod tests {
         let display_only = read_control_state_if_actionable(false, || {
             reads.set(reads.get() + 1);
             ControlState {
-                enabled: Some(true),
+                selected: Some(true),
                 ..ControlState::default()
             }
         });
         assert_eq!(reads.get(), 0, "display-only nodes must not read state");
-        assert_eq!(display_only.enabled, None);
+        assert_eq!(display_only.selected, None);
 
         let actionable = read_control_state_if_actionable(true, || {
             reads.set(reads.get() + 1);
             ControlState {
-                enabled: Some(true),
+                selected: Some(true),
                 ..ControlState::default()
             }
         });
         assert_eq!(reads.get(), 1, "actionable nodes must read state once");
-        assert_eq!(actionable.enabled, Some(true));
+        assert_eq!(actionable.selected, Some(true));
     }
 }

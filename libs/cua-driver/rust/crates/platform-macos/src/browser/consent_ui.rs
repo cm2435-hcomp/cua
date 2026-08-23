@@ -255,6 +255,7 @@ mod tests {
 
     fn node(role: &str, depth: usize, title: Option<&str>, actions: &[&str]) -> AXNode {
         AXNode {
+            render_id: 0,
             element_index: (!actions.is_empty()).then_some(0),
             role: role.to_owned(),
             subrole: None,
@@ -275,6 +276,8 @@ mod tests {
             enabled: None,
             selected: None,
             in_web_content: false,
+            selectable: false,
+            available_child_subset: None,
         }
     }
 

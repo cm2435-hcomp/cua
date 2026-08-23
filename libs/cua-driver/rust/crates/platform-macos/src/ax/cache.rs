@@ -20,6 +20,7 @@ use super::bindings::AXUIElementRef;
 use super::tree::AXNode;
 use core_foundation::base::{CFRelease, CFRetain, CFTypeRef};
 use cua_driver_core::element_cache::ElementCacheCore;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// An AXUIElementRef borrowed out of the cache with an extra `CFRetain`, so it
 /// stays alive for the duration of an AX action even if a concurrent
@@ -79,12 +80,14 @@ impl Drop for CachedSnapshot {
 /// Global element cache.
 pub struct ElementCache {
     core: ElementCacheCore<CacheKey, CachedSnapshot>,
+    action_borrow_epoch: AtomicU64,
 }
 
 impl ElementCache {
     pub fn new() -> Self {
         Self {
             core: ElementCacheCore::new(),
+            action_borrow_epoch: AtomicU64::new(0),
         }
     }
 
@@ -112,7 +115,8 @@ impl ElementCache {
         window_id: u32,
         element_index: usize,
     ) -> Option<RetainedElement> {
-        self.core
+        let retained = self
+            .core
             .with_snapshot(&CacheKey { pid, window_id }, |s| {
                 let ptr = s.elements.get(element_index).copied()?;
                 if ptr != 0 {
@@ -122,7 +126,20 @@ impl ElementCache {
                 }
                 Some(RetainedElement(ptr))
             })
-            .flatten()
+            .flatten();
+        if retained.is_some() {
+            // Every production caller borrows an element to attempt a native
+            // action. Invalidate retained tree observations before dispatch so
+            // a very fast follow-up observation cannot outrun AXObserver
+            // delivery. A later refusal may cause an unnecessary full walk,
+            // which is the safe direction.
+            self.action_borrow_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        retained
+    }
+
+    pub fn action_borrow_epoch(&self) -> u64 {
+        self.action_borrow_epoch.load(Ordering::Acquire)
     }
 
     /// Number of indexed elements for (pid, window_id), or 0 if not cached.
@@ -150,6 +167,7 @@ mod tests {
     // so CFGetRetainCount is reliable.
     fn node_with_ptr(ptr: usize) -> AXNode {
         AXNode {
+            render_id: ptr,
             element_index: Some(0),
             role: String::new(),
             subrole: None,
@@ -170,6 +188,8 @@ mod tests {
             enabled: None,
             selected: None,
             in_web_content: false,
+            selectable: false,
+            available_child_subset: None,
         }
     }
 
@@ -197,9 +217,11 @@ mod tests {
         );
 
         // Borrow the element out for an action.
+        let action_epoch = cache.action_borrow_epoch();
         let guard = cache
             .get_element_retained(1, 2, 0)
             .expect("element is cached");
+        assert_eq!(cache.action_borrow_epoch(), action_epoch + 1);
         assert_eq!(
             unsafe { CFGetRetainCount(ptr as CFTypeRef) },
             base + 2,

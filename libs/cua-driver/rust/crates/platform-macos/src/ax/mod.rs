@@ -22,10 +22,12 @@ pub mod enablement;
 pub mod exact_target;
 pub mod minimized_recovery;
 pub mod tree;
+pub mod tree_provider;
 pub mod window_scope;
 
 pub use cache::ElementCache;
 pub use tree::{
     walk_tree, walk_tree_bounded, AXNode, TreeWalkResult, DEFAULT_MAX_DEPTH, DEFAULT_MAX_ELEMENTS,
 };
+pub use tree_provider::MacAxTreeProvider;
 pub use window_scope::WindowScope;
