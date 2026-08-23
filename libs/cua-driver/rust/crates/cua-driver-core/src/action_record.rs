@@ -713,6 +713,9 @@ fn transport_from_legacy(
             }
         }
         "dom_event" => ActionTransport::BrowserCdpRuntimeFunction,
+        // Linux Chromium Enter uses the same exact-page CDP key transport as
+        // text insertion. Keeping its receipt typed prevents the successful
+        // route from collapsing into an unknown/internal result upstream.
         "cdp_insert_text" | "browser_cdp_input_key" => ActionTransport::BrowserCdpInputKey,
         "trusted" => ActionTransport::BrowserCdpInputMouse,
         "chromium_cdp_scroll_gesture" => ActionTransport::BrowserCdpInputMouse,

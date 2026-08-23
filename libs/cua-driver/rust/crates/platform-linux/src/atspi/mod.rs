@@ -114,6 +114,11 @@ pub fn walk_tree_bounded(
     // enumerating the app's tree yet. Retry a few times with a short backoff
     // while the tree is suspiciously root-only, so the first get_window_state
     // after launch returns the real tree instead of an empty one. See #1927.
+    // A Calc table walk exposed that retrying the old per-attempt 25-second
+    // budget outlived the Python and guest deadlines, leaving the private
+    // worker busy until later list_apps calls lost transport. One native
+    // observation therefore owns one budget; only a fast root-only cold tree
+    // may consume another attempt from what remains.
     let deadline = Instant::now() + Duration::from_secs(25);
     let (walked, native_failure) =
         native_walk_with_retries(deadline, Duration::from_millis(150), |remaining| {

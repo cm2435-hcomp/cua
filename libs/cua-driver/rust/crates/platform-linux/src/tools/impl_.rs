@@ -2096,6 +2096,10 @@ async fn chromium_dom_set_value(
     xid: Option<u64>,
     value: &str,
 ) -> Option<ToolResult> {
+    // Chromium's Linux AT-SPI value setter acknowledged OSW form writes while
+    // the renderer retained the old value. The exact unique CDP page supplies
+    // the renderer-native setter and readback without foreground assistance;
+    // ordinary Electron apps still fall through to their native route.
     if !is_chromium_embedder(pid) {
         return None;
     }
@@ -2242,6 +2246,10 @@ fn is_gtk_process(pid: u32) -> bool {
 }
 
 fn is_focused_keyboard_toolkit_process(pid: u32) -> bool {
+    // VLC exposed the missing Qt half of this policy: X11 can address its
+    // window in the background, but Qt and GTK deliver keyboard events only
+    // through the focused seat. Refuse that route so the existing bounded
+    // foreground-assist policy can restore the spectator after delivery.
     fs::read_to_string(format!("/proc/{pid}/maps"))
         .map(|maps| maps_indicate_gtk(&maps) || maps_indicate_qt_widgets(&maps))
         .unwrap_or(false)
