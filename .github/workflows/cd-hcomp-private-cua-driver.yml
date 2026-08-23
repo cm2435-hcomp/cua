@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: 38320b1214f3540d8987e7e7f246486cb39c726c
+  SOURCE_SHA: 46d60f278979dfba01d490c97360d8db3ec0b74e
 
 jobs:
   build-linux-native:
@@ -38,7 +38,7 @@ jobs:
       - name: Check out pinned native source
         uses: actions/checkout@v4
         with:
-          ref: 38320b1214f3540d8987e7e7f246486cb39c726c
+          ref: 46d60f278979dfba01d490c97360d8db3ec0b74e
           path: source
           persist-credentials: false
 
@@ -83,7 +83,7 @@ jobs:
       - name: Check out pinned native source
         uses: actions/checkout@v4
         with:
-          ref: 38320b1214f3540d8987e7e7f246486cb39c726c
+          ref: 46d60f278979dfba01d490c97360d8db3ec0b74e
           path: source
           persist-credentials: false
 
@@ -150,7 +150,7 @@ jobs:
       - name: Check out pinned native source
         uses: actions/checkout@v4
         with:
-          ref: 38320b1214f3540d8987e7e7f246486cb39c726c
+          ref: 46d60f278979dfba01d490c97360d8db3ec0b74e
           path: source
           persist-credentials: false
 
