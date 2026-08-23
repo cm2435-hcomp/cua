@@ -10,6 +10,7 @@
 //! fall back to a minimal X11 property tree (window title + role) via x11rb.
 
 use anyhow::Result;
+use std::time::{Duration, Instant};
 
 pub mod cache;
 pub mod native;
@@ -113,45 +114,65 @@ pub fn walk_tree_bounded(
     // enumerating the app's tree yet. Retry a few times with a short backoff
     // while the tree is suspiciously root-only, so the first get_window_state
     // after launch returns the real tree instead of an empty one. See #1927.
-    const MAX_ATTEMPTS: usize = 4;
-    let mut native_failure = None;
-    for attempt in 0..MAX_ATTEMPTS {
-        match native::walk_tree_bounded(pid, xid, max_elements, max_depth) {
-            Ok(Some(walked)) => {
-                // `nodes.len() <= 1` == only the root window resolved: the
-                // cold-registry symptom. Accept any real tree immediately; only
-                // keep waiting on the degenerate case, and accept it anyway on the
-                // final attempt rather than discarding a (minimal) valid result.
-                if !walked.markdown.is_empty()
-                    && (walked.nodes.len() > 1 || attempt == MAX_ATTEMPTS - 1)
-                {
-                    let md = if let Some(q) = query {
-                        filter_tree(&walked.markdown, q)
-                    } else {
-                        walked.markdown
-                    };
-                    return AtspiTreeResult {
-                        tree_markdown: md,
-                        nodes: walked.nodes,
-                        bounds: walked.bounds,
-                        trusted: true,
-                        degraded_reason: None,
-                        window_scoped: walked.window_scoped,
-                    };
-                }
-            }
-            Ok(None) => {}
-            Err(error) => native_failure = Some(error.to_string()),
-        }
-        if attempt < MAX_ATTEMPTS - 1 {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-        }
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let (walked, native_failure) =
+        native_walk_with_retries(deadline, Duration::from_millis(150), |remaining| {
+            native::walk_tree_bounded_with_timeout(pid, xid, max_elements, max_depth, remaining)
+        });
+    if let Some(walked) = walked {
+        let md = if let Some(q) = query {
+            filter_tree(&walked.markdown, q)
+        } else {
+            walked.markdown
+        };
+        return AtspiTreeResult {
+            tree_markdown: md,
+            nodes: walked.nodes,
+            bounds: walked.bounds,
+            trusted: true,
+            degraded_reason: None,
+            window_scoped: walked.window_scoped,
+        };
     }
 
     // Fallback: X11 window properties as minimal tree.
     let mut fallback = walk_via_x11_properties(xid, query);
     fallback.degraded_reason = native_failure.map(|error| format!("atspi_walk_failed: {error}"));
     fallback
+}
+
+fn native_walk_with_retries(
+    deadline: Instant,
+    retry_delay: Duration,
+    mut walk: impl FnMut(Duration) -> Result<Option<native::WalkedTree>>,
+) -> (Option<native::WalkedTree>, Option<String>) {
+    const MAX_ATTEMPTS: usize = 4;
+    let mut root_only = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match walk(remaining) {
+            Ok(Some(walked)) if !walked.markdown.is_empty() => {
+                if walked.nodes.len() > 1 {
+                    return (Some(walked), None);
+                }
+                root_only = Some(walked);
+            }
+            Ok(Some(_)) | Ok(None) => break,
+            Err(error) => return (None, Some(error.to_string())),
+        }
+        if attempt < MAX_ATTEMPTS - 1 {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if remaining <= retry_delay {
+                break;
+            }
+            std::thread::sleep(retry_delay);
+        }
+    }
+    (root_only, None)
 }
 
 /// Perform the first advertised action on element `idx` within pid's app tree.
@@ -425,4 +446,61 @@ fn filter_tree(markdown: &str, query: &str) -> String {
     let mut r = output.join("\n");
     r.push('\n');
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walked(node_count: usize) -> native::WalkedTree {
+        let node = AtspiNode {
+            element_index: Some(0),
+            role: "window".into(),
+            name: Some("fixture".into()),
+            value: None,
+            checked: None,
+            enabled: Some(true),
+            selected: None,
+            description: None,
+            actions: vec!["activate".into()],
+            element_key: 0,
+            depth: 0,
+            parent_element_index: None,
+            in_web_content: false,
+        };
+        native::WalkedTree {
+            markdown: "- [0] window \"fixture\" [actions=[activate]]\n".into(),
+            nodes: vec![node; node_count],
+            bounds: Vec::new(),
+            window_scoped: true,
+        }
+    }
+
+    #[test]
+    fn native_walk_retries_only_root_only_success_with_one_deadline() {
+        let mut failed_calls = 0;
+        let (failed, _) = native_walk_with_retries(
+            Instant::now() + Duration::from_secs(1),
+            Duration::ZERO,
+            |_| {
+                failed_calls += 1;
+                Ok(None)
+            },
+        );
+        assert!(failed.is_none());
+        assert_eq!(failed_calls, 1);
+
+        let mut remaining_budgets = Vec::new();
+        let (walked, _) = native_walk_with_retries(
+            Instant::now() + Duration::from_secs(1),
+            Duration::ZERO,
+            |remaining| {
+                remaining_budgets.push(remaining);
+                Ok(Some(walked(remaining_budgets.len())))
+            },
+        );
+        assert_eq!(walked.expect("second walk is actionable").nodes.len(), 2);
+        assert_eq!(remaining_budgets.len(), 2);
+        assert!(remaining_budgets[1] <= remaining_budgets[0]);
+    }
 }
