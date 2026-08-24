@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: 1c28b897c3be31010d5b71d4685a98c92eaaf689
+  SOURCE_SHA: c4ff039af187003d0e84aa02400199ba8a788228
 
 jobs:
   build-linux-native:
