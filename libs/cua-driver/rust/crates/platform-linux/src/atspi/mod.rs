@@ -66,6 +66,9 @@ pub struct AtspiTreeResult {
     /// D-Bus peers which supplied this tree. Used only to scope retained-read
     /// invalidation; never returned through the public tool contract.
     pub(crate) event_sources: Vec<String>,
+    /// Only complete native topology may seed the retained provider. Bounded
+    /// caller shapes and failure prefixes remain usable without being reused.
+    pub(crate) completeness: native::WalkCompleteness,
 }
 
 /// Walk the AT-SPI tree for a window identified by (pid, xid).
@@ -96,6 +99,7 @@ pub(crate) fn walk_tree_for_recording(
                 degraded_reason: None,
                 window_scoped: walked.window_scoped,
                 event_sources: walked.event_sources,
+                completeness: walked.completeness,
             };
         }
     }
@@ -166,6 +170,7 @@ pub(crate) fn walk_tree_bounded_uncached(
             degraded_reason: None,
             window_scoped: walked.window_scoped,
             event_sources: walked.event_sources,
+            completeness: walked.completeness,
         };
     }
 
@@ -335,6 +340,7 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
                 degraded_reason: None,
                 window_scoped: false,
                 event_sources: Vec::new(),
+                completeness: native::WalkCompleteness::Incomplete,
             }
         }
     };
@@ -397,6 +403,7 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
         window_scoped: true,
         degraded_reason: None,
         event_sources: Vec::new(),
+        completeness: native::WalkCompleteness::Incomplete,
     }
 }
 
@@ -510,6 +517,7 @@ mod tests {
             bounds: Vec::new(),
             window_scoped: true,
             event_sources: vec![":1.20".into()],
+            completeness: native::WalkCompleteness::Complete,
         }
     }
 

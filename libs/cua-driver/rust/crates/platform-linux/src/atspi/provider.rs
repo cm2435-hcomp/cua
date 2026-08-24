@@ -231,6 +231,11 @@ impl AtspiTreeProvider {
                 .all(|source| source.starts_with(':'));
         let cache_status = if !cache_shape {
             "full_walk_custom_shape"
+        } else if tree.completeness != super::native::WalkCompleteness::Complete {
+            // A timeout/error prefix is still useful to its immediate caller,
+            // but reusing it would silently turn missing descendants or bounds
+            // into the stable baseline for every later observation.
+            "full_walk_incomplete"
         } else if !tree.trusted {
             "full_walk_untrusted"
         } else if !tree.window_scoped {
@@ -323,6 +328,7 @@ mod tests {
             degraded_reason: None,
             window_scoped: true,
             event_sources: vec![":1.20".to_owned()],
+            completeness: crate::atspi::native::WalkCompleteness::Complete,
         }
     }
 
@@ -330,6 +336,26 @@ mod tests {
         let mut tree = fixture_tree();
         tree.event_sources = vec!["org.a11y.atspi.WebKit.WebProcess.fixture".to_owned()];
         tree
+    }
+
+    #[test]
+    fn incomplete_walk_never_seeds_the_retained_cache() {
+        let provider = AtspiTreeProvider::new();
+        let events = EventJournal::new();
+        events.set_reliable();
+        let walks = std::cell::Cell::new(0);
+        let observe = || {
+            provider.observe_with(20, 99, None, None, None, true, &events, || {
+                walks.set(walks.get() + 1);
+                let mut tree = fixture_tree();
+                tree.completeness = crate::atspi::native::WalkCompleteness::Incomplete;
+                tree
+            })
+        };
+
+        assert_eq!(observe().1, "full_walk_incomplete");
+        assert_eq!(observe().1, "full_walk_incomplete");
+        assert_eq!(walks.get(), 2);
     }
 
     #[test]

@@ -296,6 +296,10 @@ fn is_document_role(role: &str) -> bool {
     r.contains("document") || r == "embedded"
 }
 
+fn should_enumerate_children(states: Option<&StateSet>) -> bool {
+    !states.is_some_and(|states| states.contains(State::ManagesDescendants))
+}
+
 fn is_web_process_bus(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name.contains("webkit") || name.contains("webprocess")
@@ -596,7 +600,7 @@ async fn collect_visited<'a>(
 ) -> Result<Option<Vec<Visited<'a>>>> {
     collect_visited_bounded(conn, pid, 0, None, None)
         .await
-        .map(|walked| walked.map(|(visited, _)| visited))
+        .map(|walked| walked.map(|(visited, _, _)| visited))
 }
 
 /// Screen-space distance between an AT-SPI frame's extents and a native
@@ -769,7 +773,8 @@ async fn collect_visited_bounded<'a>(
     xid: u64,
     max_elements: Option<usize>,
     max_depth: Option<usize>,
-) -> Result<Option<(Vec<Visited<'a>>, Option<usize>)>> {
+) -> Result<Option<(Vec<Visited<'a>>, Option<usize>, WalkCompleteness)>> {
+    let walk_started = std::time::Instant::now();
     let app = match app_for_pid(conn, pid).await? {
         Some(a) => a,
         None => return Ok(None),
@@ -827,14 +832,21 @@ async fn collect_visited_bounded<'a>(
     // time out too. Give up after a few so type_text falls back to XTEST in a
     // few seconds rather than ~25s.
     let mut consecutive_timeouts = 0u32;
+    let mut completeness = WalkCompleteness::Complete;
 
     while let Some((oref, depth, inherited_web_doc, frame_ordinal)) = stack.pop() {
         if budget == 0 {
             dlog!("node budget exhausted; truncating walk");
+            completeness = if max_elements.is_some() {
+                WalkCompleteness::Bounded
+            } else {
+                WalkCompleteness::Incomplete
+            };
             break;
         }
         if std::time::Instant::now() >= deadline {
             dlog!("collect_visited time budget exhausted; returning partial walk");
+            completeness = WalkCompleteness::Incomplete;
             break;
         }
         budget -= 1;
@@ -854,9 +866,11 @@ async fn collect_visited_bounded<'a>(
             Some(Ok(a)) => a,
             Some(Err(error)) => {
                 dlog!("  accessible_for failed: {error:#}");
+                completeness = WalkCompleteness::Incomplete;
                 continue;
             }
             None => {
+                completeness = WalkCompleteness::Incomplete;
                 consecutive_timeouts += 1;
                 if consecutive_timeouts >= 3 {
                     dlog!(
@@ -879,11 +893,13 @@ async fn collect_visited_bounded<'a>(
             // A completed-but-errored call is node-specific; keep walking.
             Some(Err(error)) => {
                 dlog!("  get_interfaces failed: {error:#}");
+                completeness = WalkCompleteness::Incomplete;
                 continue;
             }
             // A timeout means the app didn't answer in CALL_TIMEOUT. A run of
             // these means the whole app is wedged — bail so callers fall back.
             None => {
+                completeness = WalkCompleteness::Incomplete;
                 consecutive_timeouts += 1;
                 if consecutive_timeouts >= 3 {
                     dlog!(
@@ -901,14 +917,15 @@ async fn collect_visited_bounded<'a>(
         let has_component = ifaces.contains(Interface::Component);
         let has_text = ifaces.contains(Interface::Text);
 
-        // These four are independent — issue them concurrently to cut the
-        // per-node round-trip cost (large trees like Chromium's have hundreds
-        // of nodes, so sequential reads dominate the walk time).
-        let (role_r, name_r, state_r, children_r) = tokio::join!(
+        // State must resolve before children. Large virtual containers such as
+        // Calc's grid publish MANAGES_DESCENDANTS specifically so AT clients
+        // do not enumerate and materialize every cell. Querying GetChildren in
+        // parallel with state caused LibreOffice to allocate ~10.5 GiB and
+        // stop servicing AT-SPI before this guard could act.
+        let (role_r, name_r, state_r) = tokio::join!(
             call(acc.get_role_name()),
             call(acc.name()),
             call(acc.get_state()),
-            call(raw_children(zconn, &oref)),
         );
         let role = match role_r {
             Some(Ok(r)) => r,
@@ -1012,19 +1029,30 @@ async fn collect_visited_bounded<'a>(
         // Children inherit web-document context, plus this node's own role.
         let child_in_web_doc = in_web_doc || is_document_role(&role);
 
-        // Enqueue children (fetched above) before moving `acc` into `visited`.
-        // Honor max_depth (#22865): skip enqueueing descendants whose depth
-        // would exceed the cap.
+        // Honor max_depth (#22865) and AT-SPI's MANAGES_DESCENDANTS contract
+        // before issuing GetChildren. The managed container itself remains in
+        // the tree; its provider announces relevant descendants through
+        // active-descendant/state events instead of requiring enumeration.
         let descend = max_depth.map(|d| depth + 1 <= d).unwrap_or(true);
-        if descend {
-            match children_r {
+        if !descend && max_depth.is_some() && completeness == WalkCompleteness::Complete {
+            completeness = WalkCompleteness::Bounded;
+        }
+        let states = state_r.as_ref().and_then(|state| state.as_ref().ok());
+        if descend && should_enumerate_children(states) {
+            match call(raw_children(zconn, &oref)).await {
                 Some(Ok(children)) => {
                     for c in children.into_iter().rev() {
                         stack.push((c, depth + 1, child_in_web_doc, frame_ordinal));
                     }
                 }
-                Some(Err(error)) => dlog!("  get_children failed: {error:#}"),
-                None => dlog!("  get_children timed out"),
+                Some(Err(error)) => {
+                    dlog!("  get_children failed: {error:#}");
+                    completeness = WalkCompleteness::Incomplete;
+                }
+                None => {
+                    dlog!("  get_children timed out");
+                    completeness = WalkCompleteness::Incomplete;
+                }
             }
         }
 
@@ -1050,8 +1078,12 @@ async fn collect_visited_bounded<'a>(
         });
     }
 
-    dlog!("walked pid {pid}: {} node(s)", visited.len());
-    Ok(Some((visited, scoped_frame)))
+    dlog!(
+        "walked pid {pid}: {} node(s) in {}ms ({completeness:?})",
+        visited.len(),
+        walk_started.elapsed().as_millis()
+    );
+    Ok(Some((visited, scoped_frame, completeness)))
 }
 
 /// Render visited nodes into the markdown + node list `walk_tree` returns.
@@ -1242,6 +1274,17 @@ pub struct WalkedTree {
     /// means the snapshot spans every window the application publishes.
     pub window_scoped: bool,
     pub event_sources: Vec<String>,
+    pub completeness: WalkCompleteness,
+}
+
+/// Whether the returned topology is a complete application walk. Bounded
+/// caller-requested shapes and failure prefixes remain usable by that caller,
+/// but only `Complete` may seed the retained provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkCompleteness {
+    Complete,
+    Bounded,
+    Incomplete,
 }
 
 /// Walk the AT-SPI tree with caller-supplied node + depth caps.
@@ -1279,7 +1322,7 @@ pub(super) fn walk_tree_bounded_with_timeout(
                 return Ok(None);
             }
         };
-        let Some((visited, scoped_frame)) = walked else {
+        let Some((visited, scoped_frame, mut completeness)) = walked else {
             return Ok(None);
         };
         let (markdown, nodes) = render(&visited, scoped_frame);
@@ -1292,6 +1335,7 @@ pub(super) fn walk_tree_bounded_with_timeout(
             Ok(bounds) => bounds,
             Err(_) => {
                 dlog!("element bounds timed out for pid {pid}");
+                completeness = WalkCompleteness::Incomplete;
                 Vec::new()
             }
         };
@@ -1319,6 +1363,7 @@ pub(super) fn walk_tree_bounded_with_timeout(
             bounds,
             window_scoped: scoped_frame.is_some(),
             event_sources,
+            completeness,
         }))
     })
 }
@@ -2559,7 +2604,7 @@ async fn set_value_inner(
     let conn = shared_connection()
         .await
         .map_err(|error| refuse(format!("AT-SPI connection unavailable: {error}")))?;
-    let (visited, scoped_frame) = collect_visited_bounded(conn, pid, xid, None, None)
+    let (visited, scoped_frame, _) = collect_visited_bounded(conn, pid, xid, None, None)
         .await
         .map_err(|error| refuse(format!("AT-SPI tree unavailable: {error}")))?
         .ok_or_else(|| refuse(format!("no AT-SPI application for pid {pid}")))?;
@@ -3233,6 +3278,7 @@ async fn element_bounds_for_visited(
     pid: u32,
     xid: u64,
 ) -> Vec<(usize, i32, i32, u32, u32)> {
+    let bounds_started = std::time::Instant::now();
     // Query WINDOW-relative extents and add a deterministic screen offset
     // (X11 window origin + GTK4 CSD inset). This fixes GTK4 — whose
     // CoordType::Screen reports every element at (0,0) — by using the
@@ -3391,6 +3437,12 @@ async fn element_bounds_for_visited(
             ));
         }
     }
+    dlog!(
+        "collected {} bound(s) from {} indexable node(s) in {}ms",
+        out.len(),
+        action_nodes.len(),
+        bounds_started.elapsed().as_millis()
+    );
     out
 }
 
@@ -3527,8 +3579,8 @@ mod coord_tests {
         is_activation_action, is_enabled_state, is_indexable_capabilities, is_passive_role,
         is_web_process_bus, portable_action_index, prefer_authoritative_wayland_origin,
         rebase_renderer_window_offset, resolve_text_selection_offsets, screen_extent_rebase,
-        select_click_target, validate_scoped_action_index, ApplicationSelection,
-        TextSelectionRequest, TextSelectionType,
+        select_click_target, should_enumerate_children, validate_scoped_action_index,
+        ApplicationSelection, TextSelectionRequest, TextSelectionType,
     };
     use atspi::{State, StateSet};
     use std::time::Duration;
@@ -3726,6 +3778,15 @@ mod coord_tests {
             State::Enabled | State::Sensitive
         )));
         assert!(!is_enabled_state(&StateSet::empty()));
+    }
+
+    #[test]
+    fn virtual_containers_are_retained_without_enumerating_managed_descendants() {
+        assert!(!should_enumerate_children(Some(&StateSet::new(
+            State::ManagesDescendants
+        ))));
+        assert!(should_enumerate_children(Some(&StateSet::empty())));
+        assert!(should_enumerate_children(None));
     }
 
     #[test]
