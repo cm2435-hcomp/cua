@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 pub mod cache;
 pub mod native;
+mod provider;
 pub use cache::ElementCache;
 pub use native::ensure_listener_active;
 
@@ -45,6 +46,7 @@ pub struct AtspiNode {
     pub in_web_content: bool,
 }
 
+#[derive(Clone)]
 pub struct AtspiTreeResult {
     pub tree_markdown: String,
     pub nodes: Vec<AtspiNode>,
@@ -61,6 +63,9 @@ pub struct AtspiTreeResult {
     /// snapshot of a multi-window app carries every window's controls; callers
     /// that act on behalf of an exact native window must require this.
     pub window_scoped: bool,
+    /// D-Bus peers which supplied this tree. Used only to scope retained-read
+    /// invalidation; never returned through the public tool contract.
+    pub(crate) event_sources: Vec<String>,
 }
 
 /// Walk the AT-SPI tree for a window identified by (pid, xid).
@@ -90,6 +95,7 @@ pub(crate) fn walk_tree_for_recording(
                 trusted: true,
                 degraded_reason: None,
                 window_scoped: walked.window_scoped,
+                event_sources: walked.event_sources,
             };
         }
     }
@@ -101,6 +107,28 @@ pub(crate) fn walk_tree_for_recording(
 /// Issue #22865: caps protect against Electron / large web apps that
 /// produce 10k+ element trees and blow context windows.
 pub fn walk_tree_bounded(
+    pid: u32,
+    xid: u64,
+    query: Option<&str>,
+    max_elements: Option<usize>,
+    max_depth: Option<usize>,
+) -> AtspiTreeResult {
+    walk_tree_bounded_uncached(pid, xid, query, max_elements, max_depth)
+}
+
+pub(crate) fn observe_tree_bounded(
+    pid: u32,
+    xid: u64,
+    query: Option<&str>,
+    max_elements: Option<usize>,
+    max_depth: Option<usize>,
+    allow_cache: bool,
+) -> (AtspiTreeResult, &'static str) {
+    let _ = native::ensure_event_monitor();
+    provider::global().observe(pid, xid, query, max_elements, max_depth, allow_cache)
+}
+
+pub(crate) fn walk_tree_bounded_uncached(
     pid: u32,
     xid: u64,
     query: Option<&str>,
@@ -137,6 +165,7 @@ pub fn walk_tree_bounded(
             trusted: true,
             degraded_reason: None,
             window_scoped: walked.window_scoped,
+            event_sources: walked.event_sources,
         };
     }
 
@@ -305,6 +334,7 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
                 trusted: false,
                 degraded_reason: None,
                 window_scoped: false,
+                event_sources: Vec::new(),
             }
         }
     };
@@ -366,6 +396,7 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
         // proving anything a caller acts on.
         window_scoped: true,
         degraded_reason: None,
+        event_sources: Vec::new(),
     }
 }
 
@@ -478,6 +509,7 @@ mod tests {
             nodes: vec![node; node_count],
             bounds: Vec::new(),
             window_scoped: true,
+            event_sources: vec![":1.20".into()],
         }
     }
 

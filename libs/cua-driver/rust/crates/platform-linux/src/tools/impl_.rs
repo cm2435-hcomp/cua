@@ -930,13 +930,21 @@ impl Tool for GetWindowStateTool {
         let query_for_walk = query.clone();
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let tree_result = Some(crate::atspi::walk_tree_bounded(
+            let (tree_result, tree_cache_status) = crate::atspi::observe_tree_bounded(
                 pid,
                 xid,
                 query_for_walk.as_deref(),
                 max_elements,
                 max_depth,
-            ));
+                !observation_only,
+            );
+            tracing::debug!(
+                pid,
+                window_id = xid,
+                cache_status = tree_cache_status,
+                "Linux AT-SPI provider observation"
+            );
+            let tree_result = Some(tree_result);
             // Bounds and element indices come from the same captured AT-SPI
             // traversal. Joining two live walks by ordinal mis-associated
             // Chromium controls when its lazy subtree changed between walks.
@@ -976,12 +984,12 @@ impl Tool for GetWindowStateTool {
             } else {
                 None
             };
-            Ok((tree_result, screenshot, bounds))
+            Ok((tree_result, screenshot, bounds, tree_cache_status))
         })
         .await;
 
         match result {
-            Ok(Ok((tree_opt, shot_opt, bounds))) => {
+            Ok(Ok((tree_opt, shot_opt, bounds, tree_cache_status))) => {
                 if tree_opt.as_ref().is_some_and(|tree| !tree.window_scoped)
                     && crate::wayland::list_windows_dispatch(Some(pid)).len() > 1
                 {
@@ -1002,6 +1010,7 @@ impl Tool for GetWindowStateTool {
                 }
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
+                structured["atspi_tree_cache_status"] = json!(tree_cache_status);
                 add_window_bounds(&mut structured, &target_window);
 
                 if let Some(tr) = tree_opt {

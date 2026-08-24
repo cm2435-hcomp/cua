@@ -101,6 +101,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 
 static SHARED_CONNECTION: tokio::sync::OnceCell<AccessibilityConnection> =
     tokio::sync::OnceCell::const_new();
+static OBJECT_EVENTS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Keep one AT-SPI connection and registry registration alive for the daemon
 /// lifetime. WebKitGTK only publishes its WebProcess accessibility subtree
@@ -111,8 +112,13 @@ async fn shared_connection() -> Result<&'static AccessibilityConnection> {
             let conn = AccessibilityConnection::new()
                 .await
                 .map_err(|error| anyhow!("AT-SPI connect failed: {error}"))?;
-            if let Err(error) = conn.add_registry_event::<atspi::ObjectEvents>().await {
-                dlog!("AT-SPI object-event registration failed: {error}");
+            // LibreOffice can exhaust the desktop when unchanged trees are
+            // walked repeatedly. Register both the AT-SPI registry interest and
+            // the D-Bus match rule so the retained provider can fail closed on
+            // every object event instead of trusting a blind cache.
+            match conn.register_event::<atspi::ObjectEvents>().await {
+                Ok(()) => OBJECT_EVENTS_REGISTERED.store(true, Ordering::Release),
+                Err(error) => dlog!("AT-SPI object-event registration failed: {error}"),
             }
             Ok(conn)
         })
@@ -123,7 +129,24 @@ async fn shared_connection() -> Result<&'static AccessibilityConnection> {
 /// launched. Idempotent; later calls reuse the same connection.
 pub fn ensure_listener_active() -> Result<()> {
     wait_for_listener_startup(LISTENER_STARTUP_TIMEOUT, || {
-        runtime().block_on(async { shared_connection().await.map(|_| ()) })
+        runtime().block_on(async {
+            let connection = shared_connection().await?;
+            if OBJECT_EVENTS_REGISTERED.load(Ordering::Acquire) {
+                super::provider::start_event_monitor(connection);
+            }
+            Ok(())
+        })
+    })
+}
+
+pub(super) fn ensure_event_monitor() -> Result<()> {
+    runtime().block_on(async {
+        let connection = shared_connection().await?;
+        if !OBJECT_EVENTS_REGISTERED.load(Ordering::Acquire) {
+            anyhow::bail!("AT-SPI object-event registration unavailable");
+        }
+        super::provider::start_event_monitor(connection);
+        Ok(())
     })
 }
 
@@ -231,6 +254,9 @@ mod listener_startup_tests {
 /// A node discovered during the pre-order walk, with its proxy retained so the
 /// per-index operations can act on it without re-walking the tree.
 struct Visited<'a> {
+    /// D-Bus peer which supplied this node. Retained reads use the complete set
+    /// only for process-scoped event invalidation.
+    source_name: String,
     depth: usize,
     role: String,
     /// Display text: the accessible `name`, or — for editable/text widgets that
@@ -1003,6 +1029,7 @@ async fn collect_visited_bounded<'a>(
         }
 
         visited.push(Visited {
+            source_name: oref.name.clone(),
             depth,
             role,
             name,
@@ -1205,6 +1232,7 @@ pub fn walk_tree(pid: u32) -> Result<Option<(String, Vec<AtspiNode>)>> {
 
 /// One accessibility snapshot, plus whether it was provably narrowed to the
 /// caller's window.
+#[derive(Clone)]
 pub struct WalkedTree {
     pub markdown: String,
     pub nodes: Vec<AtspiNode>,
@@ -1213,6 +1241,7 @@ pub struct WalkedTree {
     /// top-level and the snapshot contains only that window's nodes. False
     /// means the snapshot spans every window the application publishes.
     pub window_scoped: bool,
+    pub event_sources: Vec<String>,
 }
 
 /// Walk the AT-SPI tree with caller-supplied node + depth caps.
@@ -1278,11 +1307,18 @@ pub(super) fn walk_tree_bounded_with_timeout(
         } else {
             bounds
         };
+        let event_sources = visited
+            .iter()
+            .map(|node| node.source_name.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
         Ok(Some(WalkedTree {
             markdown,
             nodes,
             bounds,
             window_scoped: scoped_frame.is_some(),
+            event_sources,
         }))
     })
 }
@@ -1550,6 +1586,7 @@ async fn write_through_editable_proxies(
 /// Write into the best editable exposed by the current AT-SPI tree without
 /// falling through to synthetic X11 input.
 pub fn type_into_editable(pid: u32, text: &str) -> Result<()> {
+    super::provider::global().invalidate_pid(pid);
     bounded(
         async {
             let conn = shared_connection().await?;
@@ -1568,6 +1605,7 @@ pub fn type_into_editable(pid: u32, text: &str) -> Result<()> {
 
 /// Write into the exact indexed editable exposed by the caller's snapshot.
 pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
+    super::provider::global().invalidate_pid(pid);
     bounded(
         async {
             let conn = shared_connection().await?;
@@ -1613,6 +1651,7 @@ pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
 }
 
 pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
+    super::provider::global().invalidate_pid(pid);
     bounded(
         async {
             let conn = shared_connection().await?;
@@ -1906,6 +1945,7 @@ fn exact_menu_path_matches(visited: &[Visited<'_>], path: &[String]) -> Vec<usiz
 /// Every hop re-walks AT-SPI after the preceding menu has materialized; no
 /// snapshot index is retained across mutations.
 pub fn invoke_menu_path(pid: u32, path: &[String]) -> Result<()> {
+    super::provider::global().invalidate_pid(pid);
     bounded(
         async {
             let conn = shared_connection().await?;
@@ -1953,6 +1993,7 @@ pub fn invoke_menu_path(pid: u32, path: &[String]) -> Result<()> {
 }
 
 pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
+    super::provider::global().invalidate_pid(pid);
     bounded(
         async {
             let conn = shared_connection().await?;
@@ -2011,6 +2052,7 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
 }
 
 pub fn perform_named_action(pid: u32, idx: usize, requested: &str) -> Result<(String, bool)> {
+    super::provider::global().invalidate_pid(pid);
     let requested = requested.to_owned();
     bounded(
         async {
@@ -2059,6 +2101,7 @@ pub fn perform_named_action(pid: u32, idx: usize, requested: &str) -> Result<(St
 /// `scrollDown`/`scrollForward`; using that accessibility route avoids the
 /// X11 `Button5` event path that Chromium silently drops in background mode.
 pub fn scroll_element(pid: u32, idx: usize, direction: &str, amount: usize) -> Result<()> {
+    super::provider::global().invalidate_pid(pid);
     bounded(
         async {
             let conn = shared_connection().await?;
@@ -2170,6 +2213,7 @@ pub fn scroll_element(pid: u32, idx: usize, direction: &str, amount: usize) -> R
 /// if a toolkit does not publish that state, retain the historical successful
 /// result after a bounded settling interval.
 pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
+    super::provider::global().invalidate_pid(pid);
     bounded(
         async {
             let conn = shared_connection().await?;
@@ -2240,6 +2284,7 @@ pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
 /// when an element was actuated, `Ok(None)` when no actionable element covers the
 /// point (the caller then falls back to the synthetic X11 path).
 pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Option<String>> {
+    super::provider::global().invalidate_pid(pid);
     bounded(
         async {
             let conn = shared_connection().await?;
@@ -2341,6 +2386,7 @@ pub fn perform_action_at_screen_point(
     screen_x: i32,
     screen_y: i32,
 ) -> Result<Option<String>> {
+    super::provider::global().invalidate_pid(pid);
     bounded(
         async {
             let conn = shared_connection().await?;
@@ -2606,6 +2652,7 @@ pub fn set_value(
     idx: usize,
     value: &str,
 ) -> std::result::Result<(), SetValueFailure> {
+    super::provider::global().invalidate_pid(pid);
     let dispatched = Arc::new(AtomicBool::new(false));
     let dispatched_for_call = dispatched.clone();
     let replacement = value.to_owned();
@@ -2817,6 +2864,7 @@ pub fn select_text(
     idx: usize,
     request: TextSelectionRequest,
 ) -> std::result::Result<TextSelectionOutcome, TextSelectionFailure> {
+    super::provider::global().invalidate_pid(pid);
     let dispatched = Arc::new(AtomicBool::new(false));
     let dispatched_for_call = dispatched.clone();
     runtime().block_on(async move {
