@@ -929,7 +929,7 @@ impl Tool for GetWindowStateTool {
         let state = self.state.clone();
         let query_for_walk = query.clone();
 
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let result = tokio::task::spawn_blocking(move || -> Result<_, (&'static str, String)> {
             let (tree_result, tree_cache_status) = crate::atspi::observe_tree_bounded(
                 pid,
                 xid,
@@ -964,11 +964,17 @@ impl Tool for GetWindowStateTool {
                         let orig_w = crate::capture::png_dimensions_pub(&raw)
                             .map(|(w, _)| w)
                             .unwrap_or(0);
-                        let png = crate::capture::resize_png_if_needed(&raw, max_dim)?;
-                        let (w, h) = crate::capture::png_dimensions_pub(&png)?;
+                        let png = crate::capture::resize_png_if_needed(&raw, max_dim).map_err(
+                            |error| ("linux_observation_screenshot_resize", error.to_string()),
+                        )?;
+                        let (w, h) = crate::capture::png_dimensions_pub(&png).map_err(|error| {
+                            ("linux_observation_screenshot_dimensions", error.to_string())
+                        })?;
                         let original_w = if w < orig_w { Some(orig_w) } else { None };
                         if let Some(ref path) = screenshot_out_file {
-                            std::fs::write(path, &png)?;
+                            std::fs::write(path, &png).map_err(|error| {
+                                ("linux_observation_screenshot_write", error.to_string())
+                            })?;
                             Some((None, Some(path.clone()), w, h, original_w))
                         } else {
                             use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -976,8 +982,9 @@ impl Tool for GetWindowStateTool {
                         }
                     }
                     Err(error) => {
-                        return Err(anyhow::anyhow!(
-                            "window screenshot failed for window {xid}: {error}"
+                        return Err((
+                            "linux_observation_screenshot_capture",
+                            format!("window screenshot failed for window {xid}: {error}"),
                         ));
                     }
                 }
@@ -1207,23 +1214,63 @@ impl Tool for GetWindowStateTool {
                     action_record: None,
                 }
             }
-            Ok(Err(e)) => decorate_linux_observation_error(
-                ToolResult::error(format!("Capture error: {e}")),
+            Ok(Err((failure_site, error))) => linux_observation_failure(
+                failure_site,
+                format!("Capture error: {error}"),
                 minimized_recovery.as_ref(),
             ),
-            Err(e) => decorate_linux_observation_error(
-                ToolResult::error(format!("Task error: {e}")),
+            Err(error) => linux_observation_failure(
+                "linux_observation_task_join",
+                format!("Task error: {error}"),
                 minimized_recovery.as_ref(),
             ),
         }
     }
 }
 
-fn decorate_linux_observation_error(
-    result: ToolResult,
+fn linux_observation_failure(
+    failure_site: &'static str,
+    message: String,
     recovery: Option<&crate::x11::minimized_recovery::RecoveryEvidence>,
 ) -> ToolResult {
-    decorate_linux_post_recovery_error(result, recovery)
+    // OSW exposed these as identical `internal/preflight` failures after
+    // healthy Calc reads. Keep user-visible semantics unchanged while naming
+    // the content-free native stage needed to distinguish capture from task
+    // failure on the next focused reproduction.
+    decorate_linux_post_recovery_error(
+        ToolResult::error(message).with_structured(json!({
+            "code": "internal",
+            "phase": "preflight",
+            "retryable": false,
+            "effect": "refused",
+            "effect_may_have_occurred": false,
+            "native_side_effect_started": false,
+            "failure_site": failure_site,
+        })),
+        recovery,
+    )
+}
+
+#[cfg(test)]
+mod observation_failure_tests {
+    use super::linux_observation_failure;
+
+    #[test]
+    fn observation_failure_retains_its_content_free_native_site() {
+        let result = linux_observation_failure(
+            "linux_observation_screenshot_capture",
+            "fixture failure".to_owned(),
+            None,
+        );
+        let structured = result.structured_content.expect("structured failure");
+        assert_eq!(structured["code"], "internal");
+        assert_eq!(structured["phase"], "preflight");
+        assert_eq!(
+            structured["failure_site"],
+            "linux_observation_screenshot_capture"
+        );
+        assert_eq!(structured["native_side_effect_started"], false);
+    }
 }
 
 fn decorate_linux_post_recovery_error(
