@@ -1034,7 +1034,7 @@ impl Tool for GetWindowStateTool {
                         header + &tr.tree_markdown,
                     ));
                     if !observation_only {
-                        state.element_cache.update(pid, xid, &tr.nodes);
+                        state.element_cache.update(pid, xid, &tr.nodes, &bounds);
                     }
                     structured["element_count"] = json!(count);
                     // AT-SPI's current bounded walker does not surface an
@@ -2964,13 +2964,28 @@ impl Tool for ClickTool {
 
         if let Some(idx) = elem_idx_resolved {
             let xid_hint = window_id_resolved;
+            let observed_bounds =
+                xid_hint.and_then(|xid| self.state.element_cache.get_element_bounds(pid, xid, idx));
             // Resolve the element's screen center + its window FIRST, so the
             // agent cursor glides to the target *before* the click fires —
             // matching the coordinate path below and the macOS/Windows backends.
             // Previously perform_action ran inside this spawn_blocking, so the
             // app updated before the cursor visibly arrived.
             let (xid, sx, sy) = tokio::task::spawn_blocking(move || -> (u64, f64, f64) {
-                let (cx, cy) = element_screen_center(pid, idx).unwrap_or((0.0, 0.0));
+                // LibreOffice semantic clicks used to repeat the entire AT-SPI
+                // walk solely to animate the cursor, then walk again to press.
+                // Two 25s native budgets can outrun the 45s authority deadline.
+                // Reuse only observation geometry here; action dispatch below
+                // still resolves the live tree and therefore keeps its safety.
+                let (cx, cy) = observed_bounds
+                    .map(|(x, y, width, height)| {
+                        (
+                            x as f64 + width as f64 / 2.0,
+                            y as f64 + height as f64 / 2.0,
+                        )
+                    })
+                    .or_else(|| element_screen_center(pid, idx).ok())
+                    .unwrap_or((0.0, 0.0));
                 let xid = xid_hint
                     .or_else(|| {
                         crate::x11::list_windows(Some(pid))
