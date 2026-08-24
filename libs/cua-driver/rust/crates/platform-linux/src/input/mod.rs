@@ -2745,6 +2745,17 @@ fn key_name_to_keysym(key: &str) -> Result<u32> {
     Ok(keysym)
 }
 
+/// Validate the finite X11 key vocabulary before opening a connection or
+/// queuing input. OSW once supplied `Page_Down`; letting that fail inside the
+/// dispatch task erased the fact that no native event had started.
+pub(crate) fn validate_x11_key_chord(key: &str, modifiers: &[String]) -> Result<()> {
+    key_name_to_keysym(key)?;
+    for modifier in modifiers {
+        key_name_to_keysym(modifier)?;
+    }
+    Ok(())
+}
+
 /// A keycode we have *temporarily* rebound to host a keysym that is absent from
 /// the current X keyboard map (sparse/headless keymaps such as a minimal
 /// Xwayland). On drop it reinstates the keycode's original keysyms so the

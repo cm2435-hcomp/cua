@@ -3996,9 +3996,21 @@ fn press_key_chord(mods: &[String], key: &str) -> Option<Vec<String>> {
     Some(chord)
 }
 
+fn invalid_key_refusal(error: impl std::fmt::Display) -> ToolResult {
+    ToolResult::error(error.to_string()).with_structured(json!({
+        "code": "invalid_request",
+        "phase": "preflight",
+        "retryable": false,
+        "effect": "refused",
+        "effect_may_have_occurred": false,
+        "native_side_effect_started": false,
+        "dispatch_scope": "target"
+    }))
+}
+
 #[cfg(test)]
 mod press_key_tests {
-    use super::press_key_chord;
+    use super::{invalid_key_refusal, press_key_chord};
 
     #[test]
     fn unmodified_press_stays_on_the_single_key_route() {
@@ -4023,6 +4035,17 @@ mod press_key_tests {
         // takes the last non-modifier as the key. Appending keeps that true.
         let chord = press_key_chord(&["ctrl".to_owned()], "s").expect("chord");
         assert_eq!(chord.last().map(String::as_str), Some("s"));
+    }
+
+    #[test]
+    fn invalid_key_refusal_proves_dispatch_never_started() {
+        let refusal = invalid_key_refusal("Unknown key: Page_Down");
+        assert_eq!(refusal.is_error, Some(true));
+        let structured = refusal.structured_content.expect("structured refusal");
+        assert_eq!(structured["code"], "invalid_request");
+        assert_eq!(structured["phase"], "preflight");
+        assert_eq!(structured["effect_may_have_occurred"], false);
+        assert_eq!(structured["native_side_effect_started"], false);
     }
 }
 
@@ -4063,6 +4086,11 @@ impl Tool for PressKeyTool {
             let display = key.clone();
             let modifiers = input.modifiers.unwrap_or_default();
             let wayland = crate::wayland::wayland_input_enabled();
+            if !wayland {
+                if let Err(error) = crate::input::validate_x11_key_chord(&key, &modifiers) {
+                    return invalid_key_refusal(error);
+                }
+            }
             let path = if wayland { "wayland_focused" } else { "xtest" };
             let result = tokio::task::spawn_blocking(move || {
                 if wayland && modifiers.is_empty() {
@@ -4092,6 +4120,11 @@ impl Tool for PressKeyTool {
             Err(e) => return e,
         };
         let mods: Vec<String> = args.str_array("modifiers");
+        if !crate::wayland::wayland_input_enabled() && !crate::wayland::is_inject_mode() {
+            if let Err(error) = crate::input::validate_x11_key_chord(&key, &mods) {
+                return invalid_key_refusal(error);
+            }
+        }
 
         // Surface 6: resolve element_token / element_index for the window-id
         // hint. press_key targets a window via XSendEvent, so we only need
