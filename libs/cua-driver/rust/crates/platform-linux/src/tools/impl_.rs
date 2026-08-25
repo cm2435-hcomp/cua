@@ -1040,30 +1040,21 @@ impl Tool for GetWindowStateTool {
 
         match result {
             Ok(Ok((tree_opt, shot_opt, bounds, tree_cache_status))) => {
-                if tree_opt.as_ref().is_some_and(|tree| !tree.window_scoped)
-                    && crate::wayland::list_windows_dispatch(Some(pid)).len() > 1
-                {
-                    let refusal = ToolResult::error(format!(
-                        "Could not prove which AT-SPI top-level owns exact window {xid}; refresh after the window geometry or title settles."
-                    ))
-                    .with_structured(json!({
-                        "code": "observation_raced",
-                        "phase": "preflight",
-                        "retryable": true,
-                        "effect": "refused",
-                        "dispatch_scope": "target"
-                    }));
-                    return decorate_linux_post_recovery_error(
-                        refusal,
-                        minimized_recovery.as_ref(),
-                    );
-                }
+                let window_scope_unresolved =
+                    tree_opt.as_ref().is_some_and(|tree| !tree.window_scoped);
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
                 structured["atspi_tree_cache_status"] = json!(tree_cache_status);
                 add_window_bounds(&mut structured, &target_window);
 
-                if let Some(tr) = tree_opt {
+                if window_scope_unresolved {
+                    // EOG can expose two same-process windows with identical
+                    // titles and geometry. AT-SPI keeps them as separate frames
+                    // but publishes no X11 id to join on. Never leak the shared
+                    // application tree under one exact XID; preserve only that
+                    // XID's screenshot as read-only perception, matching macOS.
+                    mark_ax_window_unresolved(&mut structured, &mut content, pid, xid);
+                } else if let Some(tr) = tree_opt {
                     let source_trusted = tr.trusted;
                     let source_degraded_reason = tr.degraded_reason.clone();
                     let tree_completeness = tr.completeness;
@@ -1286,6 +1277,36 @@ impl Tool for GetWindowStateTool {
             ),
         }
     }
+}
+
+fn mark_ax_window_unresolved(
+    structured: &mut serde_json::Value,
+    content: &mut Vec<cua_driver_core::protocol::Content>,
+    pid: u32,
+    xid: u64,
+) {
+    content.push(cua_driver_core::protocol::Content::text(format!(
+        "window_id={xid} pid={pid} elements=0 tree_status=partial\n\n"
+    )));
+    structured["element_count"] = json!(0);
+    structured["elements_complete"] = json!(false);
+    structured["elements_completeness"] = json!("partial");
+    structured["elements_incomplete_reason"] = json!("ax_window_unresolved");
+    structured["tree_markdown"] = json!("");
+    structured["total_element_count"] = json!(0);
+    structured["returned_element_count"] = json!(0);
+    structured["elements"] = json!([]);
+    structured["degraded"] = json!(true);
+    structured["degraded_reason"] = json!(format!(
+        "ax_window_unresolved: window_id {xid} exists and is owned by pid {pid}, but its \
+         AT-SPI top-level cannot be distinguished from a same-process sibling. The tree \
+         is empty on purpose so sibling controls cannot ground an action."
+    ));
+    structured["escalation"] = json!({
+        "recommended": "foreground",
+        "reason": "observation-only: the screenshot is the requested window, but \
+                   background input is refused until its AT-SPI top-level is resolved."
+    });
 }
 
 fn linux_observation_failure(
@@ -9472,8 +9493,8 @@ mod click_button_schema_tests {
     use super::{
         await_semantic_click_stage, build_registry, chromium_background_must_refuse,
         chromium_debugging_port_from_cmdline, maps_indicate_gtk, maps_indicate_qt_widgets,
-        remaining_semantic_click_budget, should_try_atspi_action, snapshot_index_extent,
-        terminal_semantic_action_failure, ClickTool,
+        mark_ax_window_unresolved, remaining_semantic_click_budget, should_try_atspi_action,
+        snapshot_index_extent, terminal_semantic_action_failure, ClickTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::Value;
@@ -9562,6 +9583,23 @@ mod click_button_schema_tests {
             },
         ];
         assert_eq!(snapshot_index_extent(&nodes), 24);
+    }
+
+    #[test]
+    fn unresolved_exact_window_never_exposes_sibling_elements_or_action_snapshot() {
+        let mut structured = serde_json::json!({"pid": 42, "window_id": 7});
+        let mut content = Vec::new();
+
+        mark_ax_window_unresolved(&mut structured, &mut content, 42, 7);
+
+        assert_eq!(structured["tree_markdown"], "");
+        assert_eq!(structured["elements"], serde_json::json!([]));
+        assert_eq!(structured["degraded"], true);
+        assert!(structured["degraded_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("ax_window_unresolved:")));
+        assert!(structured.get("snapshot_id").is_none());
+        assert_eq!(content.len(), 1);
     }
 
     /// Surface 5: schema must advertise the three canonical button values and
