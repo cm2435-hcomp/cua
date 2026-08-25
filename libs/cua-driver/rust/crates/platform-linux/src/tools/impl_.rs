@@ -3253,7 +3253,7 @@ impl Tool for ClickTool {
                 Ok(Err(error)) => (None, Some(error.to_string())),
                 Err(error) => (None, Some(error.to_string())),
             };
-            let cursor_visualization = if let Some((xid, sx, sy)) = geometry {
+            let cursor_visualized = if let Some((xid, sx, sy)) = geometry {
                 if xid != 0 {
                     crate::overlay::send_command_for(
                         cursor_id.clone(),
@@ -3279,12 +3279,12 @@ impl Tool for ClickTool {
                     cursor_id.clone(),
                     cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
                 );
-                "shown"
+                true
             } else {
                 // Calc exposes exact AT-SPI actions for some unrealized nodes
                 // without drawable bounds. Geometry controls visualization,
                 // so its absence must not suppress authoritative AX dispatch.
-                "unavailable"
+                false
             };
 
             // Chromium can execute a genuine AT-SPI action without focus. Try
@@ -3314,12 +3314,11 @@ impl Tool for ClickTool {
                             "path": "ax",
                             "verified": false,
                             "effect": if suspected_noop { "suspected_noop" } else { "unverifiable" },
-                            "cursor_visualization": cursor_visualization,
                         });
                         if suspected_noop {
                             structured["escalation"] = non_ax_escalation();
                         }
-                        let text = if cursor_visualization == "shown" {
+                        let text = if cursor_visualized {
                             format!("Clicked element [{idx}] (pid {pid}).")
                         } else {
                             format!(
@@ -3418,7 +3417,6 @@ impl Tool for ClickTool {
                         "path": "x11_pixel",
                         "verified": false,
                         "effect": "unverifiable",
-                        "cursor_visualization": "shown",
                     });
                     ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
                         .with_structured(structured)
