@@ -1419,6 +1419,71 @@ fn xdg_open_failure(mut child: std::process::Child) -> Option<String> {
     }
 }
 
+fn normalized_launch_identity(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn select_launched_windows(
+    windows: &[crate::x11::WindowInfo],
+    previous_window_ids: &std::collections::HashSet<u64>,
+    launcher_pid: u32,
+    launched_name: &str,
+) -> Option<(u32, Vec<crate::x11::WindowInfo>)> {
+    let direct: Vec<_> = windows
+        .iter()
+        .filter(|window| window.pid == Some(launcher_pid))
+        .cloned()
+        .collect();
+    if !direct.is_empty() {
+        return Some((launcher_pid, direct));
+    }
+
+    let launched_identity = normalized_launch_identity(launched_name);
+    let matching: Vec<_> = windows
+        .iter()
+        .filter(|window| !previous_window_ids.contains(&window.xid))
+        .filter(|window| {
+            let app = normalized_launch_identity(&window.app_name);
+            let title = normalized_launch_identity(&window.title);
+            launched_identity.len() >= 4
+                && ((app.len() >= 4
+                    && (app.contains(&launched_identity) || launched_identity.contains(&app)))
+                    || title.contains(&launched_identity))
+        })
+        .cloned()
+        .collect();
+    let pids: std::collections::HashSet<_> =
+        matching.iter().filter_map(|window| window.pid).collect();
+    if pids.len() != 1 {
+        return None;
+    }
+    Some((*pids.iter().next()?, matching))
+}
+
+fn await_launched_windows(
+    launcher_pid: u32,
+    launched_name: &str,
+    previous_window_ids: &std::collections::HashSet<u64>,
+) -> (u32, Vec<crate::x11::WindowInfo>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let windows = crate::wayland::list_windows_dispatch(None);
+        if let Some(resolved) =
+            select_launched_windows(&windows, previous_window_ids, launcher_pid, launched_name)
+        {
+            return resolved;
+        }
+        if std::time::Instant::now() >= deadline {
+            return (launcher_pid, Vec::new());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 #[cfg(test)]
 mod launch_app_tests {
     use super::*;
@@ -1449,6 +1514,47 @@ mod launch_app_tests {
                 "thunar-settings",
             ),
         ]
+    }
+
+    fn window(xid: u64, pid: u32, app_name: &str, title: &str) -> crate::x11::WindowInfo {
+        crate::x11::WindowInfo {
+            xid,
+            pid: Some(pid),
+            app_name: app_name.to_owned(),
+            title: title.to_owned(),
+            is_on_screen: true,
+            z_index: Some(0),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }
+    }
+
+    #[test]
+    fn launch_window_selection_follows_a_forked_app_but_fails_closed_on_ambiguity() {
+        let previous = std::collections::HashSet::from([10]);
+        let calc = window(20, 300, "libreoffice-calc", "Untitled 1 - LibreOffice Calc");
+        let unrelated = window(21, 400, "org.gnome.Terminal", "Terminal");
+        let selected = select_launched_windows(
+            &[calc.clone(), unrelated.clone()],
+            &previous,
+            200,
+            "LibreOffice Calc",
+        )
+        .expect("one matching forked window should resolve");
+        assert_eq!(selected.0, 300);
+        assert_eq!(selected.1.len(), 1);
+        assert_eq!(selected.1[0].xid, calc.xid);
+
+        let second_calc = window(22, 500, "libreoffice-calc", "Untitled 2 - LibreOffice Calc");
+        assert!(select_launched_windows(
+            &[calc, unrelated, second_calc],
+            &previous,
+            200,
+            "LibreOffice Calc",
+        )
+        .is_none());
     }
 
     /// Process state letter from `/proc/<pid>/stat`, or `None` once the entry
@@ -1615,6 +1721,12 @@ impl Tool for LaunchAppTool {
             return ToolResult::error("Provide at least one of: launch_path, name, or urls.");
         }
 
+        let previous_window_ids: std::collections::HashSet<u64> =
+            crate::wayland::list_windows_dispatch(None)
+                .into_iter()
+                .map(|window| window.xid)
+                .collect();
+
         let result = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(String, Option<u32>, String)> {
                 // Open URLs via xdg-open.
@@ -1710,19 +1822,18 @@ impl Tool for LaunchAppTool {
         match result {
             Ok(Ok((message, pid_opt, name))) => {
                 if let Some(pid) = pid_opt {
-                    let windows = tokio::task::spawn_blocking(move || {
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(3);
-                        loop {
-                            let windows = crate::wayland::list_windows_dispatch(Some(pid));
-                            if !windows.is_empty() || std::time::Instant::now() >= deadline {
-                                return windows.iter().map(window_record_json).collect::<Vec<_>>();
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
+                    // LibreOffice and Chromium launchers can fork before their
+                    // first window exists. Following only the launcher PID made
+                    // a successful cold launch look stopped to HAI. Accept one
+                    // newly appeared, name-matching PID group; ambiguity stays
+                    // unresolved so exact-window selection never guesses.
+                    let launched_name = name.clone();
+                    let (pid, windows) = tokio::task::spawn_blocking(move || {
+                        await_launched_windows(pid, &launched_name, &previous_window_ids)
                     })
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or((pid, Vec::new()));
+                    let windows = windows.iter().map(window_record_json).collect::<Vec<_>>();
                     ToolResult::text(message).with_structured(json!({
                         "pid": pid,
                         "bundle_id": Value::Null,
