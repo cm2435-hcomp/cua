@@ -60,8 +60,38 @@ const LISTENER_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Run `fut` with [`CALL_TIMEOUT`]; `None` on timeout so the caller can skip
 /// the node and keep walking rather than blocking forever.
-async fn call<T>(fut: impl std::future::Future<Output = T>) -> Option<T> {
-    tokio::time::timeout(CALL_TIMEOUT, fut).await.ok()
+#[track_caller]
+fn call<T>(
+    fut: impl std::future::Future<Output = T>,
+) -> impl std::future::Future<Output = Option<T>> {
+    let caller = std::panic::Location::caller();
+    let line = caller.line();
+    async move {
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(CALL_TIMEOUT, fut).await;
+        let elapsed = started.elapsed();
+        if dbg_enabled()
+            && (result.is_err()
+                || elapsed
+                    >= Duration::from_millis(
+                        std::env::var("CUA_ATSPI_DIAGNOSTIC_SLOW_MS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(50),
+                    ))
+        {
+            eprintln!(
+                "CUA_ATSPI_CALL line={line} elapsed_ms={} outcome={}",
+                elapsed.as_millis(),
+                if result.is_ok() {
+                    "completed"
+                } else {
+                    "timeout"
+                }
+            );
+        }
+        result.ok()
+    }
 }
 
 async fn before_snapshot_deadline<T>(
@@ -386,6 +416,15 @@ async fn accessible_for<'a>(
 struct RawObjectRef {
     name: String,
     path: String,
+}
+
+fn diagnostic_ref_id(oref: &RawObjectRef) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    oref.name.hash(&mut hasher);
+    oref.path.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl RawObjectRef {
@@ -870,6 +909,12 @@ async fn collect_visited_bounded<'a>(
             break;
         }
         budget -= 1;
+        if dbg_enabled() {
+            eprintln!(
+                "CUA_ATSPI_NODE id={:016x} depth={depth} frame_ordinal={frame_ordinal}",
+                diagnostic_ref_id(&oref)
+            );
+        }
         // WebKitGTK publishes its embedded page on a distinct WebProcess
         // D-Bus peer and can expose blank role names for the entire subtree.
         // The peer identity is therefore the reliable document boundary when
