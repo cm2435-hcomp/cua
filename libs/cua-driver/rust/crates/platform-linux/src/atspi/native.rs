@@ -50,10 +50,10 @@ fn action_failure(dispatched: bool, timed_out: bool, detail: String) -> ActionFa
 /// lazily-built trees like Chromium's) must not stall the whole walk.
 const CALL_TIMEOUT: Duration = Duration::from_secs(3);
 /// Healthy cold reads across GTK, Qt, LibreOffice, Chromium, and Electron had
-/// no AT-SPI call above 11 ms on the retained Linux VM. A 500 ms topology bound
-/// leaves more than 45x measured headroom while preventing one poisoned child
+/// no AT-SPI call above 11 ms on the retained Linux VM. A 50 ms topology bound
+/// leaves more than 4.5x measured headroom while preventing one poisoned child
 /// from consuming the 25-second walk budget.
-const TOPOLOGY_CALL_TIMEOUT: Duration = Duration::from_millis(500);
+const TOPOLOGY_CALL_TIMEOUT: Duration = Duration::from_millis(50);
 /// Overall budget for one tree walk / operation.
 const OP_TIMEOUT: Duration = Duration::from_secs(25);
 /// Startup may run before `serve` binds its socket or MCP reads stdin. A
