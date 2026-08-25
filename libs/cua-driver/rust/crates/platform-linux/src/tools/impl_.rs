@@ -1981,8 +1981,22 @@ fn resolve_element_local_coords(
 }
 
 fn element_screen_center(pid: u32, idx: usize) -> anyhow::Result<(f64, f64)> {
-    let (bx, by, bw, bh) = crate::atspi::get_element_bounds(pid, idx)?;
-    Ok((bx as f64 + bw as f64 / 2.0, by as f64 + bh as f64 / 2.0))
+    let started = std::time::Instant::now();
+    let result = crate::atspi::get_element_bounds(pid, idx)
+        .map(|(bx, by, bw, bh)| (bx as f64 + bw as f64 / 2.0, by as f64 + bh as f64 / 2.0));
+    if std::env::var_os("CUA_ATSPI_TIMING_DEBUG").is_some() {
+        match &result {
+            Ok((x, y)) => eprintln!(
+                "CUA_SEMANTIC_GEOMETRY elapsed_ms={} outcome=resolved x={x:.1} y={y:.1}",
+                started.elapsed().as_millis()
+            ),
+            Err(_) => eprintln!(
+                "CUA_SEMANTIC_GEOMETRY elapsed_ms={} outcome=unavailable",
+                started.elapsed().as_millis()
+            ),
+        }
+    }
+    result
 }
 
 fn window_local_to_screen(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {

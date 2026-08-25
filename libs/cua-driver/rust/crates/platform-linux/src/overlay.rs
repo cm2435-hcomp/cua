@@ -479,6 +479,10 @@ pub async fn animate_cursor_to_for(key: CursorKey, x: f64, y: f64) {
             _ => false,
         }
     };
+    let timing_debug = std::env::var_os("CUA_ATSPI_TIMING_DEBUG").is_some();
+    if timing_debug {
+        eprintln!("CUA_OVERLAY_ARRIVAL stage=prepared animate={should_animate} x={x:.1} y={y:.1}");
+    }
     if !should_animate {
         return;
     }
@@ -497,10 +501,19 @@ pub async fn animate_cursor_to_for(key: CursorKey, x: f64, y: f64) {
         // A full or disconnected channel cannot ever produce an arrival. Drop
         // the registered sender now so this async operation cannot hang.
         arrival_cancel(&key);
+        if timing_debug {
+            eprintln!("CUA_OVERLAY_ARRIVAL stage=send outcome=rejected");
+        }
         return;
     }
 
+    if timing_debug {
+        eprintln!("CUA_OVERLAY_ARRIVAL stage=send outcome=accepted");
+    }
     let _ = rx.await;
+    if timing_debug {
+        eprintln!("CUA_OVERLAY_ARRIVAL stage=wait outcome=released");
+    }
 }
 
 pub fn remove_cursor(key: CursorKey) {
