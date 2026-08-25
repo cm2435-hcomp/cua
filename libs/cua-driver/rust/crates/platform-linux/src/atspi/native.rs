@@ -19,7 +19,7 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use atspi::connection::AccessibilityConnection;
+use atspi::connection::{AccessibilityConnection, P2P};
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{CoordType, Interface, State, StateSet};
@@ -357,9 +357,25 @@ async fn accessible_for<'a>(
     conn: &'a AccessibilityConnection,
     oref: &RawObjectRef,
 ) -> Result<AccessibleProxy<'a>> {
-    // Stay on the standard AT-SPI bus. The crate's optional P2P feature scans
-    // every provider while opening the retained connection; one stopped app
-    // then blocks observation before any per-call deadline can run.
+    // Keep the atspi crate's peer-to-peer path when this connection actually
+    // knows the peer. Late WebKit WebProcess children are not in the initial
+    // peer snapshot; object_as_accessible's bus fallback omits their destination
+    // and targets the Accessible interface name instead. Build an explicit bus
+    // proxy below for those late peers and for well-known references.
+    if oref.name.starts_with(':') {
+        let name = atspi::zbus::names::UniqueName::try_from(oref.name.clone())
+            .map_err(|e| anyhow!("bad a11y unique name: {e}"))?;
+        let bus_name = atspi::zbus::names::BusName::Unique(name.as_ref());
+        if conn.get_peer(&bus_name).is_some() {
+            let path = atspi::zbus::zvariant::ObjectPath::try_from(oref.path.clone())
+                .map_err(|e| anyhow!("bad a11y path: {e}"))?;
+            let object = atspi::ObjectRef::new_owned(name, path);
+            return conn
+                .object_as_accessible(&object)
+                .await
+                .map_err(|e| anyhow!("AccessibleProxy build failed: {e}"));
+        }
+    }
     AccessibleProxy::builder(conn.connection())
         .cache_properties(atspi::zbus::proxy::CacheProperties::No)
         .destination(oref.name.clone())
