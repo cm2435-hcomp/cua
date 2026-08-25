@@ -357,23 +357,33 @@ fn merge_app_inventory(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let executable_match = disambiguate_installed_match(candidates, installed, key_source);
-        let window_class_match = || {
-            let mut candidates = std::collections::BTreeSet::new();
-            for window_class in window_classes_by_pid.get(&process.pid)? {
-                if let Some(indices) = installed_by_window_class.get(window_class) {
-                    candidates.extend(indices.iter().copied());
+        let mut window_class_matches = std::collections::BTreeSet::new();
+        if let Some(window_classes) = window_classes_by_pid.get(&process.pid) {
+            for window_class in window_classes {
+                if let Some(candidates) = installed_by_window_class.get(window_class) {
+                    if let Some(index) =
+                        disambiguate_installed_match(candidates, installed, key_source)
+                    {
+                        window_class_matches.insert(index);
+                    }
                 }
             }
-            disambiguate_installed_match(
-                &candidates.into_iter().collect::<Vec<_>>(),
-                installed,
-                key_source,
-            )
-        };
-        match executable_match.or_else(window_class_match) {
-            Some(index) => matching_processes.entry(index).or_default().push(process),
-            None if window_pids.contains(&process.pid) => unmatched_window_processes.push(process),
-            None => {}
+        }
+        if window_class_matches.is_empty() {
+            match executable_match {
+                Some(index) => matching_processes.entry(index).or_default().push(process),
+                None if window_pids.contains(&process.pid) => {
+                    unmatched_window_processes.push(process)
+                }
+                None => {}
+            }
+        } else {
+            // LibreOffice can host Calc and Impress windows in one soffice.bin
+            // process. Preserve every exact window-class identity so HAI does
+            // not relaunch a module that is already open in the shared host.
+            for index in window_class_matches {
+                matching_processes.entry(index).or_default().push(process);
+            }
         }
     }
 
@@ -498,6 +508,39 @@ mod list_apps_tests {
         }));
         assert!(apps.iter().any(|app| app["pid"] == 31));
         assert!(!apps.iter().any(|app| app["pid"] == 21));
+    }
+
+    #[test]
+    fn inventory_preserves_multiple_window_classes_from_one_shared_process() {
+        let processes = vec![process(
+            42,
+            "soffice.bin",
+            "/usr/lib/libreoffice/program/soffice.bin",
+        )];
+        let installed = vec![
+            installed("LibreOffice Calc", "libreoffice-calc", "libreoffice --calc"),
+            installed(
+                "LibreOffice Impress",
+                "libreoffice-impress",
+                "libreoffice --impress",
+            ),
+        ];
+        let window_pids = std::collections::HashSet::from([42]);
+        let window_classes_by_pid = std::collections::HashMap::from([(
+            42,
+            std::collections::HashSet::from([
+                "libreoffice-calc".to_owned(),
+                "libreoffice-impress".to_owned(),
+            ]),
+        )]);
+
+        let apps =
+            merge_app_inventory(&processes, &installed, &window_pids, &window_classes_by_pid);
+
+        assert_eq!(apps.len(), 2);
+        assert!(apps
+            .iter()
+            .all(|app| app["pid"] == 42 && app["running"] == true));
     }
 }
 
