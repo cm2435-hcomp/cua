@@ -2109,7 +2109,7 @@ pub fn perform_action(pid: u32, idx: usize) -> std::result::Result<(String, bool
             // turn before returning success so a caller's immediate external
             // state read observes the action it was told was delivered.
             tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok((action, suspected_noop))
+            Ok::<(String, bool), anyhow::Error>((action, suspected_noop))
         })
         .await
     });
