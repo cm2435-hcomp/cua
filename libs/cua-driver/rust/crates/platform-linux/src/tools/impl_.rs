@@ -1512,7 +1512,13 @@ fn await_launched_windows(
     launched_name: &str,
     previous_window_ids: &std::collections::HashSet<u64>,
 ) -> (u32, Vec<crate::x11::WindowInfo>) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    // LibreOffice can take more than three seconds to expose the new module
+    // window when Calc joins an existing soffice process under OSW load. The
+    // old bound returned an empty successful launch, then the same exact app
+    // appeared on the caller's immediate retry. Match macOS's 30-second
+    // NSWorkspace completion posture while continuing to fail closed unless
+    // one unambiguous new window group appears.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let windows = crate::wayland::list_windows_dispatch(None);
         if let Some(resolved) =
