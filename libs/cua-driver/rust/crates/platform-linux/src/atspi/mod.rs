@@ -106,10 +106,9 @@ pub(crate) fn walk_tree_for_recording(
     walk_via_x11_properties(xid, None)
 }
 
-/// Walk the AT-SPI tree with caller-supplied caps. `None` for either cap
-/// means "use the walker's built-in default" (5 000 nodes; unlimited depth).
-/// Issue #22865: caps protect against Electron / large web apps that
-/// produce 10k+ element trees and blow context windows.
+/// Walk the AT-SPI tree with caller-supplied caps. `None` attempts the complete
+/// tree within the walk deadline. Explicit caps protect callers that choose a
+/// bounded projection for large web or Electron surfaces.
 pub fn walk_tree_bounded(
     pid: u32,
     xid: u64,
@@ -348,7 +347,9 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
                 degraded_reason: None,
                 window_scoped: false,
                 event_sources: Vec::new(),
-                completeness: native::WalkCompleteness::Incomplete,
+                completeness: native::WalkCompleteness::Partial(
+                    native::WalkPartialReason::AtspiUnavailable,
+                ),
             }
         }
     };
@@ -411,7 +412,9 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
         window_scoped: true,
         degraded_reason: None,
         event_sources: Vec::new(),
-        completeness: native::WalkCompleteness::Incomplete,
+        completeness: native::WalkCompleteness::Partial(
+            native::WalkPartialReason::AtspiUnavailable,
+        ),
     }
 }
 

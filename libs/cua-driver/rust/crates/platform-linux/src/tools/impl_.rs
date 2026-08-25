@@ -1066,13 +1066,26 @@ impl Tool for GetWindowStateTool {
                 if let Some(tr) = tree_opt {
                     let source_trusted = tr.trusted;
                     let source_degraded_reason = tr.degraded_reason.clone();
+                    let tree_completeness = tr.completeness;
                     let count = tr
                         .nodes
                         .iter()
                         .filter(|n| n.element_index.is_some())
                         .count();
                     let token_index_extent = snapshot_index_extent(&tr.nodes);
-                    let header = format!("window_id={xid} pid={pid} elements={count}\n\n");
+                    let completeness_status = tree_completeness.status();
+                    let mut header = format!(
+                        "window_id={xid} pid={pid} elements={count} tree_status={completeness_status}\n"
+                    );
+                    if completeness_status != "complete" {
+                        let reason = tree_completeness
+                            .incomplete_reason()
+                            .unwrap_or("caller_requested_bound");
+                        header.push_str(&format!(
+                            "WARNING: accessibility tree is {completeness_status} ({reason}); missing elements are unknown.\n"
+                        ));
+                    }
+                    header.push('\n');
                     content.push(cua_driver_core::protocol::Content::text(
                         header + &tr.tree_markdown,
                     ));
@@ -1080,9 +1093,13 @@ impl Tool for GetWindowStateTool {
                         state.element_cache.update(pid, xid, &tr.nodes, &bounds);
                     }
                     structured["element_count"] = json!(count);
-                    // AT-SPI's current bounded walker does not surface an
-                    // exhaustive-walk proof. Keep negative existence unknown.
-                    structured["elements_complete"] = json!(false);
+                    structured["elements_complete"] = json!(
+                        tree_completeness == crate::atspi::native::WalkCompleteness::Complete
+                    );
+                    structured["elements_completeness"] = json!(completeness_status);
+                    if let Some(reason) = tree_completeness.incomplete_reason() {
+                        structured["elements_incomplete_reason"] = json!(reason);
+                    }
                     structured["tree_markdown"] = json!(tr.tree_markdown);
 
                     // Surface 6: register a snapshot in the global token

@@ -348,7 +348,9 @@ mod tests {
             provider.observe_with(20, 99, None, None, None, true, &events, || {
                 walks.set(walks.get() + 1);
                 let mut tree = fixture_tree();
-                tree.completeness = crate::atspi::native::WalkCompleteness::Incomplete;
+                tree.completeness = crate::atspi::native::WalkCompleteness::Partial(
+                    crate::atspi::native::WalkPartialReason::Deadline,
+                );
                 tree
             })
         };

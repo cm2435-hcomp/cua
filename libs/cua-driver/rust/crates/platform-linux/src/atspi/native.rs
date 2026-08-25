@@ -49,6 +49,11 @@ fn action_failure(dispatched: bool, timed_out: bool, detail: String) -> ActionFa
 /// Per-call D-Bus timeout: a single unresponsive accessible (common in large,
 /// lazily-built trees like Chromium's) must not stall the whole walk.
 const CALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Healthy cold reads across GTK, Qt, LibreOffice, Chromium, and Electron had
+/// no AT-SPI call above 11 ms on the retained Linux VM. A 500 ms topology bound
+/// leaves more than 45x measured headroom while preventing one poisoned child
+/// from consuming the 25-second walk budget.
+const TOPOLOGY_CALL_TIMEOUT: Duration = Duration::from_millis(500);
 /// Overall budget for one tree walk / operation.
 const OP_TIMEOUT: Duration = Duration::from_secs(25);
 /// Startup may run before `serve` binds its socket or MCP reads stdin. A
@@ -62,6 +67,10 @@ const LISTENER_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// the node and keep walking rather than blocking forever.
 async fn call<T>(fut: impl std::future::Future<Output = T>) -> Option<T> {
     tokio::time::timeout(CALL_TIMEOUT, fut).await.ok()
+}
+
+async fn topology_call<T>(fut: impl std::future::Future<Output = T>) -> Option<T> {
+    tokio::time::timeout(TOPOLOGY_CALL_TIMEOUT, fut).await.ok()
 }
 
 async fn before_snapshot_deadline<T>(
@@ -317,7 +326,7 @@ fn is_document_role(role: &str) -> bool {
 }
 
 fn should_enumerate_children(states: Option<&StateSet>) -> bool {
-    !states.is_some_and(|states| states.contains(State::ManagesDescendants))
+    states.is_some_and(|states| !states.contains(State::ManagesDescendants))
 }
 
 fn is_web_process_bus(name: &str) -> bool {
@@ -525,10 +534,9 @@ async fn app_for_pid<'a>(
     // servicing D-Bus — most commonly one holding a modal grab (an "Add/Edit/
     // Preferences" dialog). Without a bound, `GetConnectionUnixProcessID` stalls
     // on the zbus default (~25s) per such app, which made get_window_state and
-    // type_text hang on real apps (#1936). Bound each step with CALL_TIMEOUT and
-    // skip/return instead of stalling — for type_text this returns fast so the
-    // tool falls back to XTEST, which still types into the focused dialog field.
-    let root = match call(conn.root_accessible_on_registry()).await {
+    // type_text hang on real apps (#1936). Bound each topology step and
+    // skip/return instead of stalling the full observation.
+    let root = match topology_call(conn.root_accessible_on_registry()).await {
         Some(Ok(r)) => r,
         Some(Err(e)) => return Err(anyhow!("registry root unavailable: {e}")),
         None => {
@@ -540,7 +548,7 @@ async fn app_for_pid<'a>(
         .await
         .map_err(|e| anyhow!("DBus proxy unavailable: {e}"))?;
 
-    let apps = match call(root.get_children()).await {
+    let apps = match topology_call(root.get_children()).await {
         Some(r) => r.unwrap_or_default(),
         None => {
             dlog!("registry get_children timed out");
@@ -554,8 +562,8 @@ async fn app_for_pid<'a>(
     let mut selection = ApplicationSelection::new(pid);
     for child in apps {
         // A modal-grabbed app can't answer the pid query; skip it after
-        // CALL_TIMEOUT rather than blocking the whole walk on it.
-        let cpid = match call(pid_of(&dbus, &child)).await {
+        // topology deadline rather than blocking the whole walk on it.
+        let cpid = match topology_call(pid_of(&dbus, &child)).await {
             Some(p) => p,
             None => {
                 dlog!(
@@ -573,7 +581,7 @@ async fn app_for_pid<'a>(
             Some(child) => child,
             None => continue,
         };
-        let app = match call(accessible_for(conn, &child)).await {
+        let app = match topology_call(accessible_for(conn, &child)).await {
             Some(Ok(app)) => app,
             Some(Err(error)) => {
                 dlog!("  accessible_for failed for pid {pid}: {error:#}");
@@ -584,7 +592,7 @@ async fn app_for_pid<'a>(
                 continue;
             }
         };
-        let has_children = match call(app.get_children()).await {
+        let has_children = match topology_call(app.get_children()).await {
             Some(Ok(children)) => !children.is_empty(),
             Some(Err(error)) => {
                 dlog!("  get_children failed for pid {pid}: {error:#}");
@@ -726,12 +734,12 @@ async fn resolve_window_frame(
     let mut candidates: Vec<(usize, (i32, i32, i32, i32))> = Vec::new();
     let mut window_ordinals = Vec::new();
     for (ordinal, oref) in seeds.iter().enumerate() {
-        let Some(Ok(acc)) = call(accessible_for(conn, oref)).await else {
+        let Some(Ok(acc)) = topology_call(accessible_for(conn, oref)).await else {
             continue;
         };
         // Menus, tooltips and other transients are top-level accessibles too;
         // only real windows can correspond to a native window id.
-        let role = match call(acc.get_role_name()).await {
+        let role = match topology_call(acc.get_role_name()).await {
             Some(Ok(role)) => role,
             _ => continue,
         };
@@ -742,13 +750,13 @@ async fn resolve_window_frame(
             continue;
         }
         window_ordinals.push(ordinal);
-        let Some(Ok(proxies)) = call(acc.proxies()).await else {
+        let Some(Ok(proxies)) = topology_call(acc.proxies()).await else {
             continue;
         };
-        let Some(Ok(component)) = call(proxies.component()).await else {
+        let Some(Ok(component)) = topology_call(proxies.component()).await else {
             continue;
         };
-        if let Some(Ok(extents)) = call(component.get_extents(CoordType::Screen)).await {
+        if let Some(Ok(extents)) = topology_call(component.get_extents(CoordType::Screen)).await {
             candidates.push((ordinal, extents));
         }
     }
@@ -762,10 +770,10 @@ async fn resolve_window_frame(
             let Some(oref) = seeds.get(ordinal) else {
                 continue;
             };
-            let Some(Ok(acc)) = call(accessible_for(conn, oref)).await else {
+            let Some(Ok(acc)) = topology_call(accessible_for(conn, oref)).await else {
                 continue;
             };
-            if let Some(Ok(title)) = call(acc.name()).await {
+            if let Some(Ok(title)) = topology_call(acc.name()).await {
                 title_candidates.push((ordinal, title));
             }
         }
@@ -782,7 +790,8 @@ async fn resolve_window_frame(
 }
 
 /// `collect_visited` with caller-supplied caps.
-/// - `max_elements = None` keeps the historical 5 000-node budget.
+/// - `max_elements = None` walks every reachable node within the operation
+///   deadline.
 /// - `max_depth = None` keeps depth uncapped (the historical behaviour);
 ///   `Some(d)` skips enqueueing children whose depth would exceed `d`.
 /// Issue #22865: caps protect against Electron / large web apps that produce
@@ -808,7 +817,7 @@ async fn collect_visited_bounded<'a>(
     // chrome. `frame_ordinal` is the seed's position in `get_children()` order
     // and is likewise inherited, so every node carries the identity of the
     // top-level window it belongs to.
-    let seeds: Vec<RawObjectRef> = match call(app.get_children()).await {
+    let seeds: Vec<RawObjectRef> = match topology_call(app.get_children()).await {
         Some(Ok(children)) => children
             .into_iter()
             .filter_map(|child| RawObjectRef::from_atspi(&child))
@@ -834,12 +843,13 @@ async fn collect_visited_bounded<'a>(
         .collect();
 
     let mut visited: Vec<Visited<'a>> = Vec::new();
-    // Guard against pathological/looping trees. Defaults to 5 000 (the
-    // historical hard-coded budget); callers can override via max_elements.
-    let mut budget = max_elements.unwrap_or(5000usize);
+    // A node bound is a caller-selected projection. The default must attempt
+    // the complete tree: an implicit cap made large Chromium trees look
+    // authoritatively absent beyond node 5 000.
+    let mut budget = max_elements.unwrap_or(usize::MAX);
     // Time budget alongside the node budget: when an app is unresponsive to
     // AT-SPI (most commonly because it holds a modal grab and isn't servicing
-    // D-Bus), every per-node `call()` burns the full CALL_TIMEOUT before being
+    // D-Bus), every per-node topology call burns its deadline before being
     // skipped, so the walk would otherwise grind for minutes. Callers that lack
     // their own OP_TIMEOUT (snapshot bounds, insert_text) relied on this
     // never happening — bound it here so the walk returns partial within
@@ -847,7 +857,7 @@ async fn collect_visited_bounded<'a>(
     // on modal dialogs (#1936).
     let deadline = std::time::Instant::now() + OP_TIMEOUT;
     // Fast bail for an app that has stopped answering AT-SPI entirely (modal
-    // grab): if several consecutive nodes each burn the full CALL_TIMEOUT, the
+    // grab): if several consecutive nodes each burn the topology deadline, the
     // app is unresponsive and the remaining ~OP_TIMEOUT of walking would all
     // time out too. Give up after a few so type_text falls back to XTEST in a
     // few seconds rather than ~25s.
@@ -857,16 +867,12 @@ async fn collect_visited_bounded<'a>(
     while let Some((oref, depth, inherited_web_doc, frame_ordinal)) = stack.pop() {
         if budget == 0 {
             dlog!("node budget exhausted; truncating walk");
-            completeness = if max_elements.is_some() {
-                WalkCompleteness::Bounded
-            } else {
-                WalkCompleteness::Incomplete
-            };
+            completeness = WalkCompleteness::CallerBounded;
             break;
         }
         if std::time::Instant::now() >= deadline {
             dlog!("collect_visited time budget exhausted; returning partial walk");
-            completeness = WalkCompleteness::Incomplete;
+            completeness.mark_partial(WalkPartialReason::Deadline);
             break;
         }
         budget -= 1;
@@ -878,19 +884,19 @@ async fn collect_visited_bounded<'a>(
 
         // accessible_for builds a proxy whose first use round-trips to the
         // target app. On a modal-grabbed (AT-SPI-unresponsive) app this is the
-        // await that actually hangs, so it MUST carry the per-call timeout —
+        // await that actually hangs, so it MUST carry the topology timeout —
         // otherwise the loop never returns to the deadline check at the top and
         // the walk stalls past OP_TIMEOUT for callers without an outer guard
         // (snapshot bounds, insert_text). That was the residual #1936 hang.
-        let acc = match call(accessible_for(conn, &oref)).await {
+        let acc = match topology_call(accessible_for(conn, &oref)).await {
             Some(Ok(a)) => a,
             Some(Err(error)) => {
                 dlog!("  accessible_for failed: {error:#}");
-                completeness = WalkCompleteness::Incomplete;
+                completeness.mark_partial(WalkPartialReason::AccessibleError);
                 continue;
             }
             None => {
-                completeness = WalkCompleteness::Incomplete;
+                completeness.mark_partial(WalkPartialReason::AccessibleTimeout);
                 consecutive_timeouts += 1;
                 if consecutive_timeouts >= 3 {
                     dlog!(
@@ -905,7 +911,7 @@ async fn collect_visited_bounded<'a>(
 
         // Interfaces gate every other query; if even this times out the node is
         // unreachable, so skip it rather than stall.
-        let ifaces = match call(acc.get_interfaces()).await {
+        let ifaces = match topology_call(acc.get_interfaces()).await {
             Some(Ok(i)) => {
                 consecutive_timeouts = 0;
                 i
@@ -913,13 +919,13 @@ async fn collect_visited_bounded<'a>(
             // A completed-but-errored call is node-specific; keep walking.
             Some(Err(error)) => {
                 dlog!("  get_interfaces failed: {error:#}");
-                completeness = WalkCompleteness::Incomplete;
+                completeness.mark_partial(WalkPartialReason::InterfacesError);
                 continue;
             }
-            // A timeout means the app didn't answer in CALL_TIMEOUT. A run of
+            // A timeout means the app didn't answer in the topology deadline. A run of
             // these means the whole app is wedged — bail so callers fall back.
             None => {
-                completeness = WalkCompleteness::Incomplete;
+                completeness.mark_partial(WalkPartialReason::InterfacesTimeout);
                 consecutive_timeouts += 1;
                 if consecutive_timeouts >= 3 {
                     dlog!(
@@ -943,9 +949,9 @@ async fn collect_visited_bounded<'a>(
         // parallel with state caused LibreOffice to allocate ~10.5 GiB and
         // stop servicing AT-SPI before this guard could act.
         let (role_r, name_r, state_r) = tokio::join!(
-            call(acc.get_role_name()),
-            call(acc.name()),
-            call(acc.get_state()),
+            topology_call(acc.get_role_name()),
+            topology_call(acc.name()),
+            topology_call(acc.get_state()),
         );
         let role = match role_r {
             Some(Ok(r)) => r,
@@ -995,10 +1001,13 @@ async fn collect_visited_bounded<'a>(
         let mut value: Option<String> = None;
         let mut text_content = String::new();
         if has_action || has_value || has_text {
-            if let Some(Ok(proxies)) = call(acc.proxies()).await {
+            if let Some(Ok(proxies)) = topology_call(acc.proxies()).await {
                 if has_action {
-                    if let Some(Ok(ap)) = call(proxies.action()).await {
-                        let n = call(ap.n_actions()).await.and_then(|r| r.ok()).unwrap_or(0);
+                    if let Some(Ok(ap)) = topology_call(proxies.action()).await {
+                        let n = topology_call(ap.n_actions())
+                            .await
+                            .and_then(|r| r.ok())
+                            .unwrap_or(0);
                         for i in 0..n {
                             // Preserve the AT-SPI action index even when an
                             // individual name lookup fails. `do_action` takes
@@ -1006,7 +1015,7 @@ async fn collect_visited_bounded<'a>(
                             // could otherwise actuate a different action than
                             // the name we selected.
                             actions.push(
-                                call(ap.get_name(i))
+                                topology_call(ap.get_name(i))
                                     .await
                                     .and_then(|result| result.ok())
                                     .unwrap_or_default(),
@@ -1015,8 +1024,8 @@ async fn collect_visited_bounded<'a>(
                     }
                 }
                 if has_value {
-                    if let Some(Ok(vp)) = call(proxies.value()).await {
-                        value = call(vp.current_value())
+                    if let Some(Ok(vp)) = topology_call(proxies.value()).await {
+                        value = topology_call(vp.current_value())
                             .await
                             .and_then(|r| r.ok())
                             .map(format_value);
@@ -1025,14 +1034,14 @@ async fn collect_visited_bounded<'a>(
                 // Text content is where editable/entry text (the typed string)
                 // lives; `name` is usually empty for such widgets.
                 if has_text {
-                    if let Some(Ok(tp)) = call(proxies.text()).await {
-                        let count = call(tp.character_count())
+                    if let Some(Ok(tp)) = topology_call(proxies.text()).await {
+                        let count = topology_call(tp.character_count())
                             .await
                             .and_then(|r| r.ok())
                             .unwrap_or(0);
                         if count > 0 {
                             let end = count.min(4096);
-                            if let Some(Ok(t)) = call(tp.get_text(0, end)).await {
+                            if let Some(Ok(t)) = topology_call(tp.get_text(0, end)).await {
                                 text_content = t;
                             }
                         }
@@ -1055,11 +1064,22 @@ async fn collect_visited_bounded<'a>(
         // active-descendant/state events instead of requiring enumeration.
         let descend = max_depth.map(|d| depth + 1 <= d).unwrap_or(true);
         if !descend && max_depth.is_some() && completeness == WalkCompleteness::Complete {
-            completeness = WalkCompleteness::Bounded;
+            completeness = WalkCompleteness::CallerBounded;
         }
         let states = state_r.as_ref().and_then(|state| state.as_ref().ok());
+        if states.is_none() {
+            // A virtual container may advertise MANAGES_DESCENDANTS. If its
+            // state cannot be read, enumerating children can materialize a
+            // huge LibreOffice grid and wedge the provider. Keep the node,
+            // omit its unknown descendants, and expose the partial result.
+            completeness.mark_partial(if state_r.is_none() {
+                WalkPartialReason::StateTimeout
+            } else {
+                WalkPartialReason::StateError
+            });
+        }
         if descend && should_enumerate_children(states) {
-            match call(raw_children(zconn, &oref)).await {
+            match topology_call(raw_children(zconn, &oref)).await {
                 Some(Ok(children)) => {
                     for c in children.into_iter().rev() {
                         stack.push((c, depth + 1, child_in_web_doc, frame_ordinal));
@@ -1067,11 +1087,11 @@ async fn collect_visited_bounded<'a>(
                 }
                 Some(Err(error)) => {
                     dlog!("  get_children failed: {error:#}");
-                    completeness = WalkCompleteness::Incomplete;
+                    completeness.mark_partial(WalkPartialReason::ChildrenError);
                 }
                 None => {
                     dlog!("  get_children timed out");
-                    completeness = WalkCompleteness::Incomplete;
+                    completeness.mark_partial(WalkPartialReason::ChildrenTimeout);
                 }
             }
         }
@@ -1303,13 +1323,69 @@ pub struct WalkedTree {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WalkCompleteness {
     Complete,
-    Bounded,
-    Incomplete,
+    CallerBounded,
+    Partial(WalkPartialReason),
+}
+
+impl WalkCompleteness {
+    pub fn status(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::CallerBounded => "caller_bounded",
+            Self::Partial(_) => "partial",
+        }
+    }
+
+    pub fn incomplete_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Partial(reason) => Some(reason.as_str()),
+            Self::Complete | Self::CallerBounded => None,
+        }
+    }
+
+    fn mark_partial(&mut self, reason: WalkPartialReason) {
+        if !matches!(self, Self::Partial(_)) {
+            *self = Self::Partial(reason);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkPartialReason {
+    AtspiUnavailable,
+    Deadline,
+    AccessibleError,
+    AccessibleTimeout,
+    InterfacesError,
+    InterfacesTimeout,
+    StateError,
+    StateTimeout,
+    ChildrenError,
+    ChildrenTimeout,
+    BoundsTimeout,
+}
+
+impl WalkPartialReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AtspiUnavailable => "atspi_unavailable",
+            Self::Deadline => "walk_deadline",
+            Self::AccessibleError => "accessible_error",
+            Self::AccessibleTimeout => "accessible_timeout",
+            Self::InterfacesError => "interfaces_error",
+            Self::InterfacesTimeout => "interfaces_timeout",
+            Self::StateError => "state_error",
+            Self::StateTimeout => "state_timeout",
+            Self::ChildrenError => "children_error",
+            Self::ChildrenTimeout => "children_timeout",
+            Self::BoundsTimeout => "bounds_timeout",
+        }
+    }
 }
 
 /// Walk the AT-SPI tree with caller-supplied node + depth caps.
-/// `max_elements = None` keeps the historical 5 000-node default; `max_depth
-/// = None` keeps the historical unbounded depth. Issue #22865.
+/// `max_elements = None` attempts the complete tree; `max_depth = None` keeps
+/// depth unbounded. Explicit caps remain available for caller-bounded output.
 pub fn walk_tree_bounded(
     pid: u32,
     xid: u64,
@@ -1355,7 +1431,7 @@ pub(super) fn walk_tree_bounded_with_timeout(
             Ok(bounds) => bounds,
             Err(_) => {
                 dlog!("element bounds timed out for pid {pid}");
-                completeness = WalkCompleteness::Incomplete;
+                completeness.mark_partial(WalkPartialReason::BoundsTimeout);
                 Vec::new()
             }
         };
@@ -3645,7 +3721,8 @@ mod coord_tests {
         prefer_authoritative_wayland_origin, rebase_renderer_window_offset,
         resolve_text_selection_offsets, screen_extent_rebase, select_click_target,
         should_enumerate_children, usable_component_extents, validate_scoped_action_index,
-        ApplicationSelection, TextSelectionRequest, TextSelectionType,
+        ApplicationSelection, TextSelectionRequest, TextSelectionType, WalkCompleteness,
+        WalkPartialReason,
     };
     use atspi::{State, StateSet};
     use std::time::Duration;
@@ -3885,7 +3962,19 @@ mod coord_tests {
             State::ManagesDescendants
         ))));
         assert!(should_enumerate_children(Some(&StateSet::empty())));
-        assert!(should_enumerate_children(None));
+        // A failed GetState cannot prove that this is not a virtual container.
+        // Descending anyway previously rematerialized Calc's managed grid.
+        assert!(!should_enumerate_children(None));
+    }
+
+    #[test]
+    fn walk_completeness_distinguishes_absence_authority_from_usable_prefixes() {
+        assert_eq!(WalkCompleteness::Complete.status(), "complete");
+        assert_eq!(WalkCompleteness::CallerBounded.status(), "caller_bounded");
+        assert_eq!(
+            WalkCompleteness::Partial(WalkPartialReason::ChildrenTimeout).incomplete_reason(),
+            Some("children_timeout")
+        );
     }
 
     #[test]
