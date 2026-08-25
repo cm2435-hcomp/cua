@@ -1865,6 +1865,19 @@ fn remaining_semantic_click_budget(
     }
 }
 
+async fn await_semantic_click_stage<T>(
+    deadline: std::time::Instant,
+    stage: &'static str,
+    work: impl std::future::Future<Output = T>,
+) -> Result<T, crate::atspi::ActionFailure> {
+    let remaining = remaining_semantic_click_budget(deadline)?;
+    tokio::time::timeout(remaining, work).await.map_err(|_| {
+        crate::atspi::ActionFailure::TimedOutBeforeDispatch(format!(
+            "semantic click timed out while waiting for {stage}"
+        ))
+    })
+}
+
 fn terminal_semantic_action_failure(failure: crate::atspi::ActionFailure) -> Option<ToolResult> {
     match failure {
         crate::atspi::ActionFailure::Refused(_) => None,
@@ -3063,7 +3076,21 @@ impl Tool for ClickTool {
                     cursor_overlay::OverlayCommand::PinAbove(xid),
                 );
             }
-            overlay_glide_to_for(&cursor_id, sx, sy).await;
+            // A wedged X11 overlay accepted MoveTo but never fired its arrival
+            // oneshot in Calc/Writer OSW tasks. That visual wait sat outside
+            // the AT-SPI timeout, so HAI killed the private worker at 45s even
+            // though no click had been dispatched. Keep visual-before-action,
+            // but fail closed inside the same pre-dispatch click budget.
+            if let Err(error) = await_semantic_click_stage(
+                semantic_click_deadline,
+                "the Linux cursor overlay",
+                overlay_glide_to_for(&cursor_id, sx, sy),
+            )
+            .await
+            {
+                return terminal_semantic_action_failure(error)
+                    .expect("pre-dispatch timeout is terminal");
+            }
             crate::overlay::send_command_for(
                 cursor_id.clone(),
                 cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
@@ -9220,10 +9247,10 @@ pub fn build_registry_with_provider(
 #[cfg(test)]
 mod click_button_schema_tests {
     use super::{
-        build_registry, chromium_background_must_refuse, chromium_debugging_port_from_cmdline,
-        maps_indicate_gtk, maps_indicate_qt_widgets, remaining_semantic_click_budget,
-        should_try_atspi_action, snapshot_index_extent, terminal_semantic_action_failure,
-        ClickTool,
+        await_semantic_click_stage, build_registry, chromium_background_must_refuse,
+        chromium_debugging_port_from_cmdline, maps_indicate_gtk, maps_indicate_qt_widgets,
+        remaining_semantic_click_budget, should_try_atspi_action, snapshot_index_extent,
+        terminal_semantic_action_failure, ClickTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::Value;
@@ -9249,6 +9276,18 @@ mod click_button_schema_tests {
         let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
         assert!(matches!(
             remaining_semantic_click_budget(expired),
+            Err(crate::atspi::ActionFailure::TimedOutBeforeDispatch(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cursor_overlay_cannot_outlive_the_semantic_click_deadline() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+        let result =
+            await_semantic_click_stage(deadline, "fixture overlay", std::future::pending::<()>())
+                .await;
+        assert!(matches!(
+            result,
             Err(crate::atspi::ActionFailure::TimedOutBeforeDispatch(_))
         ));
     }
