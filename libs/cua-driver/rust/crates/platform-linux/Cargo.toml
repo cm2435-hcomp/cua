@@ -34,7 +34,7 @@ libc = "0.2"
 # subprocess bridge so accessibility input/readback needs no Python or GI
 # typelibs at runtime. `tokio` matches the driver's async runtime; `zbus`
 # re-exports the bus types we need (fdo::DBusProxy for pid resolution).
-atspi = { version = "0.30", features = ["tokio", "zbus"] }
+atspi = { version = "0.30", default-features = false, features = ["connection", "proxies", "tokio", "wrappers", "zbus"] }
 evdev = "0.12"
 # Math-expression evaluator for parallel_mouse_drag `fn` paths (y = f(x)).
 meval = "0.2"
