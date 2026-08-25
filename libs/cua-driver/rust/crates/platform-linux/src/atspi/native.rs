@@ -141,14 +141,6 @@ async fn shared_connection() -> Result<&'static AccessibilityConnection> {
             let conn = AccessibilityConnection::new()
                 .await
                 .map_err(|error| anyhow!("AT-SPI connect failed: {error}"))?;
-            // LibreOffice can exhaust the desktop when unchanged trees are
-            // walked repeatedly. Register both the AT-SPI registry interest and
-            // the D-Bus match rule so the retained provider can fail closed on
-            // every object event instead of trusting a blind cache.
-            match conn.register_event::<atspi::ObjectEvents>().await {
-                Ok(()) => OBJECT_EVENTS_REGISTERED.store(true, Ordering::Release),
-                Err(error) => dlog!("AT-SPI object-event registration failed: {error}"),
-            }
             Ok(conn)
         })
         .await
@@ -160,8 +152,16 @@ pub fn ensure_listener_active() -> Result<()> {
     wait_for_listener_startup(LISTENER_STARTUP_TIMEOUT, || {
         runtime().block_on(async {
             let connection = shared_connection().await?;
-            if OBJECT_EVENTS_REGISTERED.load(Ordering::Acquire) {
-                super::provider::start_event_monitor(connection);
+            // Event registration can synchronously notify every provider. A
+            // stopped app must not hold the shared connection's OnceCell and
+            // thereby block ordinary reads; do this only after connection
+            // construction, inside the existing bounded startup worker.
+            match connection.register_event::<atspi::ObjectEvents>().await {
+                Ok(()) => {
+                    OBJECT_EVENTS_REGISTERED.store(true, Ordering::Release);
+                    super::provider::start_event_monitor(connection);
+                }
+                Err(error) => dlog!("AT-SPI object-event registration failed: {error}"),
             }
             Ok(())
         })
