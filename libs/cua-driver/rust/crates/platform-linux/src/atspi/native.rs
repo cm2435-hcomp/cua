@@ -69,25 +69,8 @@ async fn call<T>(fut: impl std::future::Future<Output = T>) -> Option<T> {
     tokio::time::timeout(CALL_TIMEOUT, fut).await.ok()
 }
 
-async fn topology_call<T: Send + 'static>(
-    fut: impl std::future::Future<Output = T> + Send + 'static,
-) -> Option<T> {
-    let mut task = tokio::spawn(fut);
-    match tokio::time::timeout(TOPOLOGY_CALL_TIMEOUT, &mut task).await {
-        Ok(Ok(value)) => Some(value),
-        Ok(Err(_)) => None,
-        Err(_) => {
-            task.abort();
-            None
-        }
-    }
-}
-
-macro_rules! topology_method {
-    ($receiver:expr, $method:ident $(, $argument:expr)*) => {{
-        let receiver = ($receiver).clone();
-        topology_call(async move { receiver.$method($($argument),*).await }).await
-    }};
+async fn topology_call<T>(fut: impl std::future::Future<Output = T>) -> Option<T> {
+    tokio::time::timeout(TOPOLOGY_CALL_TIMEOUT, fut).await.ok()
 }
 
 async fn before_snapshot_deadline<T>(
@@ -138,10 +121,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            // Observation requests run as abortable tasks. Keep the timer on a
-            // separate worker so a provider blocked inside one proxy poll
-            // cannot prevent its 50 ms deadline from firing.
-            .worker_threads(2)
+            .worker_threads(1)
             .enable_all()
             .build()
             .expect("build AT-SPI tokio runtime")
@@ -373,11 +353,11 @@ fn is_web_process_bus(name: &str) -> bool {
 /// be walked and written without killing the app. Other toolkits are
 /// unaffected (they already tolerate `GetAll`), and the sub-interface proxies
 /// from `proxies()` already use `CacheProperties::No`.
-async fn accessible_for(
-    conn: &'static AccessibilityConnection,
+async fn accessible_for<'a>(
+    conn: &'a AccessibilityConnection,
     oref: &RawObjectRef,
     allow_p2p: bool,
-) -> Result<AccessibleProxy<'static>> {
+) -> Result<AccessibleProxy<'a>> {
     // Keep the atspi crate's peer-to-peer path when this connection actually
     // knows the peer. Late WebKit WebProcess children are not in the initial
     // peer snapshot; object_as_accessible's bus fallback omits their destination
@@ -546,11 +526,11 @@ impl<T> ApplicationSelection<T> {
 }
 
 /// Locate the application accessible whose backing process is `pid`.
-async fn app_for_pid(
-    conn: &'static AccessibilityConnection,
+async fn app_for_pid<'a>(
+    conn: &'a AccessibilityConnection,
     pid: u32,
     allow_p2p: bool,
-) -> Result<Option<AccessibleProxy<'static>>> {
+) -> Result<Option<AccessibleProxy<'a>>> {
     let zconn = conn.connection();
     // Every AT-SPI round-trip below can block on an app whose main loop isn't
     // servicing D-Bus — most commonly one holding a modal grab (an "Add/Edit/
@@ -570,7 +550,7 @@ async fn app_for_pid(
         .await
         .map_err(|e| anyhow!("DBus proxy unavailable: {e}"))?;
 
-    let apps = match topology_method!(root, get_children) {
+    let apps = match topology_call(root.get_children()).await {
         Some(r) => r.unwrap_or_default(),
         None => {
             dlog!("registry get_children timed out");
@@ -585,11 +565,7 @@ async fn app_for_pid(
     for child in apps {
         // A modal-grabbed app can't answer the pid query; skip it after
         // topology deadline rather than blocking the whole walk on it.
-        let cpid = match {
-            let dbus = dbus.clone();
-            let child = child.clone();
-            topology_call(async move { pid_of(&dbus, &child).await }).await
-        } {
+        let cpid = match topology_call(pid_of(&dbus, &child)).await {
             Some(p) => p,
             None => {
                 dlog!(
@@ -607,10 +583,7 @@ async fn app_for_pid(
             Some(child) => child,
             None => continue,
         };
-        let app = match {
-            let child = child.clone();
-            topology_call(async move { accessible_for(conn, &child, allow_p2p).await }).await
-        } {
+        let app = match topology_call(accessible_for(conn, &child, allow_p2p)).await {
             Some(Ok(app)) => app,
             Some(Err(error)) => {
                 dlog!("  accessible_for failed for pid {pid}: {error:#}");
@@ -618,10 +591,10 @@ async fn app_for_pid(
             }
             None => {
                 dlog!("  accessible_for timed out for pid {pid}");
-                return Ok(None);
+                continue;
             }
         };
-        let has_children = match topology_method!(app, get_children) {
+        let has_children = match topology_call(app.get_children()).await {
             Some(Ok(children)) => !children.is_empty(),
             Some(Err(error)) => {
                 dlog!("  get_children failed for pid {pid}: {error:#}");
@@ -629,7 +602,7 @@ async fn app_for_pid(
             }
             None => {
                 dlog!("  get_children timed out for pid {pid}");
-                return Ok(None);
+                false
             }
         };
         dlog!("  matching app has_children={has_children}");
@@ -651,10 +624,10 @@ async fn app_for_pid(
 /// Depth-first, pre-order walk of an application's windows. Mirrors the old
 /// pyatspi `walk`/`collect` traversal so element indices stay stable.
 #[allow(dead_code)]
-async fn collect_visited(
-    conn: &'static AccessibilityConnection,
+async fn collect_visited<'a>(
+    conn: &'a AccessibilityConnection,
     pid: u32,
-) -> Result<Option<Vec<Visited<'static>>>> {
+) -> Result<Option<Vec<Visited<'a>>>> {
     collect_visited_bounded(conn, pid, 0, None, None, true)
         .await
         .map(|walked| walked.map(|(visited, _, _)| visited))
@@ -742,7 +715,7 @@ fn correlate_frame_title(candidates: &[(usize, String)], target_title: &str) -> 
 /// application-wide: callers that merely want a tree carry on, and callers that
 /// need window identity must refuse.
 async fn resolve_window_frame(
-    conn: &'static AccessibilityConnection,
+    conn: &AccessibilityConnection,
     pid: u32,
     xid: u64,
     seeds: &[RawObjectRef],
@@ -764,15 +737,12 @@ async fn resolve_window_frame(
     let mut candidates: Vec<(usize, (i32, i32, i32, i32))> = Vec::new();
     let mut window_ordinals = Vec::new();
     for (ordinal, oref) in seeds.iter().enumerate() {
-        let Some(Ok(acc)) = ({
-            let oref = oref.clone();
-            topology_call(async move { accessible_for(conn, &oref, allow_p2p).await }).await
-        }) else {
+        let Some(Ok(acc)) = topology_call(accessible_for(conn, oref, allow_p2p)).await else {
             continue;
         };
         // Menus, tooltips and other transients are top-level accessibles too;
         // only real windows can correspond to a native window id.
-        let role = match topology_method!(acc, get_role_name) {
+        let role = match topology_call(acc.get_role_name()).await {
             Some(Ok(role)) => role,
             _ => continue,
         };
@@ -783,13 +753,13 @@ async fn resolve_window_frame(
             continue;
         }
         window_ordinals.push(ordinal);
-        let Some(Ok(proxies)) = topology_method!(acc, proxies) else {
+        let Some(Ok(proxies)) = topology_call(acc.proxies()).await else {
             continue;
         };
-        let Some(Ok(component)) = topology_method!(proxies, component) else {
+        let Some(Ok(component)) = topology_call(proxies.component()).await else {
             continue;
         };
-        if let Some(Ok(extents)) = topology_method!(component, get_extents, CoordType::Screen) {
+        if let Some(Ok(extents)) = topology_call(component.get_extents(CoordType::Screen)).await {
             candidates.push((ordinal, extents));
         }
     }
@@ -803,13 +773,10 @@ async fn resolve_window_frame(
             let Some(oref) = seeds.get(ordinal) else {
                 continue;
             };
-            let Some(Ok(acc)) = ({
-                let oref = oref.clone();
-                topology_call(async move { accessible_for(conn, &oref, allow_p2p).await }).await
-            }) else {
+            let Some(Ok(acc)) = topology_call(accessible_for(conn, oref, allow_p2p)).await else {
                 continue;
             };
-            if let Some(Ok(title)) = topology_method!(acc, name) {
+            if let Some(Ok(title)) = topology_call(acc.name()).await {
                 title_candidates.push((ordinal, title));
             }
         }
@@ -832,14 +799,14 @@ async fn resolve_window_frame(
 ///   `Some(d)` skips enqueueing children whose depth would exceed `d`.
 /// Issue #22865: caps protect against Electron / large web apps that produce
 /// 10k+ element trees and blow context windows.
-async fn collect_visited_bounded(
-    conn: &'static AccessibilityConnection,
+async fn collect_visited_bounded<'a>(
+    conn: &'a AccessibilityConnection,
     pid: u32,
     xid: u64,
     max_elements: Option<usize>,
     max_depth: Option<usize>,
     allow_p2p: bool,
-) -> Result<Option<(Vec<Visited<'static>>, Option<usize>, WalkCompleteness)>> {
+) -> Result<Option<(Vec<Visited<'a>>, Option<usize>, WalkCompleteness)>> {
     let walk_started = std::time::Instant::now();
     let app = match app_for_pid(conn, pid, allow_p2p).await? {
         Some(a) => a,
@@ -855,7 +822,7 @@ async fn collect_visited_bounded(
     // and is likewise inherited, so every node carries the identity of the
     // top-level window it belongs to.
     let (seeds, mut completeness): (Vec<RawObjectRef>, WalkCompleteness) =
-        match topology_method!(app, get_children) {
+        match topology_call(app.get_children()).await {
             Some(Ok(children)) => (
                 children
                     .into_iter()
@@ -896,7 +863,7 @@ async fn collect_visited_bounded(
         .rev()
         .collect();
 
-    let mut visited: Vec<Visited<'static>> = Vec::new();
+    let mut visited: Vec<Visited<'a>> = Vec::new();
     // A node bound is a caller-selected projection. The default must attempt
     // the complete tree: an implicit cap made large Chromium trees look
     // authoritatively absent beyond node 5 000.
@@ -910,6 +877,12 @@ async fn collect_visited_bounded(
     // OP_TIMEOUT for every caller, instead of hanging get_window_state/type_text
     // on modal dialogs (#1936).
     let deadline = std::time::Instant::now() + OP_TIMEOUT;
+    // Fast bail for an app that has stopped answering AT-SPI entirely (modal
+    // grab): if several consecutive nodes each burn the topology deadline, the
+    // app is unresponsive and the remaining ~OP_TIMEOUT of walking would all
+    // time out too. Give up after a few so type_text falls back to XTEST in a
+    // few seconds rather than ~25s.
+    let mut consecutive_timeouts = 0u32;
     while let Some((oref, depth, inherited_web_doc, frame_ordinal)) = stack.pop() {
         if budget == 0 {
             dlog!("node budget exhausted; truncating walk");
@@ -936,10 +909,7 @@ async fn collect_visited_bounded(
         // otherwise the loop never returns to the deadline check at the top and
         // the walk stalls past OP_TIMEOUT for callers without an outer guard
         // (snapshot bounds, insert_text). That was the residual #1936 hang.
-        let acc = match {
-            let oref = oref.clone();
-            topology_call(async move { accessible_for(conn, &oref, allow_p2p).await }).await
-        } {
+        let acc = match topology_call(accessible_for(conn, &oref, allow_p2p)).await {
             Some(Ok(a)) => a,
             Some(Err(error)) => {
                 dlog!("  accessible_for failed: {error:#}");
@@ -948,15 +918,25 @@ async fn collect_visited_bounded(
             }
             None => {
                 completeness.mark_partial(WalkPartialReason::AccessibleTimeout);
-                dlog!("accessible_for timed out; provider unresponsive, bailing walk");
-                break;
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    dlog!(
+                        "{} consecutive AT-SPI timeouts (accessible_for); app unresponsive, bailing walk",
+                        consecutive_timeouts
+                    );
+                    break;
+                }
+                continue;
             }
         };
 
         // Interfaces gate every other query; if even this times out the node is
         // unreachable, so skip it rather than stall.
-        let ifaces = match topology_method!(acc, get_interfaces) {
-            Some(Ok(i)) => i,
+        let ifaces = match topology_call(acc.get_interfaces()).await {
+            Some(Ok(i)) => {
+                consecutive_timeouts = 0;
+                i
+            }
             // A completed-but-errored call is node-specific; keep walking.
             Some(Err(error)) => {
                 dlog!("  get_interfaces failed: {error:#}");
@@ -967,8 +947,15 @@ async fn collect_visited_bounded(
             // these means the whole app is wedged — bail so callers fall back.
             None => {
                 completeness.mark_partial(WalkPartialReason::InterfacesTimeout);
-                dlog!("get_interfaces timed out; provider unresponsive, bailing walk");
-                break;
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    dlog!(
+                        "{} consecutive AT-SPI timeouts; app unresponsive, bailing walk",
+                        consecutive_timeouts
+                    );
+                    break;
+                }
+                continue;
             }
         };
         let has_action = ifaces.contains(Interface::Action);
@@ -982,16 +969,11 @@ async fn collect_visited_bounded(
         // do not enumerate and materialize every cell. Querying GetChildren in
         // parallel with state caused LibreOffice to allocate ~10.5 GiB and
         // stop servicing AT-SPI before this guard could act.
-        let state_r = topology_method!(acc, get_state);
-        let mut provider_timed_out = state_r.is_none();
-        let (role_r, name_r) = if matches!(state_r, Some(Ok(_))) {
-            (
-                topology_method!(acc, get_role_name),
-                topology_method!(acc, name),
-            )
-        } else {
-            (None, None)
-        };
+        let (role_r, name_r, state_r) = tokio::join!(
+            topology_call(acc.get_role_name()),
+            topology_call(acc.name()),
+            topology_call(acc.get_state()),
+        );
         let role = match role_r {
             Some(Ok(r)) => r,
             _ => String::new(),
@@ -1039,11 +1021,12 @@ async fn collect_visited_bounded(
         let mut actions: Vec<String> = Vec::new();
         let mut value: Option<String> = None;
         let mut text_content = String::new();
-        if !provider_timed_out && (has_action || has_value || has_text) {
-            if let Some(Ok(proxies)) = topology_method!(acc, proxies) {
+        if has_action || has_value || has_text {
+            if let Some(Ok(proxies)) = topology_call(acc.proxies()).await {
                 if has_action {
-                    if let Some(Ok(ap)) = topology_method!(proxies, action) {
-                        let n = topology_method!(ap, n_actions)
+                    if let Some(Ok(ap)) = topology_call(proxies.action()).await {
+                        let n = topology_call(ap.n_actions())
+                            .await
                             .and_then(|r| r.ok())
                             .unwrap_or(0);
                         for i in 0..n {
@@ -1053,7 +1036,8 @@ async fn collect_visited_bounded(
                             // could otherwise actuate a different action than
                             // the name we selected.
                             actions.push(
-                                topology_method!(ap, get_name, i)
+                                topology_call(ap.get_name(i))
+                                    .await
                                     .and_then(|result| result.ok())
                                     .unwrap_or_default(),
                             );
@@ -1061,8 +1045,9 @@ async fn collect_visited_bounded(
                     }
                 }
                 if has_value {
-                    if let Some(Ok(vp)) = topology_method!(proxies, value) {
-                        value = topology_method!(vp, current_value)
+                    if let Some(Ok(vp)) = topology_call(proxies.value()).await {
+                        value = topology_call(vp.current_value())
+                            .await
                             .and_then(|r| r.ok())
                             .map(format_value);
                     }
@@ -1070,13 +1055,14 @@ async fn collect_visited_bounded(
                 // Text content is where editable/entry text (the typed string)
                 // lives; `name` is usually empty for such widgets.
                 if has_text {
-                    if let Some(Ok(tp)) = topology_method!(proxies, text) {
-                        let count = topology_method!(tp, character_count)
+                    if let Some(Ok(tp)) = topology_call(proxies.text()).await {
+                        let count = topology_call(tp.character_count())
+                            .await
                             .and_then(|r| r.ok())
                             .unwrap_or(0);
                         if count > 0 {
                             let end = count.min(4096);
-                            if let Some(Ok(t)) = topology_method!(tp, get_text, 0, end) {
+                            if let Some(Ok(t)) = topology_call(tp.get_text(0, end)).await {
                                 text_content = t;
                             }
                         }
@@ -1114,12 +1100,7 @@ async fn collect_visited_bounded(
             });
         }
         if descend && should_enumerate_children(states) {
-            let children = {
-                let zconn = zconn.clone();
-                let oref = oref.clone();
-                topology_call(async move { raw_children(&zconn, &oref).await }).await
-            };
-            match children {
+            match topology_call(raw_children(zconn, &oref)).await {
                 Some(Ok(children)) => {
                     for c in children.into_iter().rev() {
                         stack.push((c, depth + 1, child_in_web_doc, frame_ordinal));
@@ -1132,7 +1113,6 @@ async fn collect_visited_bounded(
                 None => {
                     dlog!("  get_children timed out");
                     completeness.mark_partial(WalkPartialReason::ChildrenTimeout);
-                    provider_timed_out = true;
                 }
             }
         }
@@ -1157,10 +1137,6 @@ async fn collect_visited_bounded(
             frame_ordinal,
             acc,
         });
-        if provider_timed_out {
-            dlog!("provider timed out; returning the safe observed prefix");
-            break;
-        }
     }
 
     dlog!(
@@ -3372,10 +3348,10 @@ async fn web_document_origin_for_visited(visited: &[Visited<'_>], pid: u32) -> O
         .filter(|node| is_document_role(&node.role) || node.in_web_doc)
         .min_by_key(|node| node.depth);
     let document = if let Some(document) = document {
-        match topology_method!(document.acc, proxies) {
-            Some(Ok(proxies)) => match topology_method!(proxies, component) {
+        match topology_call(document.acc.proxies()).await {
+            Some(Ok(proxies)) => match topology_call(proxies.component()).await {
                 Some(Ok(component)) => {
-                    match topology_method!(component, get_extents, CoordType::Window) {
+                    match topology_call(component.get_extents(CoordType::Window)).await {
                         Some(Ok((x, y, width, height))) if x >= 0 && y >= 0 => {
                             let inferred_top = match (compositor, sway_window.as_ref()) {
                                 (Some((_, 0)), Some(window))
@@ -3504,10 +3480,10 @@ async fn element_bounds_for_visited(
                 )
         });
         if let (Some(origin), Some(frame)) = (x11_origin, frame) {
-            let accessible_origin = match topology_method!(frame.acc, proxies) {
-                Some(Ok(proxies)) => match topology_method!(proxies, component) {
+            let accessible_origin = match topology_call(frame.acc.proxies()).await {
+                Some(Ok(proxies)) => match topology_call(proxies.component()).await {
                     Some(Ok(component)) => {
-                        match topology_method!(component, get_extents, CoordType::Screen) {
+                        match topology_call(component.get_extents(CoordType::Screen)).await {
                             Some(Ok((x, y, _, _))) => Some((x, y)),
                             _ => None,
                         }
@@ -3537,10 +3513,10 @@ async fn element_bounds_for_visited(
                 )
         });
         if let Some(frame) = frame {
-            match topology_method!(frame.acc, proxies) {
-                Some(Ok(proxies)) => match topology_method!(proxies, component) {
+            match topology_call(frame.acc.proxies()).await {
+                Some(Ok(proxies)) => match topology_call(proxies.component()).await {
                     Some(Ok(component)) => {
-                        match topology_method!(component, get_extents, CoordType::Window) {
+                        match topology_call(component.get_extents(CoordType::Window)).await {
                             Some(Ok((x, y, _, _))) => Some((x, y)),
                             _ => None,
                         }
@@ -3593,15 +3569,15 @@ async fn element_bounds_for_visited(
         if !node.has_component {
             continue;
         }
-        let proxies = match topology_method!(node.acc, proxies) {
+        let proxies = match topology_call(node.acc.proxies()).await {
             Some(Ok(p)) => p,
             _ => continue,
         };
-        let comp = match topology_method!(proxies, component) {
+        let comp = match topology_call(proxies.component()).await {
             Some(Ok(c)) => c,
             _ => continue,
         };
-        if let Some(Ok((x, y, w, h))) = topology_method!(comp, get_extents, coord) {
+        if let Some(Ok((x, y, w, h))) = topology_call(comp.get_extents(coord)).await {
             // Unrealized widgets (e.g. items inside closed menus/popovers)
             // report GetExtents as the i32::MIN sentinel and/or a degenerate
             // 0x0 / 1x1 size. Emitting those poisons downstream consumers
