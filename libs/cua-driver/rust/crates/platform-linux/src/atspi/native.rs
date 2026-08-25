@@ -821,13 +821,30 @@ async fn collect_visited_bounded<'a>(
     // chrome. `frame_ordinal` is the seed's position in `get_children()` order
     // and is likewise inherited, so every node carries the identity of the
     // top-level window it belongs to.
-    let seeds: Vec<RawObjectRef> = match topology_call(app.get_children()).await {
-        Some(Ok(children)) => children
-            .into_iter()
-            .filter_map(|child| RawObjectRef::from_atspi(&child))
-            .collect(),
-        _ => Vec::new(),
-    };
+    let (seeds, mut completeness): (Vec<RawObjectRef>, WalkCompleteness) =
+        match topology_call(app.get_children()).await {
+            Some(Ok(children)) => (
+                children
+                    .into_iter()
+                    .filter_map(|child| RawObjectRef::from_atspi(&child))
+                    .collect(),
+                WalkCompleteness::Complete,
+            ),
+            Some(Err(error)) => {
+                dlog!("application get_children failed: {error:#}");
+                (
+                    Vec::new(),
+                    WalkCompleteness::Partial(WalkPartialReason::ChildrenError),
+                )
+            }
+            None => {
+                dlog!("application get_children timed out");
+                (
+                    Vec::new(),
+                    WalkCompleteness::Partial(WalkPartialReason::ChildrenTimeout),
+                )
+            }
+        };
 
     // Resolve which seed is the caller's window before walking, from the same
     // child list the walk is about to seed from. Re-reading `get_children()`
@@ -866,8 +883,6 @@ async fn collect_visited_bounded<'a>(
     // time out too. Give up after a few so type_text falls back to XTEST in a
     // few seconds rather than ~25s.
     let mut consecutive_timeouts = 0u32;
-    let mut completeness = WalkCompleteness::Complete;
-
     while let Some((oref, depth, inherited_web_doc, frame_ordinal)) = stack.pop() {
         if budget == 0 {
             dlog!("node budget exhausted; truncating walk");
