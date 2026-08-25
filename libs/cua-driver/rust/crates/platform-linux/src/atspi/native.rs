@@ -13,7 +13,7 @@
 //! ordered set.
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, OnceLock,
 };
 use std::time::Duration;
@@ -57,6 +57,8 @@ const OP_TIMEOUT: Duration = Duration::from_secs(25);
 /// budget so a late registry reply can still establish the process-lifetime
 /// listener.
 const LISTENER_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+static DIAGNOSTIC_WALK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Run `fut` with [`CALL_TIMEOUT`]; `None` on timeout so the caller can skip
 /// the node and keep walking rather than blocking forever.
@@ -841,7 +843,11 @@ async fn collect_visited_bounded<'a>(
     max_elements: Option<usize>,
     max_depth: Option<usize>,
 ) -> Result<Option<(Vec<Visited<'a>>, Option<usize>, WalkCompleteness)>> {
+    let walk_id = DIAGNOSTIC_WALK_ID.fetch_add(1, Ordering::Relaxed);
     let walk_started = std::time::Instant::now();
+    if timing_dbg_enabled() {
+        eprintln!("CUA_ATSPI_WALK_BEGIN walk={walk_id} pid={pid} xid={xid}");
+    }
     let app = match app_for_pid(conn, pid).await? {
         Some(a) => a,
         None => return Ok(None),
@@ -919,7 +925,7 @@ async fn collect_visited_bounded<'a>(
         budget -= 1;
         if timing_dbg_enabled() {
             eprintln!(
-                "CUA_ATSPI_NODE id={:016x} depth={depth} frame_ordinal={frame_ordinal}",
+                "CUA_ATSPI_NODE walk={walk_id} id={:016x} depth={depth} frame_ordinal={frame_ordinal}",
                 diagnostic_ref_id(&oref)
             );
         }
@@ -1111,9 +1117,33 @@ async fn collect_visited_bounded<'a>(
             completeness = WalkCompleteness::Bounded;
         }
         let states = state_r.as_ref().and_then(|state| state.as_ref().ok());
+        if timing_dbg_enabled() {
+            let id = diagnostic_ref_id(&oref);
+            match state_r.as_ref() {
+                Some(Ok(states)) if states.contains(State::ManagesDescendants) => {
+                    eprintln!("CUA_ATSPI_MANAGED walk={walk_id} id={id:016x}");
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) => {
+                    eprintln!("CUA_ATSPI_STATE_UNKNOWN walk={walk_id} id={id:016x} outcome=error");
+                }
+                None => {
+                    eprintln!(
+                        "CUA_ATSPI_STATE_UNKNOWN walk={walk_id} id={id:016x} outcome=timeout"
+                    );
+                }
+            }
+        }
         if descend && should_enumerate_children(states) {
             match call(raw_children(zconn, &oref)).await {
                 Some(Ok(children)) => {
+                    if timing_dbg_enabled() && children.len() >= 100 {
+                        eprintln!(
+                            "CUA_ATSPI_WIDE_BRANCH walk={walk_id} id={:016x} children={}",
+                            diagnostic_ref_id(&oref),
+                            children.len()
+                        );
+                    }
                     for c in children.into_iter().rev() {
                         stack.push((c, depth + 1, child_in_web_doc, frame_ordinal));
                     }
@@ -1156,6 +1186,13 @@ async fn collect_visited_bounded<'a>(
         visited.len(),
         walk_started.elapsed().as_millis()
     );
+    if timing_dbg_enabled() {
+        eprintln!(
+            "CUA_ATSPI_WALK_END walk={walk_id} elapsed_ms={} visited={} completeness={completeness:?}",
+            walk_started.elapsed().as_millis(),
+            visited.len()
+        );
+    }
     Ok(Some((visited, scoped_frame, completeness)))
 }
 
