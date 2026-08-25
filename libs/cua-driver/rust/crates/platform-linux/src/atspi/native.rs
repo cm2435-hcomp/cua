@@ -867,7 +867,9 @@ async fn collect_visited_bounded<'a>(
     while let Some((oref, depth, inherited_web_doc, frame_ordinal)) = stack.pop() {
         if budget == 0 {
             dlog!("node budget exhausted; truncating walk");
-            completeness = WalkCompleteness::CallerBounded;
+            if completeness == WalkCompleteness::Complete {
+                completeness = WalkCompleteness::CallerBounded;
+            }
             break;
         }
         if std::time::Instant::now() >= deadline {
