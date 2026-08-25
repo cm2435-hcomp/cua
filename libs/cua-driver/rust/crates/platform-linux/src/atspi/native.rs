@@ -130,6 +130,8 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 
 static SHARED_CONNECTION: tokio::sync::OnceCell<AccessibilityConnection> =
     tokio::sync::OnceCell::const_new();
+static LISTENER_CONNECTION: tokio::sync::OnceCell<AccessibilityConnection> =
+    tokio::sync::OnceCell::const_new();
 static OBJECT_EVENTS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Keep one AT-SPI connection and registry registration alive for the daemon
@@ -146,12 +148,22 @@ async fn shared_connection() -> Result<&'static AccessibilityConnection> {
         .await
 }
 
+async fn listener_connection() -> Result<&'static AccessibilityConnection> {
+    LISTENER_CONNECTION
+        .get_or_try_init(|| async {
+            AccessibilityConnection::new()
+                .await
+                .map_err(|error| anyhow!("AT-SPI listener connect failed: {error}"))
+        })
+        .await
+}
+
 /// Establish the process-lifetime listener before accessibility-aware apps are
 /// launched. Idempotent; later calls reuse the same connection.
 pub fn ensure_listener_active() -> Result<()> {
     wait_for_listener_startup(LISTENER_STARTUP_TIMEOUT, || {
         runtime().block_on(async {
-            let connection = shared_connection().await?;
+            let connection = listener_connection().await?;
             // Event registration can synchronously notify every provider. A
             // stopped app must not hold the shared connection's OnceCell and
             // thereby block ordinary reads; do this only after connection
@@ -170,10 +182,10 @@ pub fn ensure_listener_active() -> Result<()> {
 
 pub(super) fn ensure_event_monitor() -> Result<()> {
     runtime().block_on(async {
-        let connection = shared_connection().await?;
         if !OBJECT_EVENTS_REGISTERED.load(Ordering::Acquire) {
             anyhow::bail!("AT-SPI object-event registration unavailable");
         }
+        let connection = listener_connection().await?;
         super::provider::start_event_monitor(connection);
         Ok(())
     })
