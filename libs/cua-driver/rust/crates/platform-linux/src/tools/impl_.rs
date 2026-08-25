@@ -838,7 +838,7 @@ impl Tool for GetWindowStateTool {
                 "screenshot_out_file":{"type":"string",
                     "description":"When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output carries screenshot_file_path instead."},
                 "query":{"type":"string","description":"Optional case-insensitive substring. Projects both tree_markdown and structured elements to matches plus ancestors while preserving original indices. Compare total_element_count with returned_element_count."},
-                "max_elements":{"type":"integer","minimum":1,"description":"Cap on total AT-SPI nodes walked. Omit for the default (5 000). Lower for huge web/Electron trees."},
+                "max_elements":{"type":"integer","minimum":1,"description":"Optional caller-selected cap on total AT-SPI nodes walked. Omit to attempt the complete tree within the observation deadline."},
                 "max_depth":{"type":"integer","minimum":1,"description":"Cap on the AT-SPI tree walk depth. Omit for the default (uncapped). Lower for deeply nested apps."}
             },"additionalProperties":false}),
             read_only: true, destructive: false, idempotent: true, open_world: false,

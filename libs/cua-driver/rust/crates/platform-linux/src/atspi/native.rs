@@ -3326,26 +3326,30 @@ async fn web_document_origin_for_visited(visited: &[Visited<'_>], pid: u32) -> O
         .filter(|node| is_document_role(&node.role) || node.in_web_doc)
         .min_by_key(|node| node.depth);
     let document = if let Some(document) = document {
-        match call(document.acc.proxies()).await {
-            Some(Ok(proxies)) => match call(proxies.component()).await {
-                Some(Ok(component)) => match call(component.get_extents(CoordType::Window)).await {
-                    Some(Ok((x, y, width, height))) if x >= 0 && y >= 0 => {
-                        let inferred_top = match (compositor, sway_window.as_ref()) {
-                            (Some((_, 0)), Some(window))
-                                if width > 0
-                                    && height > 0
-                                    && (i64::from(window.width) - i64::from(width)).abs() <= 4
-                                    && i64::from(window.height) > i64::from(height) =>
-                            {
-                                (i64::from(window.height) - i64::from(height))
-                                    .min(i64::from(i32::MAX)) as i32
-                            }
-                            _ => 0,
-                        };
-                        Some((x, y.max(inferred_top)))
+        match topology_call(document.acc.proxies()).await {
+            Some(Ok(proxies)) => match topology_call(proxies.component()).await {
+                Some(Ok(component)) => {
+                    match topology_call(component.get_extents(CoordType::Window)).await {
+                        Some(Ok((x, y, width, height))) if x >= 0 && y >= 0 => {
+                            let inferred_top = match (compositor, sway_window.as_ref()) {
+                                (Some((_, 0)), Some(window))
+                                    if width > 0
+                                        && height > 0
+                                        && (i64::from(window.width) - i64::from(width)).abs()
+                                            <= 4
+                                        && i64::from(window.height) > i64::from(height) =>
+                                {
+                                    (i64::from(window.height) - i64::from(height))
+                                        .min(i64::from(i32::MAX))
+                                        as i32
+                                }
+                                _ => 0,
+                            };
+                            Some((x, y.max(inferred_top)))
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                },
+                }
                 _ => None,
             },
             _ => None,
@@ -3454,10 +3458,10 @@ async fn element_bounds_for_visited(
                 )
         });
         if let (Some(origin), Some(frame)) = (x11_origin, frame) {
-            let accessible_origin = match call(frame.acc.proxies()).await {
-                Some(Ok(proxies)) => match call(proxies.component()).await {
+            let accessible_origin = match topology_call(frame.acc.proxies()).await {
+                Some(Ok(proxies)) => match topology_call(proxies.component()).await {
                     Some(Ok(component)) => {
-                        match call(component.get_extents(CoordType::Screen)).await {
+                        match topology_call(component.get_extents(CoordType::Screen)).await {
                             Some(Ok((x, y, _, _))) => Some((x, y)),
                             _ => None,
                         }
@@ -3487,10 +3491,10 @@ async fn element_bounds_for_visited(
                 )
         });
         if let Some(frame) = frame {
-            match call(frame.acc.proxies()).await {
-                Some(Ok(proxies)) => match call(proxies.component()).await {
+            match topology_call(frame.acc.proxies()).await {
+                Some(Ok(proxies)) => match topology_call(proxies.component()).await {
                     Some(Ok(component)) => {
-                        match call(component.get_extents(CoordType::Window)).await {
+                        match topology_call(component.get_extents(CoordType::Window)).await {
                             Some(Ok((x, y, _, _))) => Some((x, y)),
                             _ => None,
                         }
@@ -3543,15 +3547,15 @@ async fn element_bounds_for_visited(
         if !node.has_component {
             continue;
         }
-        let proxies = match call(node.acc.proxies()).await {
+        let proxies = match topology_call(node.acc.proxies()).await {
             Some(Ok(p)) => p,
             _ => continue,
         };
-        let comp = match call(proxies.component()).await {
+        let comp = match topology_call(proxies.component()).await {
             Some(Ok(c)) => c,
             _ => continue,
         };
-        if let Some(Ok((x, y, w, h))) = call(comp.get_extents(coord)).await {
+        if let Some(Ok((x, y, w, h))) = topology_call(comp.get_extents(coord)).await {
             // Unrealized widgets (e.g. items inside closed menus/popovers)
             // report GetExtents as the i32::MIN sentinel and/or a degenerate
             // 0x0 / 1x1 size. Emitting those poisons downstream consumers
