@@ -3358,10 +3358,7 @@ fn combine_wayland_content_offsets(
 /// Compositor decorations and toolkit document offsets are independent and
 /// therefore additive: choosing one or the other leaves WebKit controls one
 /// title bar away from the pixels shown to the caller.
-async fn web_document_origin_for_visited(
-    visited: &[Visited<'static>],
-    pid: u32,
-) -> Option<(i32, i32)> {
+async fn web_document_origin_for_visited(visited: &[Visited<'_>], pid: u32) -> Option<(i32, i32)> {
     if !crate::wayland::is_wayland() {
         return None;
     }
@@ -3466,7 +3463,7 @@ fn rebase_renderer_window_offset(
 ///
 /// Returns `(element_index, x, y, width, height)` tuples.
 async fn element_bounds_for_visited(
-    visited: &[Visited<'static>],
+    visited: &[Visited<'_>],
     pid: u32,
     xid: u64,
 ) -> Vec<(usize, i32, i32, u32, u32)> {
