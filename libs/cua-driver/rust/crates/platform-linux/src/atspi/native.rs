@@ -2058,11 +2058,24 @@ pub fn invoke_menu_path(pid: u32, path: &[String]) -> Result<()> {
 }
 
 pub fn perform_action(pid: u32, idx: usize) -> std::result::Result<(String, bool), ActionFailure> {
+    perform_action_with_timeout(pid, idx, OP_TIMEOUT)
+}
+
+pub(super) fn perform_action_with_timeout(
+    pid: u32,
+    idx: usize,
+    timeout: Duration,
+) -> std::result::Result<(String, bool), ActionFailure> {
     super::provider::global().invalidate_pid(pid);
+    if timeout.is_zero() {
+        return Err(ActionFailure::TimedOutBeforeDispatch(format!(
+            "perform_action exhausted its shared click budget for pid {pid} before dispatch"
+        )));
+    }
     let dispatched = Arc::new(AtomicBool::new(false));
     let dispatched_for_call = dispatched.clone();
     let result = runtime().block_on(async move {
-        tokio::time::timeout(OP_TIMEOUT, async move {
+        tokio::time::timeout(timeout, async move {
             let conn = shared_connection().await?;
             let visited = collect_visited(conn, pid)
                 .await?
@@ -3631,6 +3644,14 @@ mod coord_tests {
         assert!(matches!(
             action_failure(false, false, "refused".into()),
             super::ActionFailure::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn exhausted_shared_click_budget_never_starts_action_dispatch() {
+        assert!(matches!(
+            super::perform_action_with_timeout(4242, 7, Duration::ZERO),
+            Err(super::ActionFailure::TimedOutBeforeDispatch(_))
         ));
     }
 

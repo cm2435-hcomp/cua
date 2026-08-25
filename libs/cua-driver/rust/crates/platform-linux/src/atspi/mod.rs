@@ -223,6 +223,14 @@ pub fn perform_action(pid: u32, idx: usize) -> std::result::Result<(String, bool
     native::perform_action(pid, idx)
 }
 
+pub(crate) fn perform_action_with_timeout(
+    pid: u32,
+    idx: usize,
+    timeout: Duration,
+) -> std::result::Result<(String, bool), ActionFailure> {
+    native::perform_action_with_timeout(pid, idx, timeout)
+}
+
 /// Perform one portable, explicitly requested AT-SPI action on an indexed
 /// element. The native action name is resolved by meaning rather than vector
 /// position so `pick` cannot silently degrade to the element's primary click.

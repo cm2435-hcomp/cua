@@ -1850,6 +1850,21 @@ fn should_try_atspi_action(button: u8, count: usize, has_modifiers: bool, named:
     !has_modifiers && (named || (button == 1 && count == 1))
 }
 
+const SEMANTIC_CLICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
+
+fn remaining_semantic_click_budget(
+    deadline: std::time::Instant,
+) -> Result<std::time::Duration, crate::atspi::ActionFailure> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        Err(crate::atspi::ActionFailure::TimedOutBeforeDispatch(
+            "semantic click exhausted its shared accessibility budget before dispatch".into(),
+        ))
+    } else {
+        Ok(remaining)
+    }
+}
+
 fn terminal_semantic_action_failure(failure: crate::atspi::ActionFailure) -> Option<ToolResult> {
     match failure {
         crate::atspi::ActionFailure::Refused(_) => None,
@@ -3002,6 +3017,11 @@ impl Tool for ClickTool {
         };
 
         if let Some(idx) = elem_idx_resolved {
+            // Calc and multi-app OSW traces hit elements without retained bounds:
+            // the live cursor lookup spent 25s in AT-SPI, then action resolution
+            // received another 25s and crossed HAI's 45s authority deadline.
+            // Cursor lookup and dispatch are one click, so they share one budget.
+            let semantic_click_deadline = std::time::Instant::now() + SEMANTIC_CLICK_BUDGET;
             let xid_hint = window_id_resolved;
             let observed_bounds =
                 xid_hint.and_then(|xid| self.state.element_cache.get_element_bounds(pid, xid, idx));
@@ -3058,10 +3078,16 @@ impl Tool for ClickTool {
                 requested_action.is_some(),
             ) {
                 let named_action = requested_action.is_some();
+                let action_budget = remaining_semantic_click_budget(semantic_click_deadline);
                 let ax_result = tokio::task::spawn_blocking(move || match requested_action {
-                    Some(action) => crate::atspi::perform_named_action(pid, idx, &action)
-                        .map_err(|error| crate::atspi::ActionFailure::Refused(error.to_string())),
-                    None => crate::atspi::perform_action(pid, idx),
+                    Some(action) => action_budget.and_then(|_| {
+                        crate::atspi::perform_named_action(pid, idx, &action).map_err(|error| {
+                            crate::atspi::ActionFailure::Refused(error.to_string())
+                        })
+                    }),
+                    None => action_budget.and_then(|timeout| {
+                        crate::atspi::perform_action_with_timeout(pid, idx, timeout)
+                    }),
                 })
                 .await;
                 match ax_result {
@@ -9195,8 +9221,9 @@ pub fn build_registry_with_provider(
 mod click_button_schema_tests {
     use super::{
         build_registry, chromium_background_must_refuse, chromium_debugging_port_from_cmdline,
-        maps_indicate_gtk, maps_indicate_qt_widgets, should_try_atspi_action,
-        snapshot_index_extent, terminal_semantic_action_failure, ClickTool,
+        maps_indicate_gtk, maps_indicate_qt_widgets, remaining_semantic_click_budget,
+        should_try_atspi_action, snapshot_index_extent, terminal_semantic_action_failure,
+        ClickTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::Value;
@@ -9215,6 +9242,15 @@ mod click_button_schema_tests {
             structured["failure_site"],
             "linux_atspi_action_timeout_before_dispatch"
         );
+    }
+
+    #[test]
+    fn cursor_lookup_and_semantic_dispatch_share_one_deadline() {
+        let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        assert!(matches!(
+            remaining_semantic_click_budget(expired),
+            Err(crate::atspi::ActionFailure::TimedOutBeforeDispatch(_))
+        ));
     }
 
     #[test]
