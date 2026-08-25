@@ -16,7 +16,7 @@ pub mod cache;
 pub mod native;
 mod provider;
 pub use cache::ElementCache;
-pub use native::ensure_listener_active;
+pub use native::{ensure_listener_active, ActionFailure};
 
 #[derive(Clone, Debug)]
 pub struct AtspiNode {
@@ -219,7 +219,7 @@ fn native_walk_with_retries(
 /// is true when the actuated node looked like a silent no-op (a passive
 /// display role, or no advertised action), so the caller can surface
 /// `effect: "suspected_noop"`.
-pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
+pub fn perform_action(pid: u32, idx: usize) -> std::result::Result<(String, bool), ActionFailure> {
     native::perform_action(pid, idx)
 }
 

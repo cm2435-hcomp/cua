@@ -1850,6 +1850,45 @@ fn should_try_atspi_action(button: u8, count: usize, has_modifiers: bool, named:
     !has_modifiers && (named || (button == 1 && count == 1))
 }
 
+fn terminal_semantic_action_failure(failure: crate::atspi::ActionFailure) -> Option<ToolResult> {
+    match failure {
+        crate::atspi::ActionFailure::Refused(_) => None,
+        crate::atspi::ActionFailure::TimedOutBeforeDispatch(detail) => Some(
+            // OSW LibreOffice traces showed that retrying a timed-out action as
+            // a second AT-SPI geometry walk consumed another 25-second budget,
+            // crossed HAI's authority deadline, and killed an otherwise usable
+            // private worker. Nothing was dispatched, so fail safely and let a
+            // fresh observation retry instead of repeating the poisoned read.
+            ToolResult::error(format!(
+                "click: semantic action timed out before dispatch: {detail}"
+            ))
+            .with_structured(json!({
+                "code": "action_timeout",
+                "phase": "preflight",
+                "retryable": true,
+                "effect": "refused",
+                "effect_may_have_occurred": false,
+                "native_side_effect_started": false,
+                "failure_site": "linux_atspi_action_timeout_before_dispatch",
+            })),
+        ),
+        crate::atspi::ActionFailure::AfterDispatch(detail) => Some(
+            ToolResult::error(format!(
+                "click: semantic action outcome is uncertain after dispatch: {detail}"
+            ))
+            .with_structured(json!({
+                "code": "dispatch_failed",
+                "phase": "verify",
+                "retryable": false,
+                "effect": "unverifiable",
+                "effect_may_have_occurred": true,
+                "native_side_effect_started": true,
+                "failure_site": "linux_atspi_action_after_dispatch",
+            })),
+        ),
+    }
+}
+
 /// Escalation hint for a non-AX / suspected-no-op surface — the cross-platform
 /// `escalation` field mirrored from macOS. The recommended next rung depends on
 /// the session type: X11 can pixel-target a specific window in the background,
@@ -3020,7 +3059,8 @@ impl Tool for ClickTool {
             ) {
                 let named_action = requested_action.is_some();
                 let ax_result = tokio::task::spawn_blocking(move || match requested_action {
-                    Some(action) => crate::atspi::perform_named_action(pid, idx, &action),
+                    Some(action) => crate::atspi::perform_named_action(pid, idx, &action)
+                        .map_err(|error| crate::atspi::ActionFailure::Refused(error.to_string())),
                     None => crate::atspi::perform_action(pid, idx),
                 })
                 .await;
@@ -3037,15 +3077,20 @@ impl Tool for ClickTool {
                         return ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
                             .with_structured(structured);
                     }
-                    Ok(Err(error)) if named_action => {
-                        return ToolResult::error(format!(
-                            "click: requested portable action was not delivered: {error}"
-                        ))
-                        .with_structured(json!({
-                            "code": "unsupported_action",
-                            "effect": "refused",
-                            "native_side_effect_started": false,
-                        }));
+                    Ok(Err(error)) => {
+                        if let Some(result) = terminal_semantic_action_failure(error.clone()) {
+                            return result;
+                        }
+                        if named_action {
+                            return ToolResult::error(format!(
+                                "click: requested portable action was not delivered: {error}"
+                            ))
+                            .with_structured(json!({
+                                "code": "unsupported_action",
+                                "effect": "refused",
+                                "native_side_effect_started": false,
+                            }));
+                        }
                     }
                     Err(error) if named_action => {
                         return ToolResult::error(format!(
@@ -9151,10 +9196,38 @@ mod click_button_schema_tests {
     use super::{
         build_registry, chromium_background_must_refuse, chromium_debugging_port_from_cmdline,
         maps_indicate_gtk, maps_indicate_qt_widgets, should_try_atspi_action,
-        snapshot_index_extent, ClickTool,
+        snapshot_index_extent, terminal_semantic_action_failure, ClickTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::Value;
+
+    #[test]
+    fn timed_out_semantic_action_does_not_start_a_second_accessibility_walk() {
+        let result = terminal_semantic_action_failure(
+            crate::atspi::ActionFailure::TimedOutBeforeDispatch("fixture timeout".into()),
+        )
+        .expect("a timeout is terminal");
+        let structured = result.structured_content.expect("structured timeout");
+        assert_eq!(structured["code"], "action_timeout");
+        assert_eq!(structured["retryable"], true);
+        assert_eq!(structured["effect_may_have_occurred"], false);
+        assert_eq!(
+            structured["failure_site"],
+            "linux_atspi_action_timeout_before_dispatch"
+        );
+    }
+
+    #[test]
+    fn semantic_action_failure_after_dispatch_is_not_replayable() {
+        let result = terminal_semantic_action_failure(crate::atspi::ActionFailure::AfterDispatch(
+            "fixture failure".into(),
+        ))
+        .expect("an after-dispatch failure is terminal");
+        let structured = result.structured_content.expect("structured failure");
+        assert_eq!(structured["code"], "dispatch_failed");
+        assert_eq!(structured["retryable"], false);
+        assert_eq!(structured["effect_may_have_occurred"], true);
+    }
 
     #[test]
     fn sparse_window_scoped_indices_register_the_application_wide_extent() {

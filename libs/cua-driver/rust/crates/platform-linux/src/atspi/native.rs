@@ -26,6 +26,26 @@ use atspi::{CoordType, Interface, State, StateSet};
 
 use super::AtspiNode;
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ActionFailure {
+    #[error("{0}")]
+    Refused(String),
+    #[error("{0}")]
+    TimedOutBeforeDispatch(String),
+    #[error("{0}")]
+    AfterDispatch(String),
+}
+
+fn action_failure(dispatched: bool, timed_out: bool, detail: String) -> ActionFailure {
+    if dispatched {
+        ActionFailure::AfterDispatch(detail)
+    } else if timed_out {
+        ActionFailure::TimedOutBeforeDispatch(detail)
+    } else {
+        ActionFailure::Refused(detail)
+    }
+}
+
 /// Per-call D-Bus timeout: a single unresponsive accessible (common in large,
 /// lazily-built trees like Chromium's) must not stall the whole walk.
 const CALL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -2037,10 +2057,12 @@ pub fn invoke_menu_path(pid: u32, path: &[String]) -> Result<()> {
     )
 }
 
-pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
+pub fn perform_action(pid: u32, idx: usize) -> std::result::Result<(String, bool), ActionFailure> {
     super::provider::global().invalidate_pid(pid);
-    bounded(
-        async {
+    let dispatched = Arc::new(AtomicBool::new(false));
+    let dispatched_for_call = dispatched.clone();
+    let result = runtime().block_on(async move {
+        tokio::time::timeout(OP_TIMEOUT, async move {
             let conn = shared_connection().await?;
             let visited = collect_visited(conn, pid)
                 .await?
@@ -2078,6 +2100,7 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
                 .await
                 .map_err(|e| anyhow!("Action unavailable: {e}"))?;
             let action = target.actions.get(chosen).cloned().unwrap_or_default();
+            dispatched_for_call.store(true, Ordering::SeqCst);
             ap.do_action(chosen as i32)
                 .await
                 .map_err(|e| anyhow!("doAction failed: {e}"))?;
@@ -2087,13 +2110,22 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
             // state read observes the action it was told was delivered.
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok((action, suspected_noop))
-        },
-        || {
-            Err(anyhow!(
-                "perform_action timed out for pid {pid} (app unresponsive to AT-SPI)"
-            ))
-        },
-    )
+        })
+        .await
+    });
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(action_failure(
+            dispatched.load(Ordering::SeqCst),
+            false,
+            error.to_string(),
+        )),
+        Err(_) => Err(action_failure(
+            dispatched.load(Ordering::SeqCst),
+            true,
+            format!("perform_action timed out for pid {pid} (app unresponsive to AT-SPI)"),
+        )),
+    }
 }
 
 pub fn perform_named_action(pid: u32, idx: usize, requested: &str) -> Result<(String, bool)> {
@@ -3575,15 +3607,32 @@ mod frame_correlation_tests {
 mod coord_tests {
     use super::parse_gtk_frame_extents;
     use super::{
-        activation_index, before_snapshot_deadline, combine_wayland_content_offsets,
-        is_activation_action, is_enabled_state, is_indexable_capabilities, is_passive_role,
-        is_web_process_bus, portable_action_index, prefer_authoritative_wayland_origin,
-        rebase_renderer_window_offset, resolve_text_selection_offsets, screen_extent_rebase,
-        select_click_target, should_enumerate_children, validate_scoped_action_index,
-        ApplicationSelection, TextSelectionRequest, TextSelectionType,
+        action_failure, activation_index, before_snapshot_deadline,
+        combine_wayland_content_offsets, is_activation_action, is_enabled_state,
+        is_indexable_capabilities, is_passive_role, is_web_process_bus, portable_action_index,
+        prefer_authoritative_wayland_origin, rebase_renderer_window_offset,
+        resolve_text_selection_offsets, screen_extent_rebase, select_click_target,
+        should_enumerate_children, validate_scoped_action_index, ApplicationSelection,
+        TextSelectionRequest, TextSelectionType,
     };
     use atspi::{State, StateSet};
     use std::time::Duration;
+
+    #[test]
+    fn action_timeout_preserves_whether_dispatch_started() {
+        assert!(matches!(
+            action_failure(false, true, "timeout".into()),
+            super::ActionFailure::TimedOutBeforeDispatch(_)
+        ));
+        assert!(matches!(
+            action_failure(true, true, "timeout".into()),
+            super::ActionFailure::AfterDispatch(_)
+        ));
+        assert!(matches!(
+            action_failure(false, false, "refused".into()),
+            super::ActionFailure::Refused(_)
+        ));
+    }
 
     #[test]
     fn duplicate_pid_prefers_populated_application_after_empty_registration() {
