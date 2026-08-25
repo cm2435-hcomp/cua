@@ -2075,9 +2075,8 @@ fn terminal_semantic_action_failure(failure: crate::atspi::ActionFailure) -> Opt
     }
 }
 
-/// LibreOffice exposes valid semantic actions for some unrealized nodes while
-/// returning `i32::MIN` Component extents. Refuse before cursor animation or
-/// dispatch rather than inventing a point that can wedge overlay arrival.
+/// When no semantic action can dispatch, unusable Component extents also rule
+/// out the coordinate fallback. Refuse rather than inventing a screen point.
 fn target_geometry_unavailable(
     pid: u32,
     element_index: usize,
@@ -3214,7 +3213,7 @@ impl Tool for ClickTool {
         if let Some(idx) = elem_idx_resolved {
             // Cursor lookup and dispatch are one click, so they share one budget.
             // Calc can expose an actionable recent-document node with no usable
-            // Component extents; that must refuse before the overlay sees it.
+            // Component extents; those bounds must never reach the overlay.
             let semantic_click_deadline = std::time::Instant::now() + SEMANTIC_CLICK_BUDGET;
             let xid_hint = window_id_resolved;
             let observed_bounds =
@@ -3249,36 +3248,44 @@ impl Tool for ClickTool {
                     Ok((xid, cx, cy))
                 })
                 .await;
-            let (xid, sx, sy) = match geometry {
-                Ok(Ok(geometry)) => geometry,
-                Ok(Err(error)) => return target_geometry_unavailable(pid, idx, error),
-                Err(error) => return target_geometry_unavailable(pid, idx, error),
+            let (geometry, geometry_error) = match geometry {
+                Ok(Ok(geometry)) => (Some(geometry), None),
+                Ok(Err(error)) => (None, Some(error.to_string())),
+                Err(error) => (None, Some(error.to_string())),
             };
-            if xid != 0 {
+            let cursor_visualization = if let Some((xid, sx, sy)) = geometry {
+                if xid != 0 {
+                    crate::overlay::send_command_for(
+                        cursor_id.clone(),
+                        cursor_overlay::OverlayCommand::PinAbove(xid),
+                    );
+                }
+                // A wedged X11 overlay accepted MoveTo but never fired its arrival
+                // oneshot in Calc/Writer OSW tasks. That visual wait sat outside
+                // the AT-SPI timeout, so HAI killed the private worker at 45s even
+                // though no click had been dispatched. Keep visual-before-action,
+                // but fail closed inside the same pre-dispatch click budget.
+                if let Err(error) = await_semantic_click_stage(
+                    semantic_click_deadline,
+                    "the Linux cursor overlay",
+                    overlay_glide_to_for(&cursor_id, sx, sy),
+                )
+                .await
+                {
+                    return terminal_semantic_action_failure(error)
+                        .expect("pre-dispatch timeout is terminal");
+                }
                 crate::overlay::send_command_for(
                     cursor_id.clone(),
-                    cursor_overlay::OverlayCommand::PinAbove(xid),
+                    cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
                 );
-            }
-            // A wedged X11 overlay accepted MoveTo but never fired its arrival
-            // oneshot in Calc/Writer OSW tasks. That visual wait sat outside
-            // the AT-SPI timeout, so HAI killed the private worker at 45s even
-            // though no click had been dispatched. Keep visual-before-action,
-            // but fail closed inside the same pre-dispatch click budget.
-            if let Err(error) = await_semantic_click_stage(
-                semantic_click_deadline,
-                "the Linux cursor overlay",
-                overlay_glide_to_for(&cursor_id, sx, sy),
-            )
-            .await
-            {
-                return terminal_semantic_action_failure(error)
-                    .expect("pre-dispatch timeout is terminal");
-            }
-            crate::overlay::send_command_for(
-                cursor_id.clone(),
-                cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
-            );
+                "shown"
+            } else {
+                // Calc exposes exact AT-SPI actions for some unrealized nodes
+                // without drawable bounds. Geometry controls visualization,
+                // so its absence must not suppress authoritative AX dispatch.
+                "unavailable"
+            };
 
             // Chromium can execute a genuine AT-SPI action without focus. Try
             // that route before applying its background synthetic-input gate.
@@ -3307,12 +3314,19 @@ impl Tool for ClickTool {
                             "path": "ax",
                             "verified": false,
                             "effect": if suspected_noop { "suspected_noop" } else { "unverifiable" },
+                            "cursor_visualization": cursor_visualization,
                         });
                         if suspected_noop {
                             structured["escalation"] = non_ax_escalation();
                         }
-                        return ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
-                            .with_structured(structured);
+                        let text = if cursor_visualization == "shown" {
+                            format!("Clicked element [{idx}] (pid {pid}).")
+                        } else {
+                            format!(
+                                "Clicked element [{idx}] (pid {pid}) without cursor visualization because its bounds were unavailable."
+                            )
+                        };
+                        return ToolResult::text(text).with_structured(structured);
                     }
                     Ok(Err(error)) => {
                         if let Some(result) = terminal_semantic_action_failure(error.clone()) {
@@ -3342,6 +3356,15 @@ impl Tool for ClickTool {
                     _ => {}
                 }
             }
+            let Some((xid, sx, sy)) = geometry else {
+                return target_geometry_unavailable(
+                    pid,
+                    idx,
+                    geometry_error
+                        .as_deref()
+                        .unwrap_or("bounds were unavailable"),
+                );
+            };
             if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
                 return refusal;
             }
@@ -3395,6 +3418,7 @@ impl Tool for ClickTool {
                         "path": "x11_pixel",
                         "verified": false,
                         "effect": "unverifiable",
+                        "cursor_visualization": "shown",
                     });
                     ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
                         .with_structured(structured)
@@ -9434,7 +9458,7 @@ mod click_button_schema_tests {
         await_semantic_click_stage, build_registry, chromium_background_must_refuse,
         chromium_debugging_port_from_cmdline, maps_indicate_gtk, maps_indicate_qt_widgets,
         remaining_semantic_click_budget, should_try_atspi_action, snapshot_index_extent,
-        target_geometry_unavailable, terminal_semantic_action_failure, ClickTool,
+        terminal_semantic_action_failure, ClickTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::Value;
@@ -9453,17 +9477,6 @@ mod click_button_schema_tests {
             structured["failure_site"],
             "linux_atspi_action_timeout_before_dispatch"
         );
-    }
-
-    #[test]
-    fn unavailable_semantic_geometry_refuses_before_dispatch() {
-        let result = target_geometry_unavailable(42, 7, "fixture sentinel");
-        let structured = result.structured_content.expect("structured refusal");
-        assert_eq!(structured["code"], "target_geometry_unavailable");
-        assert_eq!(structured["phase"], "preflight");
-        assert_eq!(structured["retryable"], true);
-        assert_eq!(structured["effect_may_have_occurred"], false);
-        assert_eq!(structured["native_side_effect_started"], false);
     }
 
     #[test]
