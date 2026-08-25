@@ -2519,9 +2519,9 @@ pub fn perform_action_at_screen_point(
                 let Some(Ok((x, y, w, h))) = call(comp.get_extents(coord)).await else {
                     continue;
                 };
-                if x == i32::MIN || y == i32::MIN || w <= 1 || h <= 1 {
+                let Some((x, y, w, h)) = usable_component_extents(x, y, w, h) else {
                     continue;
-                }
+                };
                 let (document_x, document_y) = if node.in_web_doc {
                     web_document_origin
                 } else {
@@ -2531,8 +2531,8 @@ pub fn perform_action_at_screen_point(
                     idx,
                     x + ox + document_x,
                     y + oy + document_y,
-                    w as u32,
-                    h as u32,
+                    w,
+                    h,
                     is_passive_role(&node.role),
                 ));
             }
@@ -2571,6 +2571,23 @@ fn is_passive_role(role: &str) -> bool {
         role,
         "label" | "static" | "static text" | "separator" | "filler" | "image" | "icon"
     )
+}
+
+/// AT-SPI uses `i32::MIN` and degenerate rectangles for unrealized widgets.
+/// Reject those raw extents before applying offsets so they can never poison
+/// click targeting or the agent-cursor renderer.
+fn usable_component_extents(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Option<(i32, i32, u32, u32)> {
+    (x != i32::MIN && y != i32::MIN && width > 1 && height > 1).then_some((
+        x,
+        y,
+        width as u32,
+        height as u32,
+    ))
 }
 
 /// Pick the `element_index` to actuate for a click at `(px, py)`. `frames` are
@@ -3011,24 +3028,23 @@ pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> 
                         .get_extents(CoordType::Window)
                         .await
                         .map_err(|e| anyhow!("getExtents failed: {e}"))?;
+                    let (x, y, w, h) = usable_component_extents(x, y, w, h).ok_or_else(|| {
+                        anyhow!("element {idx} has unavailable Component extents")
+                    })?;
                     let (document_x, document_y) = if target.in_web_doc {
                         web_document_origin
                     } else {
                         (0, 0)
                     };
-                    Ok((
-                        x + ox + document_x,
-                        y + oy + document_y,
-                        w.max(0) as u32,
-                        h.max(0) as u32,
-                    ))
+                    Ok((x + ox + document_x, y + oy + document_y, w, h))
                 }
                 None => {
                     let (x, y, w, h) = comp
                         .get_extents(CoordType::Screen)
                         .await
                         .map_err(|e| anyhow!("getExtents failed: {e}"))?;
-                    Ok((x, y, w.max(0) as u32, h.max(0) as u32))
+                    usable_component_extents(x, y, w, h)
+                        .ok_or_else(|| anyhow!("element {idx} has unavailable Component extents"))
                 }
             }
         },
@@ -3465,7 +3481,10 @@ async fn element_bounds_for_visited(
             // with plausible on-screen geometry. (Validate the raw extents,
             // before applying the screen offset, so the sentinel check still
             // catches unrealized widgets.)
-            if x == i32::MIN || y == i32::MIN || x < -16384 || y < -16384 || w <= 1 || h <= 1 {
+            let Some((x, y, w, h)) = usable_component_extents(x, y, w, h) else {
+                continue;
+            };
+            if x < -16384 || y < -16384 {
                 continue;
             }
             let (document_x, document_y) = if node.in_web_doc {
@@ -3477,8 +3496,8 @@ async fn element_bounds_for_visited(
                 idx,
                 x + offset_x + document_x,
                 y + offset_y + document_y,
-                w as u32,
-                h as u32,
+                w,
+                h,
             ));
         }
     }
@@ -3625,8 +3644,8 @@ mod coord_tests {
         is_indexable_capabilities, is_passive_role, is_web_process_bus, portable_action_index,
         prefer_authoritative_wayland_origin, rebase_renderer_window_offset,
         resolve_text_selection_offsets, screen_extent_rebase, select_click_target,
-        should_enumerate_children, validate_scoped_action_index, ApplicationSelection,
-        TextSelectionRequest, TextSelectionType,
+        should_enumerate_children, usable_component_extents, validate_scoped_action_index,
+        ApplicationSelection, TextSelectionRequest, TextSelectionType,
     };
     use atspi::{State, StateSet};
     use std::time::Duration;
@@ -3645,6 +3664,16 @@ mod coord_tests {
             action_failure(false, false, "refused".into()),
             super::ActionFailure::Refused(_)
         ));
+    }
+
+    #[test]
+    fn unrealized_component_extents_never_become_cursor_coordinates() {
+        assert_eq!(usable_component_extents(i32::MIN, i32::MIN, 1, 1), None);
+        assert_eq!(
+            usable_component_extents(-400, 20, 80, 30),
+            Some((-400, 20, 80, 30))
+        );
+        assert_eq!(usable_component_extents(20, 30, 1, 10), None);
     }
 
     #[test]

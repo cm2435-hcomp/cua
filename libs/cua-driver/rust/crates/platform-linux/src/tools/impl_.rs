@@ -2042,11 +2042,9 @@ fn terminal_semantic_action_failure(failure: crate::atspi::ActionFailure) -> Opt
     match failure {
         crate::atspi::ActionFailure::Refused(_) => None,
         crate::atspi::ActionFailure::TimedOutBeforeDispatch(detail) => Some(
-            // OSW LibreOffice traces showed that retrying a timed-out action as
-            // a second AT-SPI geometry walk consumed another 25-second budget,
-            // crossed HAI's authority deadline, and killed an otherwise usable
-            // private worker. Nothing was dispatched, so fail safely and let a
-            // fresh observation retry instead of repeating the poisoned read.
+            // OSW LibreOffice traces showed pre-dispatch cursor work outliving
+            // HAI's authority deadline. Nothing was dispatched, so fail safely
+            // and let a fresh observation retry instead of replaying internally.
             ToolResult::error(format!(
                 "click: semantic action timed out before dispatch: {detail}"
             ))
@@ -2075,6 +2073,30 @@ fn terminal_semantic_action_failure(failure: crate::atspi::ActionFailure) -> Opt
             })),
         ),
     }
+}
+
+/// LibreOffice exposes valid semantic actions for some unrealized nodes while
+/// returning `i32::MIN` Component extents. Refuse before cursor animation or
+/// dispatch rather than inventing a point that can wedge overlay arrival.
+fn target_geometry_unavailable(
+    pid: u32,
+    element_index: usize,
+    reason: impl std::fmt::Display,
+) -> ToolResult {
+    ToolResult::error(format!(
+        "click: element {element_index} has no usable screen geometry: {reason}; observe again before retrying."
+    ))
+    .with_structured(json!({
+        "code": "target_geometry_unavailable",
+        "phase": "preflight",
+        "retryable": true,
+        "effect": "refused",
+        "effect_may_have_occurred": false,
+        "native_side_effect_started": false,
+        "failure_site": "linux_semantic_target_geometry",
+        "pid": pid,
+        "element_index": element_index,
+    }))
 }
 
 /// Escalation hint for a non-AX / suspected-no-op surface — the cross-platform
@@ -3190,10 +3212,9 @@ impl Tool for ClickTool {
         };
 
         if let Some(idx) = elem_idx_resolved {
-            // Calc and multi-app OSW traces hit elements without retained bounds:
-            // the live cursor lookup spent 25s in AT-SPI, then action resolution
-            // received another 25s and crossed HAI's 45s authority deadline.
             // Cursor lookup and dispatch are one click, so they share one budget.
+            // Calc can expose an actionable recent-document node with no usable
+            // Component extents; that must refuse before the overlay sees it.
             let semantic_click_deadline = std::time::Instant::now() + SEMANTIC_CLICK_BUDGET;
             let xid_hint = window_id_resolved;
             let observed_bounds =
@@ -3203,33 +3224,36 @@ impl Tool for ClickTool {
             // matching the coordinate path below and the macOS/Windows backends.
             // Previously perform_action ran inside this spawn_blocking, so the
             // app updated before the cursor visibly arrived.
-            let (xid, sx, sy) = tokio::task::spawn_blocking(move || -> (u64, f64, f64) {
-                // LibreOffice semantic clicks used to repeat the entire AT-SPI
-                // walk solely to animate the cursor, then walk again to press.
-                // Two 25s native budgets can outrun the 45s authority deadline.
-                // Reuse only observation geometry here; action dispatch below
-                // still resolves the live tree and therefore keeps its safety.
-                let (cx, cy) = observed_bounds
-                    .map(|(x, y, width, height)| {
-                        (
-                            x as f64 + width as f64 / 2.0,
-                            y as f64 + height as f64 / 2.0,
-                        )
-                    })
-                    .or_else(|| element_screen_center(pid, idx).ok())
-                    .unwrap_or((0.0, 0.0));
-                let xid = xid_hint
-                    .or_else(|| {
-                        crate::x11::list_windows(Some(pid))
-                            .into_iter()
-                            .next()
-                            .map(|w| w.xid)
-                    })
-                    .unwrap_or(0);
-                (xid, cx, cy)
-            })
-            .await
-            .unwrap_or((0, 0.0, 0.0));
+            let geometry =
+                tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, f64, f64)> {
+                    // Prefer retained observation geometry. If it is absent, resolve
+                    // one live center for cursor parity; unusable AT-SPI extents now
+                    // fail closed instead of becoming a fabricated screen point.
+                    let (cx, cy) = observed_bounds
+                        .map(|(x, y, width, height)| {
+                            (
+                                x as f64 + width as f64 / 2.0,
+                                y as f64 + height as f64 / 2.0,
+                            )
+                        })
+                        .map(Ok)
+                        .unwrap_or_else(|| element_screen_center(pid, idx))?;
+                    let xid = xid_hint
+                        .or_else(|| {
+                            crate::x11::list_windows(Some(pid))
+                                .into_iter()
+                                .next()
+                                .map(|w| w.xid)
+                        })
+                        .unwrap_or(0);
+                    Ok((xid, cx, cy))
+                })
+                .await;
+            let (xid, sx, sy) = match geometry {
+                Ok(Ok(geometry)) => geometry,
+                Ok(Err(error)) => return target_geometry_unavailable(pid, idx, error),
+                Err(error) => return target_geometry_unavailable(pid, idx, error),
+            };
             if xid != 0 {
                 crate::overlay::send_command_for(
                     cursor_id.clone(),
@@ -9410,7 +9434,7 @@ mod click_button_schema_tests {
         await_semantic_click_stage, build_registry, chromium_background_must_refuse,
         chromium_debugging_port_from_cmdline, maps_indicate_gtk, maps_indicate_qt_widgets,
         remaining_semantic_click_budget, should_try_atspi_action, snapshot_index_extent,
-        terminal_semantic_action_failure, ClickTool,
+        target_geometry_unavailable, terminal_semantic_action_failure, ClickTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::Value;
@@ -9429,6 +9453,17 @@ mod click_button_schema_tests {
             structured["failure_site"],
             "linux_atspi_action_timeout_before_dispatch"
         );
+    }
+
+    #[test]
+    fn unavailable_semantic_geometry_refuses_before_dispatch() {
+        let result = target_geometry_unavailable(42, 7, "fixture sentinel");
+        let structured = result.structured_content.expect("structured refusal");
+        assert_eq!(structured["code"], "target_geometry_unavailable");
+        assert_eq!(structured["phase"], "preflight");
+        assert_eq!(structured["retryable"], true);
+        assert_eq!(structured["effect_may_have_occurred"], false);
+        assert_eq!(structured["native_side_effect_started"], false);
     }
 
     #[test]
