@@ -121,7 +121,11 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            // A stopped AT-SPI provider can occupy one zbus worker while its
+            // method future is pending. Keep a second worker available so the
+            // topology deadline can fire instead of waiting for that provider
+            // to resume (observed as a 32-second Chrome read on the Linux VM).
+            .worker_threads(2)
             .enable_all()
             .build()
             .expect("build AT-SPI tokio runtime")
