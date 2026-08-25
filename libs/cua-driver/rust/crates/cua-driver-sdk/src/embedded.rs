@@ -839,6 +839,7 @@ pub(crate) fn allowed_environment_name(name: &str) -> bool {
                 | "DBUS_SESSION_BUS_ADDRESS"
                 | "XAUTHORITY"
                 | "CUA_LOG"
+                | "CUA_ATSPI_TIMING_DEBUG"
         )
 }
 
