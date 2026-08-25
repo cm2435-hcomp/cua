@@ -70,16 +70,7 @@ fn call<T>(
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(CALL_TIMEOUT, fut).await;
         let elapsed = started.elapsed();
-        if dbg_enabled()
-            && (result.is_err()
-                || elapsed
-                    >= Duration::from_millis(
-                        std::env::var("CUA_ATSPI_DIAGNOSTIC_SLOW_MS")
-                            .ok()
-                            .and_then(|value| value.parse().ok())
-                            .unwrap_or(50),
-                    ))
-        {
+        if timing_dbg_enabled() && (result.is_err() || elapsed >= timing_slow_call_threshold()) {
             eprintln!(
                 "CUA_ATSPI_CALL line={line} elapsed_ms={} outcome={}",
                 elapsed.as_millis(),
@@ -92,6 +83,23 @@ fn call<T>(
         }
         result.ok()
     }
+}
+
+fn timing_dbg_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CUA_ATSPI_TIMING_DEBUG").is_some())
+}
+
+fn timing_slow_call_threshold() -> Duration {
+    static THRESHOLD: OnceLock<Duration> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        Duration::from_millis(
+            std::env::var("CUA_ATSPI_DIAGNOSTIC_SLOW_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(50),
+        )
+    })
 }
 
 async fn before_snapshot_deadline<T>(
@@ -909,7 +917,7 @@ async fn collect_visited_bounded<'a>(
             break;
         }
         budget -= 1;
-        if dbg_enabled() {
+        if timing_dbg_enabled() {
             eprintln!(
                 "CUA_ATSPI_NODE id={:016x} depth={depth} frame_ordinal={frame_ordinal}",
                 diagnostic_ref_id(&oref)
