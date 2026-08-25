@@ -121,11 +121,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            // A stopped AT-SPI provider can occupy one zbus worker while its
-            // method future is pending. Keep a second worker available so the
-            // topology deadline can fire instead of waiting for that provider
-            // to resume (observed as a 32-second Chrome read on the Linux VM).
-            .worker_threads(2)
+            .worker_threads(1)
             .enable_all()
             .build()
             .expect("build AT-SPI tokio runtime")
@@ -360,13 +356,14 @@ fn is_web_process_bus(name: &str) -> bool {
 async fn accessible_for<'a>(
     conn: &'a AccessibilityConnection,
     oref: &RawObjectRef,
+    allow_p2p: bool,
 ) -> Result<AccessibleProxy<'a>> {
     // Keep the atspi crate's peer-to-peer path when this connection actually
     // knows the peer. Late WebKit WebProcess children are not in the initial
     // peer snapshot; object_as_accessible's bus fallback omits their destination
     // and targets the Accessible interface name instead. Build an explicit bus
     // proxy below for those late peers and for well-known references.
-    if oref.name.starts_with(':') {
+    if allow_p2p && oref.name.starts_with(':') {
         let name = atspi::zbus::names::UniqueName::try_from(oref.name.clone())
             .map_err(|e| anyhow!("bad a11y unique name: {e}"))?;
         let bus_name = atspi::zbus::names::BusName::Unique(name.as_ref());
@@ -532,6 +529,7 @@ impl<T> ApplicationSelection<T> {
 async fn app_for_pid<'a>(
     conn: &'a AccessibilityConnection,
     pid: u32,
+    allow_p2p: bool,
 ) -> Result<Option<AccessibleProxy<'a>>> {
     let zconn = conn.connection();
     // Every AT-SPI round-trip below can block on an app whose main loop isn't
@@ -585,7 +583,7 @@ async fn app_for_pid<'a>(
             Some(child) => child,
             None => continue,
         };
-        let app = match topology_call(accessible_for(conn, &child)).await {
+        let app = match topology_call(accessible_for(conn, &child, allow_p2p)).await {
             Some(Ok(app)) => app,
             Some(Err(error)) => {
                 dlog!("  accessible_for failed for pid {pid}: {error:#}");
@@ -630,7 +628,7 @@ async fn collect_visited<'a>(
     conn: &'a AccessibilityConnection,
     pid: u32,
 ) -> Result<Option<Vec<Visited<'a>>>> {
-    collect_visited_bounded(conn, pid, 0, None, None)
+    collect_visited_bounded(conn, pid, 0, None, None, true)
         .await
         .map(|walked| walked.map(|(visited, _, _)| visited))
 }
@@ -721,6 +719,7 @@ async fn resolve_window_frame(
     pid: u32,
     xid: u64,
     seeds: &[RawObjectRef],
+    allow_p2p: bool,
 ) -> Option<usize> {
     // Validate the exact native identity even for a single accessible frame.
     // Otherwise a window that closes between the caller's X11 preflight and
@@ -738,7 +737,7 @@ async fn resolve_window_frame(
     let mut candidates: Vec<(usize, (i32, i32, i32, i32))> = Vec::new();
     let mut window_ordinals = Vec::new();
     for (ordinal, oref) in seeds.iter().enumerate() {
-        let Some(Ok(acc)) = topology_call(accessible_for(conn, oref)).await else {
+        let Some(Ok(acc)) = topology_call(accessible_for(conn, oref, allow_p2p)).await else {
             continue;
         };
         // Menus, tooltips and other transients are top-level accessibles too;
@@ -774,7 +773,7 @@ async fn resolve_window_frame(
             let Some(oref) = seeds.get(ordinal) else {
                 continue;
             };
-            let Some(Ok(acc)) = topology_call(accessible_for(conn, oref)).await else {
+            let Some(Ok(acc)) = topology_call(accessible_for(conn, oref, allow_p2p)).await else {
                 continue;
             };
             if let Some(Ok(title)) = topology_call(acc.name()).await {
@@ -806,9 +805,10 @@ async fn collect_visited_bounded<'a>(
     xid: u64,
     max_elements: Option<usize>,
     max_depth: Option<usize>,
+    allow_p2p: bool,
 ) -> Result<Option<(Vec<Visited<'a>>, Option<usize>, WalkCompleteness)>> {
     let walk_started = std::time::Instant::now();
-    let app = match app_for_pid(conn, pid).await? {
+    let app = match app_for_pid(conn, pid, allow_p2p).await? {
         Some(a) => a,
         None => return Ok(None),
     };
@@ -853,7 +853,7 @@ async fn collect_visited_bounded<'a>(
     let scoped_frame = if xid == 0 {
         None
     } else {
-        resolve_window_frame(conn, pid, xid, &seeds).await
+        resolve_window_frame(conn, pid, xid, &seeds, allow_p2p).await
     };
 
     let mut stack: Vec<(RawObjectRef, usize, bool, usize)> = seeds
@@ -909,7 +909,7 @@ async fn collect_visited_bounded<'a>(
         // otherwise the loop never returns to the deadline check at the top and
         // the walk stalls past OP_TIMEOUT for callers without an outer guard
         // (snapshot bounds, insert_text). That was the residual #1936 hang.
-        let acc = match topology_call(accessible_for(conn, &oref)).await {
+        let acc = match topology_call(accessible_for(conn, &oref, allow_p2p)).await {
             Some(Ok(a)) => a,
             Some(Err(error)) => {
                 dlog!("  accessible_for failed: {error:#}");
@@ -1430,7 +1430,10 @@ pub(super) fn walk_tree_bounded_with_timeout(
         let deadline = tokio::time::Instant::now() + timeout;
         let walk = async {
             let conn = shared_connection().await?;
-            collect_visited_bounded(conn, pid, xid, max_elements, max_depth).await
+            // Observation calls stay on the standard accessibility bus so a
+            // stopped direct peer cannot block before the 50 ms deadline owns
+            // the pending reply. Mutation paths retain the existing P2P route.
+            collect_visited_bounded(conn, pid, xid, max_elements, max_depth, false).await
         };
         let walked = match before_snapshot_deadline(deadline, walk).await {
             Ok(result) => result?,
@@ -1540,7 +1543,7 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
                     Some(app_ref) => app_ref,
                     None => continue,
                 };
-                let app = match call(accessible_for(conn, &app_ref)).await {
+                let app = match call(accessible_for(conn, &app_ref, true)).await {
                     Some(Ok(a)) => a,
                     _ => continue,
                 };
@@ -1558,7 +1561,7 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
                         Some(frame_ref) => frame_ref,
                         None => continue,
                     };
-                    let frame = match call(accessible_for(conn, &frame_ref)).await {
+                    let frame = match call(accessible_for(conn, &frame_ref, true)).await {
                         Some(Ok(f)) => f,
                         _ => continue,
                     };
@@ -2763,7 +2766,7 @@ async fn set_value_inner(
     let conn = shared_connection()
         .await
         .map_err(|error| refuse(format!("AT-SPI connection unavailable: {error}")))?;
-    let (visited, scoped_frame, _) = collect_visited_bounded(conn, pid, xid, None, None)
+    let (visited, scoped_frame, _) = collect_visited_bounded(conn, pid, xid, None, None, true)
         .await
         .map_err(|error| refuse(format!("AT-SPI tree unavailable: {error}")))?
         .ok_or_else(|| refuse(format!("no AT-SPI application for pid {pid}")))?;
