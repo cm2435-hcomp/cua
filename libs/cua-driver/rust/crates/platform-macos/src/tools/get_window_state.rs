@@ -178,6 +178,20 @@ impl Tool for GetWindowStateTool {
             }
         }
 
+        // Signed-helper parity: an exact current-Space minimized standard
+        // window is restored by writing AXMinimized=false without activating
+        // the app. This happens after exact WindowServer ownership preflight
+        // and before any AX tree or screenshot work. Once the write starts,
+        // every later failure must report a possible effect.
+        let minimized_recovery =
+            match crate::ax::minimized_recovery::restore_if_minimized(pid, window_id).await {
+                Ok(recovery) => recovery,
+                Err(error) => {
+                    let structured = error.structured();
+                    return ToolResult::error(error.message).with_structured(structured);
+                }
+            };
+
         let query = args.opt_str("query");
         let screenshot_out_file = args.opt_str("screenshot_out_file").map(|s| {
             // Expand ~ prefix.
@@ -251,16 +265,30 @@ impl Tool for GetWindowStateTool {
             });
             match tokio::time::timeout(std::time::Duration::from_secs(20), walk_future).await {
                 Ok(Ok(r)) => Some(r),
-                Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
+                Ok(Err(e)) => {
+                    return observation_error(
+                        format!("AX tree walk failed: {e}"),
+                        "internal",
+                        "verify",
+                        false,
+                        minimized_recovery.as_ref(),
+                    )
+                }
                 Err(_elapsed) => {
-                    return ToolResult::error(format!(
-                        "AX tree walk for pid={pid} timed out after 20 s. \
-                         The app (likely Arc, Electron, or Safari with many tabs) has a \
-                         pathologically large accessibility tree. \
-                         Workaround: re-call with a depth-limited scan \
-                         (max_elements / max_depth), then act by pixel (x,y) off \
-                         the screenshot if the tree stays unusable."
-                    ));
+                    return observation_error(
+                        format!(
+                            "AX tree walk for pid={pid} timed out after 20 s. \
+                             The app (likely Arc, Electron, or Safari with many tabs) has a \
+                             pathologically large accessibility tree. \
+                             Workaround: re-call with a depth-limited scan \
+                             (max_elements / max_depth), then act by pixel (x,y) off \
+                             the screenshot if the tree stays unusable."
+                        ),
+                        "ui_not_settled",
+                        "settle",
+                        true,
+                        minimized_recovery.as_ref(),
+                    );
                 }
             }
         };
@@ -271,7 +299,7 @@ impl Tool for GetWindowStateTool {
         let window_scope = tree_result.as_ref().and_then(|r| r.window_scope.clone());
         if let Some(ref scope) = window_scope {
             if let Some(refusal) = window_scope_refusal(pid, window_id, scope) {
-                return refusal;
+                return decorate_post_recovery_error(refusal, minimized_recovery.as_ref());
             }
         }
         // `window_scope` is None only when no window_id was requested, which
@@ -458,8 +486,12 @@ impl Tool for GetWindowStateTool {
         }
 
         if content.is_empty() {
-            return ToolResult::error(
+            return observation_error(
                 "No content produced (neither AX tree nor screenshot succeeded)",
+                "verification_failed",
+                "verify",
+                false,
+                minimized_recovery.as_ref(),
             );
         }
 
@@ -641,6 +673,9 @@ impl Tool for GetWindowStateTool {
         if let Some(ref fp) = screenshot_file_path {
             structured["screenshot_file_path"] = serde_json::json!(fp);
         }
+        if let Some(recovery) = &minimized_recovery {
+            structured["minimized_recovery"] = recovery.structured();
+        }
         cua_driver_core::window_inspection::mark_browser_chrome_capture_coverage(
             &mut structured,
             chromium_browser_window(pid).then_some(
@@ -654,6 +689,44 @@ impl Tool for GetWindowStateTool {
             action_record: None,
         }
     }
+}
+
+fn observation_error(
+    message: impl Into<String>,
+    code: &'static str,
+    phase: &'static str,
+    retryable: bool,
+    recovery: Option<&crate::ax::minimized_recovery::RecoveryEvidence>,
+) -> ToolResult {
+    let mut structured = serde_json::json!({
+        "code": code,
+        "phase": phase,
+        "retryable": retryable,
+        "effect_may_have_occurred": false,
+        "native_side_effect_started": false,
+    });
+    if let Some(recovery) = recovery {
+        structured = recovery.decorate_error(structured);
+        structured["retryable"] = serde_json::json!(false);
+    }
+    ToolResult::error(message).with_structured(structured)
+}
+
+fn decorate_post_recovery_error(
+    mut result: ToolResult,
+    recovery: Option<&crate::ax::minimized_recovery::RecoveryEvidence>,
+) -> ToolResult {
+    let Some(recovery) = recovery else {
+        return result;
+    };
+    let structured = result
+        .structured_content
+        .take()
+        .unwrap_or_else(|| serde_json::json!({"code": "observation_stale", "phase": "verify"}));
+    let mut structured = recovery.decorate_error(structured);
+    structured["retryable"] = serde_json::json!(false);
+    result.structured_content = Some(structured);
+    result
 }
 
 /// Turn an unresolvable window scope into a structured refusal, or `None` when
@@ -796,6 +869,9 @@ pub(crate) fn build_elements_array_with_token(
                 "role": node.role,
                 "depth": node.depth,
             });
+            if let Some(subrole) = node.subrole.clone() {
+                entry["subrole"] = serde_json::Value::String(subrole);
+            }
             if let Some(label) = label {
                 entry["label"] = serde_json::Value::String(label);
             }
@@ -1025,6 +1101,7 @@ mod tests {
         AXNode {
             element_index: idx,
             role: role.into(),
+            subrole: None,
             title: title.map(|s| s.to_string()),
             value: None,
             description: None,
@@ -1306,6 +1383,14 @@ mod tests {
         );
         assert_eq!(entry["role"], "AXUnknown");
         assert_eq!(entry["depth"], 0);
+    }
+
+    #[test]
+    fn elements_preserve_exact_ax_subrole() {
+        let mut nodes = vec![node(Some(0), "AXButton", None, 0, None, None)];
+        nodes[0].subrole = Some("AXCloseButton".into());
+        let entry = &build_elements_array(&nodes)[0];
+        assert_eq!(entry["subrole"], "AXCloseButton");
     }
 
     #[test]

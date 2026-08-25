@@ -141,6 +141,21 @@ fn browser_product(name: &str, bundle_id: &str) -> BrowserProduct {
     }
 }
 
+pub(crate) fn is_standalone_chromium_process(pid: i32) -> bool {
+    let name = crate::apps::get_app_name_for_pid(pid).unwrap_or_default();
+    let bundle_id = crate::apps::bundle_id_for_pid(pid).unwrap_or_default();
+    matches!(
+        browser_product(&name, &bundle_id),
+        BrowserProduct::GoogleChrome
+            | BrowserProduct::Chromium
+            | BrowserProduct::MicrosoftEdge
+            | BrowserProduct::Brave
+            | BrowserProduct::Vivaldi
+            | BrowserProduct::Opera
+            | BrowserProduct::Arc
+    )
+}
+
 fn loopback_websocket_port(url: &str) -> Option<u16> {
     ["ws://127.0.0.1:", "ws://localhost:", "ws://[::1]:"]
         .iter()

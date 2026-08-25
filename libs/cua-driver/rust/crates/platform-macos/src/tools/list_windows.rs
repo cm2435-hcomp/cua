@@ -19,7 +19,10 @@ fn def() -> &'static ToolDef {
             (x/y/width/height, top-left origin), z_index (integer or null; higher values are \
             closer to the front; null means stacking order is unavailable and callers must not \
             infer one), is_on_screen, space_ids, current_space_id (the active Space on that \
-            window's display), and on_current_space. The top-level current_space_id is \
+            window's display), on_current_space, plus exact AX minimized, \
+            is_standard, is_main, and subrole facts when the CGWindowID maps \
+            uniquely to one AX window. A minimized AXDialog is standard only \
+            while minimized, matching macOS's Calculator representation. The top-level current_space_id is \
             WindowServer's main/global active Space and can differ from a record's \
             current_space_id when displays use independent Spaces. To select a frontmost candidate, take the \
             maximum integer z_index; if every value is null, use an explicit fallback instead of \
@@ -68,7 +71,28 @@ impl Tool for ListWindowsTool {
             windows.retain(|w| w.pid == pid);
         }
 
-        let windows_json: Vec<Value> = windows.iter().map(window_record_json).collect();
+        let pids: std::collections::HashSet<i32> =
+            windows.iter().map(|window| window.pid).collect();
+        let ax_facts: std::collections::HashMap<
+            (i32, u32),
+            crate::ax::minimized_recovery::ExactAxWindowFacts,
+        > = pids
+            .into_iter()
+            .flat_map(|pid| {
+                crate::ax::minimized_recovery::ax_window_facts_for_pid(pid)
+                    .into_iter()
+                    .map(move |(window_id, facts)| ((pid, window_id), facts))
+            })
+            .collect();
+        let windows_json: Vec<Value> = windows
+            .iter()
+            .map(|window| {
+                window_record_json_with_ax_facts(
+                    window,
+                    ax_facts.get(&(window.pid, window.window_id)),
+                )
+            })
+            .collect();
 
         ToolResult::text(format!("Found {} window(s).", windows_json.len())).with_structured(
             serde_json::json!({
@@ -80,6 +104,17 @@ impl Tool for ListWindowsTool {
 }
 
 pub(super) fn window_record_json(w: &crate::windows::WindowInfo) -> Value {
+    window_record_json_with_ax_facts(w, None)
+}
+
+fn window_record_json_with_ax_facts(
+    w: &crate::windows::WindowInfo,
+    facts: Option<&crate::ax::minimized_recovery::ExactAxWindowFacts>,
+) -> Value {
+    let minimized = facts.and_then(|facts| facts.minimized);
+    let subrole = facts.and_then(|facts| facts.subrole.as_deref());
+    let is_main = facts.and_then(|facts| facts.is_main);
+    let is_standard = facts.map(|facts| facts.is_recoverable_standard());
     serde_json::json!({
         "window_id": w.window_id,
         "pid": w.pid,
@@ -97,6 +132,10 @@ pub(super) fn window_record_json(w: &crate::windows::WindowInfo) -> Value {
         "current_space_id": w.current_space_id,
         "on_current_space": w.on_current_space,
         "space_ids": w.space_ids,
+        "minimized": minimized,
+        "subrole": subrole,
+        "is_standard": is_standard,
+        "is_main": is_main,
     })
 }
 
@@ -134,5 +173,37 @@ mod tests {
             window_record_json(&window)["on_current_space"],
             serde_json::json!(true)
         );
+    }
+
+    #[test]
+    fn minimized_dialog_is_exposed_as_recoverable_standard_window() {
+        let window = crate::windows::WindowInfo {
+            window_id: 42,
+            pid: 123,
+            app_name: "Calculator".into(),
+            title: "Calculator".into(),
+            bounds: crate::windows::WindowBounds {
+                x: 1.0,
+                y: 2.0,
+                width: 300.0,
+                height: 200.0,
+            },
+            layer: 0,
+            z_index: 7,
+            is_on_screen: false,
+            current_space_id: Some(1),
+            on_current_space: Some(true),
+            space_ids: Some(vec![1]),
+        };
+        let facts = crate::ax::minimized_recovery::ExactAxWindowFacts {
+            minimized: Some(true),
+            subrole: Some("AXDialog".into()),
+            is_main: Some(false),
+        };
+
+        let record = window_record_json_with_ax_facts(&window, Some(&facts));
+        assert_eq!(record["minimized"], true);
+        assert_eq!(record["is_standard"], true);
+        assert_eq!(record["subrole"], "AXDialog");
     }
 }

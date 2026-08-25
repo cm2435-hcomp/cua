@@ -29,6 +29,7 @@ pub type AXError = c_int;
 pub const kAXErrorSuccess: AXError = 0;
 pub const kAXErrorFailure: AXError = -25200;
 pub const kAXErrorInvalidUIElement: AXError = -25202;
+pub const kAXErrorCannotComplete: AXError = -25204;
 pub const kAXErrorAttributeUnsupported: AXError = -25205;
 pub const kAXErrorNoValue: AXError = -25212;
 pub const kAXErrorAPIDisabled: AXError = -25211;
@@ -44,6 +45,7 @@ pub const kAXValueCGPointType: AXValueType = 1;
 pub const kAXValueCGSizeType: AXValueType = 2;
 pub const kAXValueCGRectType: AXValueType = 3;
 pub const kAXValueCFRangeType: AXValueType = 4;
+pub const kAXValueAXErrorType: AXValueType = 5;
 pub const kAXValueIllegalType: AXValueType = 1_000;
 
 // ── Link to AXUIElement functions ────────────────────────────────────────────
@@ -54,6 +56,12 @@ extern "C" {
         element: AXUIElementRef,
         attribute: CFStringRef,
         value: *mut CFTypeRef,
+    ) -> AXError;
+    pub fn AXUIElementCopyMultipleAttributeValues(
+        element: AXUIElementRef,
+        attributes: CFArrayRef,
+        options: u32,
+        values: *mut CFArrayRef,
     ) -> AXError;
     pub fn AXUIElementCopyAttributeNames(
         element: AXUIElementRef,
@@ -81,6 +89,7 @@ extern "C" {
         element: AXUIElementRef,
         timeout_in_seconds: f32,
     ) -> AXError;
+    pub fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> AXError;
     pub fn AXUIElementGetTypeID() -> CFTypeID;
     pub fn AXIsProcessTrusted() -> bool;
     /// `AXIsProcessTrustedWithOptions(options)` — when called with
@@ -117,6 +126,7 @@ pub unsafe fn element_at_screen_position(pid: i32, x: f64, y: f64) -> Option<AXU
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     pub fn AXValueCreate(the_type: AXValueType, value_ptr: *const c_void) -> AXValueRef;
+    pub fn AXValueGetTypeID() -> CFTypeID;
     pub fn AXValueGetType(value: AXValueRef) -> AXValueType;
     pub fn AXValueGetValue(
         value: AXValueRef,
@@ -137,6 +147,24 @@ struct CGSizeValue {
     height: f64,
 }
 
+/// Core Foundation's `CFRange` layout, used by `AXSelectedTextRange`.
+/// Locations and lengths are UTF-16 code-unit offsets for AX text elements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct AxCfRange {
+    pub location: isize,
+    pub length: isize,
+}
+
+impl AxCfRange {
+    pub fn from_utf16(location: usize, length: usize) -> Option<Self> {
+        Some(Self {
+            location: isize::try_from(location).ok()?,
+            length: isize::try_from(length).ok()?,
+        })
+    }
+}
+
 // ── Helper functions ──────────────────────────────────────────────────────────
 
 use core_foundation::{array::CFArray, base::TCFType, string::CFString as CFStr};
@@ -152,6 +180,24 @@ pub unsafe fn is_attribute_settable(element: AXUIElementRef, attr_name: &str) ->
     AXUIElementIsAttributeSettable(element, attr.as_concrete_TypeRef(), &mut settable)
         == kAXErrorSuccess
         && settable != 0
+}
+
+/// Read the process which owns an AX element without inferring ownership from
+/// the top-level application used to discover it.
+///
+/// # Safety
+///
+/// `element` must be a live AX element reference for the duration of the call.
+pub unsafe fn element_pid(element: AXUIElementRef) -> Result<i32, AXError> {
+    let mut pid = 0_i32;
+    let error = AXUIElementGetPid(element, &mut pid);
+    if error != kAXErrorSuccess {
+        return Err(error);
+    }
+    if pid <= 0 {
+        return Err(kAXErrorFailure);
+    }
+    Ok(pid)
 }
 
 /// Copy a string attribute from an AX element. Returns `None` on any error.
@@ -173,6 +219,224 @@ pub unsafe fn copy_string_attr(element: AXUIElementRef, attr_name: &str) -> Opti
     }
     let s = CFStr::wrap_under_create_rule(value as _);
     Some(s.to_string())
+}
+
+/// A retained, index-aligned result from
+/// `AXUIElementCopyMultipleAttributeValues(options: 0)`.
+///
+/// Unsupported attributes remain at their requested position as `CFNull` or
+/// an AX error value, so typed accessors return `None` without shifting later
+/// values. This preserves the scalar helpers' optional-attribute semantics
+/// while paying one cross-process AX message for the whole group.
+pub struct CopiedAxAttributes {
+    values: CFArray<*const c_void>,
+}
+
+impl CopiedAxAttributes {
+    fn value(&self, index: usize) -> Option<CFTypeRef> {
+        let index = isize::try_from(index).ok()?;
+        if index >= self.values.len() {
+            return None;
+        }
+        let value = unsafe {
+            core_foundation::array::CFArrayGetValueAtIndex(self.values.as_concrete_TypeRef(), index)
+                as CFTypeRef
+        };
+        (!value.is_null()).then_some(value)
+    }
+
+    pub fn string(&self, index: usize) -> Option<String> {
+        let value = self.value(index)?;
+        if unsafe { core_foundation::base::CFGetTypeID(value) } != CFStr::type_id() {
+            return None;
+        }
+        Some(unsafe { CFStr::wrap_under_get_rule(value as _) }.to_string())
+    }
+
+    /// Whether a per-attribute AX error should fall back to the scalar read.
+    ///
+    /// A successful multiple-attribute request may still return an AX error
+    /// value in an individual slot. Unsupported and no-value are definitive
+    /// absence; every other error retains the pre-batching scalar behavior so
+    /// a transient failure cannot silently erase a scope or control fact.
+    pub fn needs_scalar_fallback(&self, index: usize) -> bool {
+        let Some(value) = self.value(index) else {
+            return false;
+        };
+        if unsafe { core_foundation::base::CFGetTypeID(value) } != unsafe { AXValueGetTypeID() } {
+            return false;
+        }
+        let value = value as AXValueRef;
+        if unsafe { AXValueGetType(value) } != kAXValueAXErrorType {
+            return false;
+        }
+        let mut error = kAXErrorFailure;
+        if !unsafe {
+            AXValueGetValue(
+                value,
+                kAXValueAXErrorType,
+                &mut error as *mut _ as *mut c_void,
+            )
+        } {
+            return true;
+        }
+        !matches!(error, kAXErrorAttributeUnsupported | kAXErrorNoValue)
+    }
+
+    pub fn stringish(&self, index: usize) -> Option<StringishAttrValue> {
+        unsafe { coerce_stringish_value(self.value(index)?) }
+    }
+
+    pub fn number(&self, index: usize) -> Option<f64> {
+        use core_foundation::number::CFNumber;
+        let value = self.value(index)?;
+        if unsafe { core_foundation::base::CFGetTypeID(value) } != CFNumber::type_id() {
+            return None;
+        }
+        unsafe { CFNumber::wrap_under_get_rule(value as _) }.to_f64()
+    }
+
+    pub fn boolean(&self, index: usize) -> Option<bool> {
+        use core_foundation::boolean::CFBoolean;
+        use core_foundation::number::CFNumber;
+        let value = self.value(index)?;
+        let type_id = unsafe { core_foundation::base::CFGetTypeID(value) };
+        if type_id == CFBoolean::type_id() {
+            return Some(bool::from(unsafe {
+                CFBoolean::wrap_under_get_rule(value as _)
+            }));
+        }
+        if type_id == CFNumber::type_id() {
+            return unsafe { CFNumber::wrap_under_get_rule(value as _) }
+                .to_f64()
+                .map(|number| number != 0.0);
+        }
+        None
+    }
+
+    pub fn screen_rect(&self, position_index: usize, size_index: usize) -> Option<[f64; 4]> {
+        let position = self.value(position_index)? as AXValueRef;
+        let size = self.value(size_index)? as AXValueRef;
+        if unsafe { core_foundation::base::CFGetTypeID(position as CFTypeRef) }
+            != unsafe { AXValueGetTypeID() }
+            || unsafe { core_foundation::base::CFGetTypeID(size as CFTypeRef) }
+                != unsafe { AXValueGetTypeID() }
+            || unsafe { AXValueGetType(position) } != kAXValueCGPointType
+            || unsafe { AXValueGetType(size) } != kAXValueCGSizeType
+        {
+            return None;
+        }
+        let mut point = CGPointValue { x: 0.0, y: 0.0 };
+        let mut extent = CGSizeValue {
+            width: 0.0,
+            height: 0.0,
+        };
+        let point_copied = unsafe {
+            AXValueGetValue(
+                position,
+                kAXValueCGPointType,
+                &mut point as *mut _ as *mut c_void,
+            )
+        };
+        let size_copied = unsafe {
+            AXValueGetValue(
+                size,
+                kAXValueCGSizeType,
+                &mut extent as *mut _ as *mut c_void,
+            )
+        };
+        (point_copied && size_copied && extent.width >= 1.0 && extent.height >= 1.0).then_some([
+            point.x,
+            point.y,
+            extent.width,
+            extent.height,
+        ])
+    }
+}
+
+/// Copy several read-only AX attributes in one native message.
+///
+/// Returns `None` only when the batch request itself fails or violates the
+/// API's index-alignment contract. Callers may then use the existing scalar
+/// helpers as a compatibility fallback.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn copy_multiple_attr_values(
+    element: AXUIElementRef,
+    attr_names: &[&str],
+) -> Option<CopiedAxAttributes> {
+    let attributes = attr_names
+        .iter()
+        .map(|name| CFStr::new(name))
+        .collect::<Vec<_>>();
+    let attribute_array = CFArray::from_CFTypes(&attributes);
+    let mut values: CFArrayRef = std::ptr::null();
+    let error = AXUIElementCopyMultipleAttributeValues(
+        element,
+        attribute_array.as_concrete_TypeRef(),
+        0,
+        &mut values,
+    );
+    if error != kAXErrorSuccess || values.is_null() {
+        if !values.is_null() {
+            CFRelease(values as CFTypeRef);
+        }
+        return None;
+    }
+    let values = CFArray::<*const c_void>::wrap_under_create_rule(values);
+    if values.len() != isize::try_from(attr_names.len()).ok()? {
+        return None;
+    }
+    Some(CopiedAxAttributes { values })
+}
+
+/// Copy a `kAXValueCFRangeType` attribute.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn copy_cf_range_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Result<Option<AxCfRange>, AXError> {
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if error == kAXErrorNoValue || error == kAXErrorAttributeUnsupported {
+        return Ok(None);
+    }
+    if error != kAXErrorSuccess {
+        return Err(error);
+    }
+    if value.is_null() {
+        return Ok(None);
+    }
+    if core_foundation::base::CFGetTypeID(value) != AXValueGetTypeID() {
+        CFRelease(value);
+        return Err(kAXErrorFailure);
+    }
+    let value = value as AXValueRef;
+    if AXValueGetType(value) != kAXValueCFRangeType {
+        CFRelease(value as CFTypeRef);
+        return Err(kAXErrorFailure);
+    }
+    let mut range = AxCfRange {
+        location: 0,
+        length: 0,
+    };
+    let copied = AXValueGetValue(
+        value,
+        kAXValueCFRangeType,
+        &mut range as *mut _ as *mut c_void,
+    );
+    CFRelease(value as CFTypeRef);
+    if copied {
+        Ok(Some(range))
+    } else {
+        Err(kAXErrorFailure)
+    }
 }
 
 /// Copy a numeric attribute from an AX element as an `f64`. Returns `None` on
@@ -228,6 +492,58 @@ pub unsafe fn copy_bool_attr(element: AXUIElementRef, attr_name: &str) -> Option
     }
     CFRelease(value);
     None
+}
+
+/// Copy a `kAXValueCGPointType` attribute.
+///
+/// Missing and unsupported attributes are optional. Other query or type
+/// failures remain distinguishable to callers that require exact geometry.
+///
+/// # Safety
+///
+/// `element` must be a valid Accessibility object reference for this call.
+pub unsafe fn copy_point_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Result<Option<(f64, f64)>, AXError> {
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err == kAXErrorNoValue || err == kAXErrorAttributeUnsupported {
+        return Ok(None);
+    }
+    if err != kAXErrorSuccess {
+        return Err(err);
+    }
+    if value.is_null() {
+        return Ok(None);
+    }
+    if core_foundation::base::CFGetTypeID(value) != AXValueGetTypeID() {
+        CFRelease(value);
+        return Err(kAXErrorFailure);
+    }
+    let value = value as AXValueRef;
+    if AXValueGetType(value) != kAXValueCGPointType {
+        CFRelease(value as CFTypeRef);
+        return Err(kAXErrorFailure);
+    }
+    #[repr(C)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    let mut point = CGPoint { x: 0.0, y: 0.0 };
+    let copied = AXValueGetValue(
+        value,
+        kAXValueCGPointType,
+        &mut point as *mut _ as *mut c_void,
+    );
+    CFRelease(value as CFTypeRef);
+    if copied {
+        Ok(Some((point.x, point.y)))
+    } else {
+        Err(kAXErrorFailure)
+    }
 }
 
 /// A copied AX attribute represented for both existing string-only consumers
@@ -563,6 +879,27 @@ pub unsafe fn set_string_attr(element: AXUIElementRef, attr_name: &str, value: &
     AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_value.as_CFTypeRef())
 }
 
+/// Set a `kAXValueCFRangeType` attribute.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn set_cf_range_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+    range: AxCfRange,
+) -> AXError {
+    let value = AXValueCreate(kAXValueCFRangeType, &range as *const _ as *const c_void);
+    if value.is_null() {
+        return kAXErrorFailure;
+    }
+    let attr = CFStr::new(attr_name);
+    let error =
+        AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), value as CFTypeRef);
+    CFRelease(value as CFTypeRef);
+    error
+}
+
 /// Set an AX attribute to a CFNumber (double) value. Numeric controls — most
 /// notably `AXSlider` (NSSlider) and `AXStepper` — expose a numeric `AXValue`
 /// reject a `CFString` write — `-25200` (kAXErrorFailure, observed live on a
@@ -626,16 +963,29 @@ pub unsafe fn set_size_attr(
     result
 }
 
+/// Set an AX attribute to a CFBoolean value.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn set_bool_attr(element: AXUIElementRef, attr_name: &str, value: bool) -> AXError {
+    use core_foundation::boolean::CFBoolean;
+    let attr = CFStr::new(attr_name);
+    let cf_value = if value {
+        CFBoolean::true_value()
+    } else {
+        CFBoolean::false_value()
+    };
+    AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_value.as_CFTypeRef())
+}
+
 /// Set an AX attribute to a CFBoolean true value.
 ///
 /// # Safety
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn set_bool_attr_true(element: AXUIElementRef, attr_name: &str) -> AXError {
-    use core_foundation::boolean::CFBoolean;
-    let attr = CFStr::new(attr_name);
-    let cf_true = CFBoolean::true_value();
-    AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_true.as_CFTypeRef())
+    set_bool_attr(element, attr_name, true)
 }
 
 /// Signal to a Chromium/Electron application root that a real assistive client
@@ -751,5 +1101,103 @@ mod tests {
         let false_result = unsafe { coerce_stringish_value(false_value.as_CFTypeRef()) }.unwrap();
         assert_eq!(false_result.string_value, None);
         assert_eq!(false_result.state_value, "0");
+    }
+
+    #[test]
+    fn batched_attribute_decoders_preserve_tree_types_and_geometry() {
+        let title = CFStr::new("Search");
+        let number = CFNumber::from(8.0);
+        let selected = CFBoolean::true_value();
+        let point_value = CGPointValue { x: 12.5, y: 24.0 };
+        let size_value = CGSizeValue {
+            width: 320.0,
+            height: 180.0,
+        };
+        let point = unsafe {
+            AXValueCreate(
+                kAXValueCGPointType,
+                &point_value as *const _ as *const c_void,
+            )
+        };
+        let size =
+            unsafe { AXValueCreate(kAXValueCGSizeType, &size_value as *const _ as *const c_void) };
+        assert!(!point.is_null());
+        assert!(!size.is_null());
+
+        let raw_values = [
+            title.as_CFTypeRef() as *const c_void,
+            number.as_CFTypeRef() as *const c_void,
+            selected.as_CFTypeRef() as *const c_void,
+            point as *const c_void,
+            size as *const c_void,
+        ];
+        let attributes = CopiedAxAttributes {
+            values: CFArray::from_copyable(&raw_values),
+        };
+
+        assert_eq!(attributes.string(0).as_deref(), Some("Search"));
+        assert_eq!(attributes.string(1), None, "numbers stay out of AX text");
+        assert_eq!(
+            attributes.stringish(1),
+            Some(StringishAttrValue {
+                string_value: None,
+                state_value: "8".into(),
+            })
+        );
+        assert_eq!(attributes.number(1), Some(8.0));
+        assert_eq!(attributes.boolean(2), Some(true));
+        assert_eq!(
+            attributes.screen_rect(3, 4),
+            Some([12.5, 24.0, 320.0, 180.0])
+        );
+        assert_eq!(
+            attributes.screen_rect(0, 4),
+            None,
+            "wrong AX types fail closed"
+        );
+
+        drop(attributes);
+        unsafe {
+            CFRelease(point as CFTypeRef);
+            CFRelease(size as CFTypeRef);
+        }
+    }
+
+    #[test]
+    fn batched_attribute_errors_only_retry_nonterminal_slots() {
+        let cannot_complete = kAXErrorCannotComplete;
+        let unsupported = kAXErrorAttributeUnsupported;
+        let cannot_complete_value = unsafe {
+            AXValueCreate(
+                kAXValueAXErrorType,
+                &cannot_complete as *const _ as *const c_void,
+            )
+        };
+        let unsupported_value = unsafe {
+            AXValueCreate(
+                kAXValueAXErrorType,
+                &unsupported as *const _ as *const c_void,
+            )
+        };
+        assert!(!cannot_complete_value.is_null());
+        assert!(!unsupported_value.is_null());
+
+        let raw_values = [
+            cannot_complete_value as *const c_void,
+            unsupported_value as *const c_void,
+        ];
+        let attributes = CopiedAxAttributes {
+            values: CFArray::from_copyable(&raw_values),
+        };
+
+        assert!(attributes.needs_scalar_fallback(0));
+        assert!(!attributes.needs_scalar_fallback(1));
+        assert!(!attributes.needs_scalar_fallback(2));
+
+        drop(attributes);
+        unsafe {
+            CFRelease(cannot_complete_value as CFTypeRef);
+            CFRelease(unsupported_value as CFTypeRef);
+        }
     }
 }

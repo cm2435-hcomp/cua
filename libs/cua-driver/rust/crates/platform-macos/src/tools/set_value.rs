@@ -161,82 +161,108 @@ impl Tool for SetValueTool {
             };
         let element_ptr = element_guard.as_ptr();
 
-        // set_value is an always-background semantic AX mutation. Re-prove
-        // that the retained element still belongs to the requested exact
-        // window immediately before any cursor or AX work; a cache hit alone
-        // is not delivery proof after a window lifecycle or Space change.
-        let _mutation_lease = match super::gate_background_window_action(
+        // Native text AXValue writes use no process-shared focus, keyboard,
+        // pointer, or menu resource. Keep those exact writes target-local so
+        // two independent windows of one application can progress together.
+        // Popups, numeric controls, and web content retain the conservative
+        // per-process guard and focus-suppression path below.
+        let role = unsafe { copy_string_attr(element_ptr as AXUIElementRef, "AXRole") }
+            .unwrap_or_default();
+        let ax_echo_surface = super::type_text::target_in_web_area(
             pid,
-            window_id,
-            Some(element_ptr),
-            cua_driver_core::background_input::BackgroundAction::AxSemantic,
-        )
-        .await
-        {
-            Ok(lease) => lease,
-            Err(refusal_result) => return refusal_result,
+            Some((element_ptr, Some(element_index))),
+            Some(window_id),
+        );
+        let target_local = matches!(role.as_str(), "AXTextArea" | "AXTextField")
+            && !ax_echo_surface
+            && unsafe {
+                crate::ax::bindings::is_attribute_settable(element_ptr as AXUIElementRef, "AXValue")
+            };
+        let _mutation_lease = if target_local {
+            match super::gate_target_local_ax_action(pid, window_id, element_ptr).await {
+                Ok(lease) => Some(lease),
+                Err(refusal_result) => return refusal_result,
+            }
+        } else {
+            match super::gate_background_window_action(
+                pid,
+                window_id,
+                Some(element_ptr),
+                cua_driver_core::background_input::BackgroundAction::AxSemantic,
+            )
+            .await
+            {
+                Ok(lease) => Some(lease),
+                Err(refusal_result) => return refusal_result,
+            }
         };
 
-        let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
-        let center_ptr = element_ptr as usize;
-        if let Ok(Some((screen_x, screen_y))) = tokio::task::spawn_blocking(move || unsafe {
-            crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
-        })
-        .await
-        {
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::PinAbove(window_id as u64),
-            );
-            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
-            self.state
-                .cursor_registry
-                .update_position(&cursor_key, screen_x, screen_y);
+        if !target_local {
+            let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
+            let center_ptr = element_ptr as usize;
+            if let Ok(Some((screen_x, screen_y))) = tokio::task::spawn_blocking(move || unsafe {
+                crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
+            })
+            .await
+            {
+                crate::cursor::overlay::send_command(
+                    cursor_key.clone(),
+                    cursor_overlay::OverlayCommand::PinAbove(window_id as u64),
+                );
+                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y)
+                    .await;
+                self.state
+                    .cursor_registry
+                    .update_position(&cursor_key, screen_x, screen_y);
+            }
         }
         // An AXValue read-back is not ground truth for web content. Chromium,
         // WebKit, and Electron can echo the write through accessibility while
         // the renderer never observes it. Reuse type_text's bounded ancestor
         // check so native browser chrome stays trusted but rendered content is
         // always reported as unverified.
-        let ax_echo_surface = super::type_text::target_in_web_area(
-            pid,
-            Some((element_ptr, Some(element_index))),
-            Some(window_id),
-        );
-
-        // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
-        // AXValue writes on popups / sliders can cause reflex activations
-        // in Chromium-based apps; the AXPopUpButton path also AXPresses a
-        // child option which can trigger app activation in some setups.
-        let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
-
-        let result = focus_guard::with_focus_suppressed(
-            Some(pid),
-            prior_front,
-            "set_value.AXValue",
-            || async move {
+        let (result, changes_suffix) = if target_local {
+            let value = value.clone();
+            (
                 tokio::task::spawn_blocking(move || {
                     set_value_blocking(element_ptr, element_index, pid, &value)
                 })
-                .await
-            },
-        )
-        .await;
-
-        let changes = snapshot.detect_async().await;
+                .await,
+                String::new(),
+            )
+        } else {
+            // Popups / sliders can cause reflex activations in Chromium-based
+            // apps, so these routes retain the Swift-derived focus guard.
+            let prior_front = apps::frontmost_pid();
+            let snapshot = WindowChangeDetector::snapshot(prior_front);
+            let value = value.clone();
+            let result = focus_guard::with_focus_suppressed(
+                Some(pid),
+                prior_front,
+                "set_value.AXValue",
+                || async move {
+                    tokio::task::spawn_blocking(move || {
+                        set_value_blocking(element_ptr, element_index, pid, &value)
+                    })
+                    .await
+                },
+            )
+            .await;
+            (result, snapshot.detect_async().await.result_suffix())
+        };
 
         match result {
             Ok(Ok(mut outcome)) => {
                 apply_surface_trust(&mut outcome, ax_echo_surface);
                 apply_verification_label(&mut outcome);
                 let mut msg = outcome.detail;
-                msg.push_str(&changes.result_suffix());
+                msg.push_str(&changes_suffix);
                 let verified = outcome.verified.unwrap_or(false);
                 let mut structured = serde_json::json!({
                     "path": "ax",
                     "verified": verified,
                     "effect": if verified { "confirmed" } else { "unverifiable" },
+                    "dispatch_scope": if target_local { "target" } else { "process" },
                 });
                 if ax_echo_surface {
                     structured["escalation"] = serde_json::json!({

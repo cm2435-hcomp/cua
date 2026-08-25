@@ -152,6 +152,7 @@ mod tests {
         AXNode {
             element_index: Some(0),
             role: String::new(),
+            subrole: None,
             title: None,
             value: None,
             description: None,

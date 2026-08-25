@@ -47,7 +47,7 @@ impl Tool for StartRecordingTool {
             name: "start_recording".into(),
             description: "Start trajectory recording. Every subsequent action-tool \
                 invocation (click, right_click, scroll, type_text, press_key, hotkey, \
-                set_value) writes a turn folder under `output_dir`:\n\n\
+                set_value, select_text) writes a turn folder under `output_dir`:\n\n\
                 - `before_state.json` / `after_state.json` — application AX/UIA/AT-SPI \
                   state immediately before and after the action.\n\
                 - `before.png` / `after.png` — target-window screenshots immediately \
