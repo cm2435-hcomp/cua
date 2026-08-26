@@ -308,6 +308,13 @@ struct ExactDrawableGeometry {
     depth: u8,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("target window geometry raced during capture: before {before:?}, after {after:?}")]
+pub(crate) struct ExactCaptureGeometryRaced {
+    before: ExactDrawableGeometry,
+    after: ExactDrawableGeometry,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExactCaptureDrawable {
     xid: u64,
@@ -564,11 +571,11 @@ fn with_named_window_pixmap<T>(
         .and_then(|value| {
             let target_after = session.geometry(target, "post-capture target window")?;
             if target_after != source.target_geometry {
-                bail!(
-                    "target window geometry raced during capture: before {:?}, after {:?}",
-                    source.target_geometry,
-                    target_after
-                );
+                return Err(ExactCaptureGeometryRaced {
+                    before: source.target_geometry,
+                    after: target_after,
+                }
+                .into());
             }
             Ok(value)
         })

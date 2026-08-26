@@ -20,6 +20,14 @@ use std::sync::{Arc, RwLock};
 use crate::atspi::ElementCache;
 use cursor_overlay::CursorRegistry;
 
+#[derive(Clone, Copy)]
+enum LinuxObservationFailureKind {
+    Internal,
+    GeometryRaced,
+}
+
+type LinuxObservationFailure = (&'static str, String, LinuxObservationFailureKind);
+
 fn window_target_candidates_for_pid(
     windows: impl IntoIterator<Item = crate::x11::WindowInfo>,
     pid: u32,
@@ -972,7 +980,7 @@ impl Tool for GetWindowStateTool {
         let state = self.state.clone();
         let query_for_walk = query.clone();
 
-        let result = tokio::task::spawn_blocking(move || -> Result<_, (&'static str, String)> {
+        let result = tokio::task::spawn_blocking(move || -> Result<_, LinuxObservationFailure> {
             let (tree_result, tree_cache_status) = crate::atspi::observe_tree_bounded(
                 pid,
                 xid,
@@ -1008,15 +1016,29 @@ impl Tool for GetWindowStateTool {
                             .map(|(w, _)| w)
                             .unwrap_or(0);
                         let png = crate::capture::resize_png_if_needed(&raw, max_dim).map_err(
-                            |error| ("linux_observation_screenshot_resize", error.to_string()),
+                            |error| {
+                                (
+                                    "linux_observation_screenshot_resize",
+                                    error.to_string(),
+                                    LinuxObservationFailureKind::Internal,
+                                )
+                            },
                         )?;
                         let (w, h) = crate::capture::png_dimensions_pub(&png).map_err(|error| {
-                            ("linux_observation_screenshot_dimensions", error.to_string())
+                            (
+                                "linux_observation_screenshot_dimensions",
+                                error.to_string(),
+                                LinuxObservationFailureKind::Internal,
+                            )
                         })?;
                         let original_w = if w < orig_w { Some(orig_w) } else { None };
                         if let Some(ref path) = screenshot_out_file {
                             std::fs::write(path, &png).map_err(|error| {
-                                ("linux_observation_screenshot_write", error.to_string())
+                                (
+                                    "linux_observation_screenshot_write",
+                                    error.to_string(),
+                                    LinuxObservationFailureKind::Internal,
+                                )
                             })?;
                             Some((None, Some(path.clone()), w, h, original_w))
                         } else {
@@ -1025,9 +1047,21 @@ impl Tool for GetWindowStateTool {
                         }
                     }
                     Err(error) => {
+                        // Nautilus can resize its first window while XComposite
+                        // reads it. Retry the whole AX + screenshot observation
+                        // instead of pairing fresh pixels with the old AX walk.
+                        let kind = if error
+                            .downcast_ref::<crate::capture::ExactCaptureGeometryRaced>()
+                            .is_some()
+                        {
+                            LinuxObservationFailureKind::GeometryRaced
+                        } else {
+                            LinuxObservationFailureKind::Internal
+                        };
                         return Err((
                             "linux_observation_screenshot_capture",
                             format!("window screenshot failed for window {xid}: {error}"),
+                            kind,
                         ));
                     }
                 }
@@ -1265,9 +1299,10 @@ impl Tool for GetWindowStateTool {
                     action_record: None,
                 }
             }
-            Ok(Err((failure_site, error))) => linux_observation_failure(
+            Ok(Err((failure_site, error, kind))) => linux_observation_failure(
                 failure_site,
                 format!("Capture error: {error}"),
+                kind,
                 minimized_recovery.as_ref(),
                 pid,
                 xid,
@@ -1275,6 +1310,7 @@ impl Tool for GetWindowStateTool {
             Err(error) => linux_observation_failure(
                 "linux_observation_task_join",
                 format!("Task error: {error}"),
+                LinuxObservationFailureKind::Internal,
                 minimized_recovery.as_ref(),
                 pid,
                 xid,
@@ -1316,6 +1352,7 @@ fn mark_ax_window_unresolved(
 fn linux_observation_failure(
     failure_site: &'static str,
     message: String,
+    kind: LinuxObservationFailureKind,
     recovery: Option<&crate::x11::minimized_recovery::RecoveryEvidence>,
     pid: u32,
     xid: u64,
@@ -1326,13 +1363,14 @@ fn linux_observation_failure(
     // failure on the next focused reproduction.
     // The public error intentionally hides native text. Retain this bounded
     // capture-only detail so XComposite/XShm failures remain diagnosable.
+    let geometry_raced = matches!(kind, LinuxObservationFailureKind::GeometryRaced);
     let capture_failure_detail =
         (failure_site == "linux_observation_screenshot_capture").then(|| message.clone());
     decorate_linux_post_recovery_error(
         ToolResult::error(message).with_structured(json!({
-            "code": "internal",
-            "phase": "preflight",
-            "retryable": false,
+            "code": if geometry_raced { "observation_raced" } else { "internal" },
+            "phase": if geometry_raced { "verify" } else { "preflight" },
+            "retryable": geometry_raced,
             "effect": "refused",
             "effect_may_have_occurred": false,
             "native_side_effect_started": false,
@@ -1347,13 +1385,14 @@ fn linux_observation_failure(
 
 #[cfg(test)]
 mod observation_failure_tests {
-    use super::linux_observation_failure;
+    use super::{linux_observation_failure, LinuxObservationFailureKind};
 
     #[test]
     fn observation_failure_retains_its_content_free_native_site() {
         let result = linux_observation_failure(
             "linux_observation_screenshot_capture",
             "fixture failure".to_owned(),
+            LinuxObservationFailureKind::Internal,
             None,
             42,
             99,
@@ -1361,6 +1400,7 @@ mod observation_failure_tests {
         let structured = result.structured_content.expect("structured failure");
         assert_eq!(structured["code"], "internal");
         assert_eq!(structured["phase"], "preflight");
+        assert_eq!(structured["retryable"], false);
         assert_eq!(
             structured["failure_site"],
             "linux_observation_screenshot_capture"
@@ -1368,6 +1408,24 @@ mod observation_failure_tests {
         assert_eq!(structured["capture_failure_detail"], "fixture failure");
         assert_eq!(structured["pid"], 42);
         assert_eq!(structured["window_id"], 99);
+        assert_eq!(structured["native_side_effect_started"], false);
+    }
+
+    #[test]
+    fn resizing_window_is_a_retryable_observation_race() {
+        let result = linux_observation_failure(
+            "linux_observation_screenshot_capture",
+            "target window geometry raced during capture".to_owned(),
+            LinuxObservationFailureKind::GeometryRaced,
+            None,
+            42,
+            99,
+        );
+        let structured = result.structured_content.expect("structured failure");
+        assert_eq!(structured["code"], "observation_raced");
+        assert_eq!(structured["phase"], "verify");
+        assert_eq!(structured["retryable"], true);
+        assert_eq!(structured["effect_may_have_occurred"], false);
         assert_eq!(structured["native_side_effect_started"], false);
     }
 }
