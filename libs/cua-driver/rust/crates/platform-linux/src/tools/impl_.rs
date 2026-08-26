@@ -1526,7 +1526,6 @@ fn select_launched_windows(
     let launched_identity = normalized_launch_identity(launched_name);
     let matching: Vec<_> = windows
         .iter()
-        .filter(|window| !previous_window_ids.contains(&window.xid))
         .filter(|window| {
             let app = normalized_launch_identity(&window.app_name);
             let title = normalized_launch_identity(&window.title);
@@ -1537,12 +1536,34 @@ fn select_launched_windows(
         })
         .cloned()
         .collect();
-    let pids: std::collections::HashSet<_> =
-        matching.iter().filter_map(|window| window.pid).collect();
+    let newly_created: Vec<_> = matching
+        .iter()
+        .filter(|window| !previous_window_ids.contains(&window.xid))
+        .collect();
+    // Single-process apps can absorb a launch without creating a new XID.
+    // Requiring one caused LibreOffice-style relaunches to wait 30 seconds and
+    // fail even though one unambiguous existing process already owned the UI.
+    let identity_candidates: Vec<_> = if newly_created.is_empty() {
+        matching.iter().collect()
+    } else {
+        newly_created
+    };
+    let pids: std::collections::HashSet<_> = identity_candidates
+        .iter()
+        .filter_map(|window| window.pid)
+        .collect();
     if pids.len() != 1 {
         return None;
     }
-    Some((*pids.iter().next()?, matching))
+    let pid = *pids.iter().next()?;
+    Some((
+        pid,
+        windows
+            .iter()
+            .filter(|window| window.pid == Some(pid))
+            .cloned()
+            .collect(),
+    ))
 }
 
 fn await_launched_windows(
@@ -1638,6 +1659,41 @@ mod launch_app_tests {
         assert!(select_launched_windows(
             &[calc, unrelated, second_calc],
             &previous,
+            200,
+            "LibreOffice Calc",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn launch_window_selection_reuses_one_existing_process_but_not_two() {
+        let calc = window(10, 300, "libreoffice-calc", "Untitled 1 - LibreOffice Calc");
+        let dialog = window(11, 300, "soffice", "Document Recovery");
+        let previous = std::collections::HashSet::from([calc.xid, dialog.xid]);
+
+        let selected = select_launched_windows(
+            &[calc.clone(), dialog.clone()],
+            &previous,
+            200,
+            "LibreOffice Calc",
+        )
+        .expect("one existing matching process should satisfy an idempotent launch");
+        assert_eq!(selected.0, 300);
+        assert_eq!(
+            selected
+                .1
+                .iter()
+                .map(|window| window.xid)
+                .collect::<Vec<_>>(),
+            vec![calc.xid, dialog.xid]
+        );
+
+        let second_calc = window(12, 500, "libreoffice-calc", "Untitled 2 - LibreOffice Calc");
+        let ambiguous_previous =
+            std::collections::HashSet::from([calc.xid, dialog.xid, second_calc.xid]);
+        assert!(select_launched_windows(
+            &[calc, dialog, second_calc],
+            &ambiguous_previous,
             200,
             "LibreOffice Calc",
         )
@@ -1777,7 +1833,7 @@ impl Tool for LaunchAppTool {
                 "urls":{"type":"array","items":{"type":"string"},"description":"URLs to open via xdg-open."},
                 "additional_arguments":{"type":"array","items":{"type":"string"},"description":"Extra command-line arguments passed to the launched process."}
             },"additionalProperties":false}),
-            read_only: false, destructive: false, idempotent: false, open_world: true,
+            read_only: false, destructive: false, idempotent: true, open_world: true,
         })
     }
 
