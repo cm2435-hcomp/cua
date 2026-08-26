@@ -1269,11 +1269,15 @@ impl Tool for GetWindowStateTool {
                 failure_site,
                 format!("Capture error: {error}"),
                 minimized_recovery.as_ref(),
+                pid,
+                xid,
             ),
             Err(error) => linux_observation_failure(
                 "linux_observation_task_join",
                 format!("Task error: {error}"),
                 minimized_recovery.as_ref(),
+                pid,
+                xid,
             ),
         }
     }
@@ -1313,11 +1317,17 @@ fn linux_observation_failure(
     failure_site: &'static str,
     message: String,
     recovery: Option<&crate::x11::minimized_recovery::RecoveryEvidence>,
+    pid: u32,
+    xid: u64,
 ) -> ToolResult {
     // OSW exposed these as identical `internal/preflight` failures after
     // healthy Calc reads. Keep user-visible semantics unchanged while naming
     // the content-free native stage needed to distinguish capture from task
     // failure on the next focused reproduction.
+    // The public error intentionally hides native text. Retain this bounded
+    // capture-only detail so XComposite/XShm failures remain diagnosable.
+    let capture_failure_detail =
+        (failure_site == "linux_observation_screenshot_capture").then(|| message.clone());
     decorate_linux_post_recovery_error(
         ToolResult::error(message).with_structured(json!({
             "code": "internal",
@@ -1327,6 +1337,9 @@ fn linux_observation_failure(
             "effect_may_have_occurred": false,
             "native_side_effect_started": false,
             "failure_site": failure_site,
+            "capture_failure_detail": capture_failure_detail,
+            "pid": pid,
+            "window_id": xid,
         })),
         recovery,
     )
@@ -1342,6 +1355,8 @@ mod observation_failure_tests {
             "linux_observation_screenshot_capture",
             "fixture failure".to_owned(),
             None,
+            42,
+            99,
         );
         let structured = result.structured_content.expect("structured failure");
         assert_eq!(structured["code"], "internal");
@@ -1350,6 +1365,9 @@ mod observation_failure_tests {
             structured["failure_site"],
             "linux_observation_screenshot_capture"
         );
+        assert_eq!(structured["capture_failure_detail"], "fixture failure");
+        assert_eq!(structured["pid"], 42);
+        assert_eq!(structured["window_id"], 99);
         assert_eq!(structured["native_side_effect_started"], false);
     }
 }
