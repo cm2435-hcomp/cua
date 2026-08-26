@@ -1508,50 +1508,54 @@ fn normalized_launch_identity(value: &str) -> String {
         .collect()
 }
 
-fn select_launched_windows(
-    windows: &[crate::x11::WindowInfo],
-    previous_window_ids: &std::collections::HashSet<u64>,
-    launcher_pid: u32,
-    launched_name: &str,
-) -> Option<(u32, Vec<crate::x11::WindowInfo>)> {
-    let direct: Vec<_> = windows
-        .iter()
-        .filter(|window| window.pid == Some(launcher_pid))
-        .cloned()
-        .collect();
-    if !direct.is_empty() {
-        return Some((launcher_pid, direct));
+#[derive(Debug, Clone)]
+struct LaunchIdentity {
+    aliases: Vec<String>,
+    qualifier_args: Vec<String>,
+}
+
+impl LaunchIdentity {
+    fn from_command(command: &str) -> Self {
+        let mut parts = command.split_whitespace();
+        let executable = parts.next().unwrap_or(command);
+        Self {
+            aliases: vec![command.to_owned(), exec_basename(executable)],
+            qualifier_args: parts
+                .filter(|argument| argument.starts_with('-'))
+                .map(str::to_owned)
+                .collect(),
+        }
     }
 
-    let launched_identity = normalized_launch_identity(launched_name);
-    let matching: Vec<_> = windows
-        .iter()
-        .filter(|window| {
-            let app = normalized_launch_identity(&window.app_name);
-            let title = normalized_launch_identity(&window.title);
-            launched_identity.len() >= 4
-                && ((app.len() >= 4
-                    && (app.contains(&launched_identity) || launched_identity.contains(&app)))
-                    || title.contains(&launched_identity))
+    fn from_installed(app: &crate::installed_apps::InstalledApp) -> Self {
+        let mut identity = Self::from_command(&app.launch_path);
+        identity.aliases.push(app.name.clone());
+        identity.aliases.push(app.bundle_id.clone());
+        if let Some(startup_wm_class) = &app.startup_wm_class {
+            identity.aliases.push(startup_wm_class.clone());
+        }
+        identity
+    }
+}
+
+fn process_arguments(pid: u32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|raw| {
+            raw.split(|byte| *byte == 0)
+                .filter(|argument| !argument.is_empty())
+                .map(|argument| String::from_utf8_lossy(argument).into_owned())
+                .collect()
         })
-        .cloned()
-        .collect();
-    let newly_created: Vec<_> = matching
-        .iter()
-        .filter(|window| !previous_window_ids.contains(&window.xid))
-        .collect();
-    // Single-process apps can absorb a launch without creating a new XID.
-    // Requiring one caused LibreOffice-style relaunches to wait 30 seconds and
-    // fail even though one unambiguous existing process already owned the UI.
-    let identity_candidates: Vec<_> = if newly_created.is_empty() {
-        matching.iter().collect()
-    } else {
-        newly_created
-    };
-    let pids: std::collections::HashSet<_> = identity_candidates
-        .iter()
-        .filter_map(|window| window.pid)
-        .collect();
+        .unwrap_or_default()
+}
+
+fn windows_for_unique_pid(
+    windows: &[crate::x11::WindowInfo],
+    candidates: &[&crate::x11::WindowInfo],
+) -> Option<(u32, Vec<crate::x11::WindowInfo>)> {
+    let pids: std::collections::HashSet<_> =
+        candidates.iter().filter_map(|window| window.pid).collect();
     if pids.len() != 1 {
         return None;
     }
@@ -1566,9 +1570,92 @@ fn select_launched_windows(
     ))
 }
 
+fn select_launched_windows(
+    windows: &[crate::x11::WindowInfo],
+    process_arguments_by_pid: &std::collections::HashMap<u32, Vec<String>>,
+    previous_window_ids: &std::collections::HashSet<u64>,
+    launcher_pid: u32,
+    identity: &LaunchIdentity,
+) -> Option<(u32, Vec<crate::x11::WindowInfo>)> {
+    let direct: Vec<_> = windows
+        .iter()
+        .filter(|window| window.pid == Some(launcher_pid))
+        .cloned()
+        .collect();
+    if !direct.is_empty() {
+        return Some((launcher_pid, direct));
+    }
+
+    let aliases: Vec<_> = identity
+        .aliases
+        .iter()
+        .map(|alias| normalized_launch_identity(alias))
+        .filter(|alias| alias.len() >= 4)
+        .collect();
+    let matching: Vec<_> = windows
+        .iter()
+        .filter(|window| {
+            let app = normalized_launch_identity(&window.app_name);
+            let title = normalized_launch_identity(&window.title);
+            aliases.iter().any(|alias| {
+                (app.len() >= 4 && (app.contains(alias) || alias.contains(&app)))
+                    || title.contains(alias)
+            })
+        })
+        .cloned()
+        .collect();
+    let newly_created: Vec<_> = matching
+        .iter()
+        .filter(|window| !previous_window_ids.contains(&window.xid))
+        .collect();
+    // Single-process apps can absorb a launch without creating a new XID.
+    // Requiring one caused LibreOffice-style relaunches to wait 30 seconds and
+    // fail even though one unambiguous existing process already owned the UI.
+    if !newly_created.is_empty() {
+        return windows_for_unique_pid(windows, &newly_created);
+    }
+
+    if !identity.qualifier_args.is_empty() {
+        let signature_matching: Vec<_> = windows
+            .iter()
+            .filter(|window| {
+                window
+                    .pid
+                    .and_then(|pid| process_arguments_by_pid.get(&pid))
+                    .is_some_and(|arguments| {
+                        identity
+                            .qualifier_args
+                            .iter()
+                            .all(|qualifier| arguments.contains(qualifier))
+                    })
+            })
+            .collect();
+        let new_signature_matching: Vec<_> = signature_matching
+            .iter()
+            .copied()
+            .filter(|window| !previous_window_ids.contains(&window.xid))
+            .collect();
+        let candidates = if new_signature_matching.is_empty() {
+            &signature_matching
+        } else {
+            &new_signature_matching
+        };
+        if !candidates.is_empty() {
+            // X11 can expose LibreOffice module windows only as `Soffice`.
+            // The desktop launcher's module flag (`--calc`, `--impress`, …)
+            // is then the only retained exact identity. Accept it only when
+            // one window-owning process has the complete signature.
+            return windows_for_unique_pid(windows, candidates);
+        }
+    }
+
+    let identity_candidates: Vec<_> = matching.iter().collect();
+    windows_for_unique_pid(windows, &identity_candidates)
+}
+
 fn await_launched_windows(
     launcher_pid: u32,
-    launched_name: &str,
+    identity: &LaunchIdentity,
     previous_window_ids: &std::collections::HashSet<u64>,
 ) -> (u32, Vec<crate::x11::WindowInfo>) {
     // LibreOffice can take more than three seconds to expose the new module
@@ -1580,9 +1667,18 @@ fn await_launched_windows(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let windows = crate::wayland::list_windows_dispatch(None);
-        if let Some(resolved) =
-            select_launched_windows(&windows, previous_window_ids, launcher_pid, launched_name)
-        {
+        let process_arguments_by_pid = windows
+            .iter()
+            .filter_map(|window| window.pid)
+            .map(|pid| (pid, process_arguments(pid)))
+            .collect();
+        if let Some(resolved) = select_launched_windows(
+            &windows,
+            &process_arguments_by_pid,
+            previous_window_ids,
+            launcher_pid,
+            identity,
+        ) {
             return resolved;
         }
         if std::time::Instant::now() >= deadline {
@@ -1639,6 +1735,13 @@ mod launch_app_tests {
         }
     }
 
+    fn identity(name: &str) -> LaunchIdentity {
+        LaunchIdentity {
+            aliases: vec![name.to_owned()],
+            qualifier_args: Vec::new(),
+        }
+    }
+
     #[test]
     fn launch_window_selection_follows_a_forked_app_but_fails_closed_on_ambiguity() {
         let previous = std::collections::HashSet::from([10]);
@@ -1646,9 +1749,10 @@ mod launch_app_tests {
         let unrelated = window(21, 400, "org.gnome.Terminal", "Terminal");
         let selected = select_launched_windows(
             &[calc.clone(), unrelated.clone()],
+            &std::collections::HashMap::new(),
             &previous,
             200,
-            "LibreOffice Calc",
+            &identity("LibreOffice Calc"),
         )
         .expect("one matching forked window should resolve");
         assert_eq!(selected.0, 300);
@@ -1658,9 +1762,10 @@ mod launch_app_tests {
         let second_calc = window(22, 500, "libreoffice-calc", "Untitled 2 - LibreOffice Calc");
         assert!(select_launched_windows(
             &[calc, unrelated, second_calc],
+            &std::collections::HashMap::new(),
             &previous,
             200,
-            "LibreOffice Calc",
+            &identity("LibreOffice Calc"),
         )
         .is_none());
     }
@@ -1673,9 +1778,10 @@ mod launch_app_tests {
 
         let selected = select_launched_windows(
             &[calc.clone(), dialog.clone()],
+            &std::collections::HashMap::new(),
             &previous,
             200,
-            "LibreOffice Calc",
+            &identity("LibreOffice Calc"),
         )
         .expect("one existing matching process should satisfy an idempotent launch");
         assert_eq!(selected.0, 300);
@@ -1693,9 +1799,52 @@ mod launch_app_tests {
             std::collections::HashSet::from([calc.xid, dialog.xid, second_calc.xid]);
         assert!(select_launched_windows(
             &[calc, dialog, second_calc],
+            &std::collections::HashMap::new(),
             &ambiguous_previous,
             200,
-            "LibreOffice Calc",
+            &identity("LibreOffice Calc"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn launch_window_selection_uses_one_exact_process_signature_but_not_two() {
+        let first = window(10, 300, "Soffice", "plan011-idempotent.csv - LibreOffice");
+        let previous = std::collections::HashSet::from([first.xid]);
+        let calc_identity = LaunchIdentity {
+            aliases: vec!["LibreOffice Calc".to_owned(), "libreoffice-calc".to_owned()],
+            qualifier_args: vec!["--calc".to_owned()],
+        };
+        let arguments = std::collections::HashMap::from([(
+            300,
+            vec![
+                "/usr/lib/libreoffice/program/soffice.bin".to_owned(),
+                "--calc".to_owned(),
+            ],
+        )]);
+
+        let selected = select_launched_windows(
+            std::slice::from_ref(&first),
+            &arguments,
+            &previous,
+            200,
+            &calc_identity,
+        )
+        .expect("one process with the exact module signature should resolve");
+        assert_eq!(selected.0, 300);
+
+        let second = window(11, 500, "Soffice", "Other document - LibreOffice");
+        let ambiguous_arguments = std::collections::HashMap::from([
+            (300, vec!["soffice.bin".to_owned(), "--calc".to_owned()]),
+            (500, vec!["soffice.bin".to_owned(), "--calc".to_owned()]),
+        ]);
+        let ambiguous_previous = std::collections::HashSet::from([first.xid, second.xid]);
+        assert!(select_launched_windows(
+            &[first, second],
+            &ambiguous_arguments,
+            &ambiguous_previous,
+            200,
+            &calc_identity,
         )
         .is_none());
     }
@@ -1871,7 +2020,7 @@ impl Tool for LaunchAppTool {
                 .collect();
 
         let result = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<(String, Option<u32>, String)> {
+            move || -> anyhow::Result<(String, Option<u32>, String, LaunchIdentity)> {
                 // Open URLs via xdg-open.
                 if !urls.is_empty() {
                     let mut children = Vec::new();
@@ -1890,6 +2039,7 @@ impl Tool for LaunchAppTool {
                         format!("Opened {} URL(s) via xdg-open.", urls.len()),
                         None,
                         "xdg-open".to_owned(),
+                        LaunchIdentity::from_command("xdg-open"),
                     ));
                 }
                 // launch_path > name. Both go through the same direct-exec path
@@ -1903,6 +2053,7 @@ impl Tool for LaunchAppTool {
                                 format!("✅ Launched {cmd} (pid {pid}) in background."),
                                 Some(pid),
                                 cmd.to_owned(),
+                                LaunchIdentity::from_command(cmd),
                             ));
                         }
                         Err(_) => {
@@ -1929,6 +2080,7 @@ impl Tool for LaunchAppTool {
                                     ),
                                     Some(pid),
                                     app.name.clone(),
+                                    LaunchIdentity::from_installed(app),
                                 ));
                             }
                             // xdg-open handles URLs and file paths, not app
@@ -1953,6 +2105,7 @@ impl Tool for LaunchAppTool {
                                 format!("Opened '{cmd}' via xdg-open."),
                                 None,
                                 cmd.to_owned(),
+                                LaunchIdentity::from_command(cmd),
                             ));
                         }
                     }
@@ -1963,16 +2116,15 @@ impl Tool for LaunchAppTool {
         .await;
 
         match result {
-            Ok(Ok((message, pid_opt, name))) => {
+            Ok(Ok((message, pid_opt, name, identity))) => {
                 if let Some(pid) = pid_opt {
                     // LibreOffice and Chromium launchers can fork before their
                     // first window exists. Following only the launcher PID made
                     // a successful cold launch look stopped to HAI. Accept one
                     // newly appeared, name-matching PID group; ambiguity stays
                     // unresolved so exact-window selection never guesses.
-                    let launched_name = name.clone();
                     let (pid, windows) = tokio::task::spawn_blocking(move || {
-                        await_launched_windows(pid, &launched_name, &previous_window_ids)
+                        await_launched_windows(pid, &identity, &previous_window_ids)
                     })
                     .await
                     .unwrap_or((pid, Vec::new()));
