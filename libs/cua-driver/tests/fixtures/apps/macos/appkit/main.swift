@@ -54,6 +54,7 @@ let kMenuItemTitle = "Harness Test Item"
 let kSecondaryWindowTitle = "CuaTestHarness AppKit Secondary"
 let kSheetWindowTitle = "CuaTestHarness AppKit Sheet"
 let kFloatingWindowTitle = "CuaTestHarness AppKit Floating"
+let kIdentityWindowTitle = "CuaTestHarness AppKit Identity"
 
 // MARK: - Controller
 
@@ -502,6 +503,91 @@ final class ClickTargetButton: NSButton {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
+// Opt-in stale-object fixture. The journal is an external oracle: a green test
+// must prove which fresh handler ran, not merely trust the driver's response.
+final class IdentityReplacementWindowController: NSObject {
+    let window: NSWindow
+    private let content = NSStackView()
+    private let mode: String
+    private let journalPath: String
+    private var row: NSStackView?
+
+    init(mode: String, journalPath: String) {
+        self.mode = mode
+        self.journalPath = journalPath
+        window = NSWindow(
+            contentRect: NSRect(x: 160, y: 160, width: 420, height: 220),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = kIdentityWindowTitle
+        window.isReleasedWhenClosed = false
+        window.isRestorable = false
+        super.init()
+
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 16
+        content.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        window.contentView = content
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
+            content.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
+            content.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
+        ])
+
+        installRow(name: "Alice")
+        let mutate = NSButton(title: "Replace row", target: self, action: #selector(onReplace))
+        mutate.setAccessibilityIdentifier("identity-replace")
+        content.addArrangedSubview(mutate)
+    }
+
+    func show() { window.makeKeyAndOrderFront(nil) }
+
+    private func installRow(name: String) {
+        let replacement = NSStackView()
+        replacement.orientation = .horizontal
+        replacement.spacing = 12
+        replacement.setAccessibilityIdentifier("identity-row-\(name.lowercased())")
+        replacement.addArrangedSubview(NSTextField(labelWithString: name))
+        let button = NSButton(title: "Delete", target: self, action: #selector(onDelete(_:)))
+        button.setAccessibilityIdentifier("identity-delete")
+        button.tag = name == "Alice" ? 1 : 2
+        replacement.addArrangedSubview(button)
+        if let old = row {
+            let index = content.arrangedSubviews.firstIndex(of: old) ?? 0
+            content.removeArrangedSubview(old)
+            old.removeFromSuperview()
+            content.insertArrangedSubview(replacement, at: index)
+        } else {
+            content.addArrangedSubview(replacement)
+        }
+        row = replacement
+    }
+
+    @objc private func onReplace() {
+        appendJournal("replace")
+        installRow(name: mode == "changed_parent" ? "Bob" : "Alice")
+    }
+
+    @objc private func onDelete(_ sender: NSButton) {
+        appendJournal(sender.tag == 1 ? "delete_alice" : "delete_bob")
+    }
+
+    private func appendJournal(_ line: String) {
+        let url = URL(fileURLWithPath: journalPath)
+        let data = Data((line + "\n").utf8)
+        if FileManager.default.fileExists(atPath: journalPath),
+           let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
+    }
+}
+
 // Opt-in windows for the persistent exact-window activation certification.
 // Ordinary harness launches remain byte-for-byte and behaviorally unchanged.
 final class BringToFrontMatrixWindows {
@@ -612,6 +698,16 @@ struct CuaAppKitHarness {
         let controller = HarnessWindowController()
         installMenuBar(target: controller)
         controller.show()
+        var identityController: IdentityReplacementWindowController?
+        if let mode = ProcessInfo.processInfo.environment["CUA_APPKIT_IDENTITY_MODE"],
+           let journal = ProcessInfo.processInfo.environment["CUA_APPKIT_IDENTITY_JOURNAL"] {
+            identityController = IdentityReplacementWindowController(mode: mode, journalPath: journal)
+            identityController?.show()
+            if let report = ProcessInfo.processInfo.environment["CUA_APPKIT_IDENTITY_WINDOW_REPORT"],
+               let number = identityController?.window.windowNumber {
+                try? "\(number)\n".write(toFile: report, atomically: true, encoding: .utf8)
+            }
+        }
         var matrixWindows: BringToFrontMatrixWindows?
         if let mode = ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] {
             matrixWindows = BringToFrontMatrixWindows(parent: controller.window, mode: mode)
@@ -620,5 +716,6 @@ struct CuaAppKitHarness {
         writeBringToFrontWindowReport(main: controller.window, matrix: matrixWindows)
         app.run()
         _ = matrixWindows
+        _ = identityController
     }
 }

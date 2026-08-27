@@ -21,6 +21,7 @@ pub mod cache;
 pub mod enablement;
 pub mod exact_target;
 pub mod minimized_recovery;
+pub(crate) mod refetch;
 pub mod tree;
 pub mod tree_provider;
 pub mod window_scope;

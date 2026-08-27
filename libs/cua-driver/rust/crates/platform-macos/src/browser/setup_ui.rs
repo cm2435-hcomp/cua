@@ -1727,6 +1727,7 @@ mod tests {
         TreeWalkResult {
             tree_markdown: String::new(),
             nodes,
+            element_locators: Vec::new(),
             truncated: false,
             window_scope: Some(crate::ax::WindowScope::Matched),
         }
@@ -1855,6 +1856,7 @@ mod tests {
         let truncated = TreeWalkResult {
             tree_markdown: String::new(),
             nodes: Vec::new(),
+            element_locators: Vec::new(),
             truncated: true,
             window_scope: Some(crate::ax::WindowScope::Matched),
         };

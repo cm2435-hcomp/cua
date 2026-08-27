@@ -47,14 +47,35 @@ pub const DEFAULT_MAX_DEPTH: usize = 25;
 /// may still request an explicit diagnostic bound through `max_elements`.
 pub const DEFAULT_MAX_ELEMENTS: usize = usize::MAX;
 
+/// Immutable AX presentation identity used only to reacquire a replaced
+/// native object. Mutable values and geometry are deliberately excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementIdentity {
+    pub role: String,
+    pub subrole: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub identifier: Option<String>,
+}
+
+/// Exact target identity plus every AX ancestor that led to it. AppKit often
+/// replaces a control object while preserving its logical container; keeping
+/// collapsed AXGroups here prevents an identical control in another row from
+/// becoming an unsafe match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementLocator {
+    pub ancestors: Vec<ElementIdentity>,
+    pub target: ElementIdentity,
+}
+
 /// Bound each native AX request. Tokio cannot cancel a blocked
 /// `AXUIElementCopyAttributeValue` after `spawn_blocking` starts, so the native
 /// messaging timeout is what keeps an unresponsive app from retaining a worker
 /// indefinitely.
 const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 2.0;
 
-unsafe fn set_messaging_timeout(element: AXUIElementRef) {
-    let _ = AXUIElementSetMessagingTimeout(element, AX_MESSAGING_TIMEOUT_SECONDS);
+unsafe fn set_messaging_timeout(element: AXUIElementRef, timeout_seconds: f32) {
+    let _ = AXUIElementSetMessagingTimeout(element, timeout_seconds);
 }
 
 /// A single node in the AX tree.
@@ -308,6 +329,8 @@ fn is_addressable(actions_present: bool, value_settable: bool, enabled: Option<b
 pub struct TreeWalkResult {
     pub tree_markdown: String,
     pub nodes: Vec<AXNode>,
+    /// Indexed exactly like actionable `element_index` values.
+    pub element_locators: Vec<ElementLocator>,
     /// True when the walk was cut short by the MAX_ELEMENTS cap.
     pub truncated: bool,
     /// Whether the requested `window_id` actually resolved to an AX surface,
@@ -360,7 +383,49 @@ pub fn walk_tree_bounded(
     max_elements: usize,
     max_depth: usize,
 ) -> TreeWalkResult {
+    walk_tree_with_policy(
+        pid,
+        window_id,
+        query,
+        max_elements,
+        max_depth,
+        AX_MESSAGING_TIMEOUT_SECONDS,
+        None,
+    )
+}
+
+/// A stale-token recovery is an action preflight, not an observation. It gets
+/// a much tighter native-call and whole-walk budget so an unresponsive AX
+/// provider cannot turn one refused click into the historical 25-second stall.
+pub(crate) fn walk_tree_for_refetch(
+    pid: i32,
+    window_id: u32,
+    max_elements: usize,
+    max_depth: usize,
+) -> TreeWalkResult {
+    walk_tree_with_policy(
+        pid,
+        Some(window_id),
+        None,
+        max_elements,
+        max_depth,
+        0.05,
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(500)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_tree_with_policy(
+    pid: i32,
+    window_id: Option<u32>,
+    query: Option<&str>,
+    max_elements: usize,
+    max_depth: usize,
+    messaging_timeout_seconds: f32,
+    deadline: Option<std::time::Instant>,
+) -> TreeWalkResult {
     let mut nodes: Vec<AXNode> = Vec::new();
+    let mut element_locators = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
     // Shared visited-node counter passed into walk_element to enforce the cap.
@@ -376,13 +441,14 @@ pub fn walk_tree_bounded(
             return TreeWalkResult {
                 tree_markdown: String::new(),
                 nodes,
+                element_locators,
                 truncated: false,
                 // No application AX element at all, so a requested window
                 // certainly did not resolve.
                 window_scope: window_id.map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
             };
         }
-        set_messaging_timeout(app_elem);
+        set_messaging_timeout(app_elem, messaging_timeout_seconds);
 
         // Chromium/Electron apps (Arc, VS Code, Electron shells) ship their
         // web-content AX tree OFF and only build it once an assistive client
@@ -427,7 +493,7 @@ pub fn walk_tree_bounded(
             let candidates: Vec<TopLevelCandidate> = top_level
                 .iter()
                 .map(|&child| {
-                    set_messaging_timeout(child);
+                    set_messaging_timeout(child, messaging_timeout_seconds);
                     const ATTRIBUTES: [&str; 3] = ["AXRole", "AXSubrole", "AXIdentifier"];
                     let (role, subrole, identifier) =
                         if let Some(values) = copy_multiple_attr_values(child, &ATTRIBUTES) {
@@ -493,12 +559,16 @@ pub fn walk_tree_bounded(
                 None,
                 false,
                 &mut nodes,
+                &mut element_locators,
                 &mut lines,
                 &mut index_counter,
                 &mut visited_count,
                 &mut truncated,
                 max_elements,
                 max_depth,
+                &[],
+                messaging_timeout_seconds,
+                deadline,
             );
         }
 
@@ -510,6 +580,9 @@ pub fn walk_tree_bounded(
         CFRelease(app_elem as CFTypeRef);
     }
 
+    if deadline.is_some_and(|deadline| std::time::Instant::now() > deadline) {
+        truncated = true;
+    }
     let truncated_flag = truncated;
     nodes = flatten_repetitive_static_text(nodes);
     let raw_markdown = render_nodes(&nodes);
@@ -531,6 +604,7 @@ pub fn walk_tree_bounded(
     TreeWalkResult {
         tree_markdown,
         nodes,
+        element_locators,
         truncated: truncated_flag,
         window_scope,
     }
@@ -543,14 +617,26 @@ unsafe fn walk_element(
     parent_index: Option<usize>,
     in_web_content: bool,
     nodes: &mut Vec<AXNode>,
+    element_locators: &mut Vec<ElementLocator>,
     lines: &mut Vec<(usize, String)>,
     counter: &mut usize,
     visited_count: &mut usize,
     truncated: &mut bool,
     max_elements: usize,
     max_depth: usize,
+    ancestors: &[ElementIdentity],
+    messaging_timeout_seconds: f32,
+    deadline: Option<std::time::Instant>,
 ) {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() > deadline) {
+        *truncated = true;
+        return;
+    }
     if depth > max_depth {
+        // A bounded refetch must distinguish "not present" from "not fully
+        // searched". The normal observation also benefits from reporting its
+        // existing depth cap instead of silently presenting a complete tree.
+        *truncated = true;
         return;
     }
     // Enforce total-node cap — mirrors Swift's maxElements guard.
@@ -563,9 +649,27 @@ unsafe fn walk_element(
 
     // Messaging timeouts are per AX object, not inherited from the application
     // element, so every descendant must be bounded before any attribute read.
-    set_messaging_timeout(element);
+    set_messaging_timeout(element, messaging_timeout_seconds);
 
     let presentation = read_presentation_state(element);
+    let identity = ElementIdentity {
+        role: presentation.role.clone(),
+        subrole: presentation
+            .subrole
+            .clone()
+            .filter(|value| !value.is_empty()),
+        title: presentation.title.clone().filter(|value| !value.is_empty()),
+        description: presentation
+            .description
+            .clone()
+            .filter(|value| !value.is_empty()),
+        identifier: presentation
+            .identifier
+            .clone()
+            .filter(|value| !value.is_empty()),
+    };
+    let mut child_ancestors = ancestors.to_vec();
+    child_ancestors.push(identity.clone());
     let role = presentation.role;
     let (children, available_child_subset) = children_for_walk(element, &role);
 
@@ -583,12 +687,16 @@ unsafe fn walk_element(
                 parent_index,
                 in_web_content,
                 nodes,
+                element_locators,
                 lines,
                 counter,
                 visited_count,
                 truncated,
                 max_elements,
                 max_depth,
+                &child_ancestors,
+                messaging_timeout_seconds,
+                deadline,
             );
             CFRelease(child as CFTypeRef);
         }
@@ -659,12 +767,16 @@ unsafe fn walk_element(
                 parent_index,
                 in_web_content,
                 nodes,
+                element_locators,
                 lines,
                 counter,
                 visited_count,
                 truncated,
                 max_elements,
                 max_depth,
+                &child_ancestors,
+                messaging_timeout_seconds,
+                deadline,
             );
             CFRelease(child as CFTypeRef);
         }
@@ -687,6 +799,10 @@ unsafe fn walk_element(
     let node = if is_actionable {
         let idx = *counter;
         *counter += 1;
+        element_locators.push(ElementLocator {
+            ancestors: ancestors.to_vec(),
+            target: identity,
+        });
         // Retain so the element stays alive in the cache after `copy_children`
         // releases the per-child ref at the end of the caller's loop.
         CFRetain(element as CFTypeRef);
@@ -783,12 +899,16 @@ unsafe fn walk_element(
             next_parent,
             in_web_content,
             nodes,
+            element_locators,
             lines,
             counter,
             visited_count,
             truncated,
             max_elements,
             max_depth,
+            &child_ancestors,
+            messaging_timeout_seconds,
+            deadline,
         );
         CFRelease(child as CFTypeRef);
     }
@@ -998,7 +1118,7 @@ pub(crate) unsafe fn refresh_cached_node(node: &mut AXNode, element: AXUIElement
     if render_identity(element) != node.render_id {
         return false;
     }
-    set_messaging_timeout(element);
+    set_messaging_timeout(element, AX_MESSAGING_TIMEOUT_SECONDS);
     let presentation = read_presentation_state(element);
     if presentation.role != node.role {
         return false;

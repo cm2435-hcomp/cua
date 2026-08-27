@@ -332,13 +332,9 @@ impl Tool for PressKeyTool {
         // the element before the suppressed focus below dereferences it
         // (use-after-free → daemon crash). Guard lives to method end.
         let pre_focus_guard = if let (Some(idx), Some(wid)) = (element_index, window_id) {
-            match self.state.element_cache.get_element_retained(pid, wid, idx) {
-                Some(guard) => Some(guard),
-                None => {
-                    return ToolResult::error(format!(
-                        "Element index {idx} not found. Call get_window_state first."
-                    ));
-                }
+            match self.state.element_for_action(pid, wid, idx).await {
+                Ok(element) => Some(element),
+                Err(error) => return error,
             }
         } else {
             None

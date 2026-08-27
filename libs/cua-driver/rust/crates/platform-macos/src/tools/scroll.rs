@@ -216,7 +216,10 @@ impl Tool for ScrollTool {
         // the element before the suppressed focus below dereferences it
         // (use-after-free → daemon crash). Guard lives to method end.
         let pre_focus_guard = if let (Some(idx), Some(wid)) = (element_index, window_id) {
-            self.state.element_cache.get_element_retained(pid, wid, idx)
+            match self.state.element_for_action(pid, wid, idx).await {
+                Ok(element) => Some(element),
+                Err(error) => return error,
+            }
         } else {
             None
         };
@@ -239,7 +242,7 @@ impl Tool for ScrollTool {
         // AXScrollArea parent. Pressing those controls is a true
         // background-safe scroll: no activation, z-order change, or cursor move.
         if matches!(direction.as_str(), "up" | "down") {
-            if let (Some(index), Some(wid)) = (element_index, window_id) {
+            if let (Some(_), Some(wid)) = (element_index, window_id) {
                 if !delivery_mode.is_foreground() {
                     if let Some(lease) = _mutation_lease.as_ref() {
                         if let Err(refusal_result) = lease
@@ -266,16 +269,13 @@ impl Tool for ScrollTool {
                         }
                     }
                 }
-                let native_element_guard = self
-                    .state
-                    .element_cache
-                    .get_element_retained(pid, wid, index);
+                let native_element_ptr = pre_focus_ptr;
                 let direction_for_ax = direction.clone();
                 let by_for_ax = by.clone();
                 let foreground = delivery_mode.is_foreground();
                 let ax_result =
                     tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, bool)> {
-                        let Some(element_guard) = native_element_guard else {
+                        let Some(element_ptr) = native_element_ptr else {
                             return Ok((false, false));
                         };
                         if foreground {
@@ -286,7 +286,7 @@ impl Tool for ScrollTool {
                                 || {
                                     delivered = unsafe {
                                         scroll_native_text_area(
-                                            element_guard.as_ptr() as AXUIElementRef,
+                                            element_ptr as AXUIElementRef,
                                             &direction_for_ax,
                                             &by_for_ax,
                                             amount,
@@ -301,7 +301,7 @@ impl Tool for ScrollTool {
                             Ok((
                                 unsafe {
                                     scroll_native_text_area(
-                                        element_guard.as_ptr() as AXUIElementRef,
+                                        element_ptr as AXUIElementRef,
                                         &direction_for_ax,
                                         &by_for_ax,
                                         amount,

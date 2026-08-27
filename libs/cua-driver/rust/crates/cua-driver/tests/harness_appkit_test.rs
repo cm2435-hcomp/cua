@@ -58,6 +58,7 @@ fn harness_exe() -> PathBuf {
 struct Harness {
     _app: Child,
     pid: u32,
+    identity_window_id: Option<u64>,
 }
 
 impl Harness {
@@ -66,6 +67,17 @@ impl Harness {
     }
 
     fn launch_with_command_oracle(command_oracle: Option<&Path>) -> Self {
+        Self::launch_with_environment(command_oracle, None)
+    }
+
+    fn launch_with_identity_fixture(mode: &str, journal: &Path) -> Self {
+        Self::launch_with_environment(None, Some((mode, journal)))
+    }
+
+    fn launch_with_environment(
+        command_oracle: Option<&Path>,
+        identity_fixture: Option<(&str, &Path)>,
+    ) -> Self {
         let exe = harness_exe();
         assert!(
             exe.exists(),
@@ -79,13 +91,33 @@ impl Harness {
         if let Some(path) = command_oracle {
             command.env("CUA_APPKIT_COMMAND_ORACLE", path);
         }
+        let identity_window_report =
+            identity_fixture.map(|(_, journal)| journal.with_extension("window"));
+        if let Some((mode, journal)) = identity_fixture {
+            command
+                .env("CUA_APPKIT_IDENTITY_MODE", mode)
+                .env("CUA_APPKIT_IDENTITY_JOURNAL", journal)
+                .env(
+                    "CUA_APPKIT_IDENTITY_WINDOW_REPORT",
+                    identity_window_report.as_ref().expect("identity report"),
+                );
+        }
         let app = command
             .spawn()
             .unwrap_or_else(|error| panic!("launch AppKit harness {exe:?}: {error}"));
         let pid = app.id();
         // Settle for window creation + activation.
         std::thread::sleep(Duration::from_millis(800));
-        Self { _app: app, pid }
+        let identity_window_id = identity_window_report.and_then(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+        });
+        Self {
+            _app: app,
+            pid,
+            identity_window_id,
+        }
     }
 }
 
@@ -111,8 +143,12 @@ fn snapshot_elements(driver: &mut McpDriver, pid: u32, window_id: u64) -> ToolRe
 }
 
 fn element_token_by_id(snapshot: &ToolResponse, identifier: &str) -> String {
-    let index = element_index_by_id(snapshot.tree_text(), identifier)
-        .unwrap_or_else(|| panic!("{identifier} element_index not found"));
+    let index = element_index_by_id(snapshot.tree_text(), identifier).unwrap_or_else(|| {
+        panic!(
+            "{identifier} element_index not found in:\n{}",
+            snapshot.tree_text()
+        )
+    });
     snapshot.structured()["elements"]
         .as_array()
         .and_then(|elements| {
@@ -358,6 +394,69 @@ fn harness_appkit_stale_element_token_fails_closed() {
             Observation::delivered(vec![OracleKind::AxState], Evidence::default())
         },
     );
+}
+
+fn run_identity_replacement_case(mode: &str) -> (ToolResponse, String) {
+    let journal_dir = tempfile::tempdir().expect("create identity journal directory");
+    let journal = journal_dir.path().join("events.txt");
+    let harness = Harness::launch_with_identity_fixture(mode, &journal);
+    let mut driver =
+        McpDriver::spawn_macos_daemon_proxy_named(&format!("appkit_identity_replacement_{mode}"))
+            .expect("start installed macOS daemon proxy");
+    let wid = harness
+        .identity_window_id
+        .expect("identity fixture window report not found");
+    let observation = snapshot_elements(&mut driver, harness.pid, wid);
+    let old_delete = element_token_by_id(&observation, "identity-delete");
+    let replace = element_token_by_id(&observation, "identity-replace");
+
+    let replaced = driver.call(
+        "click",
+        serde_json::json!({
+            "pid": harness.pid as i64,
+            "window_id": wid,
+            "element_token": replace,
+        }),
+    );
+    assert!(
+        !replaced.is_error(),
+        "fixture replacement failed: {}",
+        replaced.text()
+    );
+    std::thread::sleep(Duration::from_millis(150));
+
+    let action = driver.call(
+        "click",
+        serde_json::json!({
+            "pid": harness.pid as i64,
+            "window_id": wid,
+            "element_token": old_delete,
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    let evidence = std::fs::read_to_string(journal).unwrap_or_default();
+    (action, evidence)
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_refetches_replaced_element_only_under_same_ancestor_path() {
+    let (same_parent, same_parent_evidence) = run_identity_replacement_case("same_parent");
+    assert!(
+        !same_parent.is_error(),
+        "same-parent replacement was not reacquired: {}",
+        same_parent.text()
+    );
+    assert_eq!(same_parent_evidence, "replace\ndelete_alice\n");
+
+    let (changed_parent, changed_parent_evidence) = run_identity_replacement_case("changed_parent");
+    assert!(
+        changed_parent.is_error(),
+        "changed-parent logical alias was dispatched: {}",
+        changed_parent.text()
+    );
+    assert_eq!(changed_parent.structured()["code"], "element_stale");
+    assert_eq!(changed_parent_evidence, "replace\n");
 }
 
 #[test]
