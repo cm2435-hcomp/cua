@@ -982,13 +982,21 @@ pub fn with_x11_foreground<T>(
     }
     let saved_focus = save_focus_state(display);
     let prior = saved_focus.ewmh_active;
-    ewmh_activate_window(display, xid as x11::xlib::Window, prior.unwrap_or(0));
+    let target = xid as x11::xlib::Window;
+    if prior == Some(target) && x11_focus_belongs_to_window(display, target) {
+        // Escape, Enter, and close shortcuts can destroy an already-focused
+        // dialog. Restoring that same XID would turn a delivered action into
+        // a false possible-effect failure, as reproduced with Zenity/LibreOffice.
+        unsafe { x11::xlib::XCloseDisplay(display) };
+        return body();
+    }
+    ewmh_activate_window(display, target, prior.unwrap_or(0));
     // Some WMs (observed on Openbox) update _NET_ACTIVE_WINDOW without raising
     // the target. Foreground pointer delivery would then hit the covering
     // window, so make the already-authorized foreground transition explicit.
     unsafe {
         let prev_handler = x11::xlib::XSetErrorHandler(Some(ignore_x_error));
-        x11::xlib::XRaiseWindow(display, xid as x11::xlib::Window);
+        x11::xlib::XRaiseWindow(display, target);
         x11::xlib::XSync(display, 0);
         x11::xlib::XSetErrorHandler(prev_handler);
     }
@@ -1008,12 +1016,12 @@ pub fn with_x11_foreground<T>(
     // focuses Chromium's renderer child, and forcing the top-level XID here
     // discards the page's focused DOM control even though the app is active.
     // KWin's raise-only case still needs the explicit top-level fallback.
-    if !x11_focus_belongs_to_window(display, xid as x11::xlib::Window) {
+    if !x11_focus_belongs_to_window(display, target) {
         unsafe {
             let prev_handler = x11::xlib::XSetErrorHandler(Some(ignore_x_error));
             x11::xlib::XSetInputFocus(
                 display,
-                xid as x11::xlib::Window,
+                target,
                 x11::xlib::RevertToParent,
                 x11::xlib::CurrentTime,
             );
@@ -2976,9 +2984,124 @@ mod path_tests {
         create_uinput_pointer, guarded_uinput_creation, is_uinput_unavailable, key_name_to_keysym,
         master_pointer_name, modifiers_to_state, normalize_uinput_device_name, path_cumulative,
         point_on_path, real_pointer_capabilities_available, sample_function, slave_pointer_name,
-        EVDEV_UINPUT_NAME_MAX_BYTES, UINPUT_POINTER_SUFFIX,
+        with_x11_foreground, EVDEV_UINPUT_NAME_MAX_BYTES, UINPUT_POINTER_SUFFIX,
     };
     use x11rb::protocol::xproto::KeyButMask;
+
+    fn test_display() -> *mut x11::xlib::Display {
+        let display = unsafe { x11::xlib::XOpenDisplay(std::ptr::null()) };
+        assert!(!display.is_null(), "live focus test requires DISPLAY");
+        display
+    }
+
+    fn test_window(display: *mut x11::xlib::Display) -> x11::xlib::Window {
+        unsafe {
+            let root = x11::xlib::XDefaultRootWindow(display);
+            let window = x11::xlib::XCreateSimpleWindow(display, root, 10, 10, 240, 120, 0, 0, 0);
+            x11::xlib::XMapWindow(display, window);
+            x11::xlib::XSync(display, 0);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                let mut attributes: x11::xlib::XWindowAttributes = std::mem::zeroed();
+                if x11::xlib::XGetWindowAttributes(display, window, &mut attributes) != 0
+                    && attributes.map_state == x11::xlib::IsViewable
+                {
+                    return window;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("window 0x{window:x} did not become viewable");
+        }
+    }
+
+    fn focus_test_window(display: *mut x11::xlib::Display, window: x11::xlib::Window) {
+        super::ewmh_activate_window(
+            display,
+            window,
+            super::ewmh_active_window(display).unwrap_or(0),
+        );
+        unsafe {
+            x11::xlib::XSetInputFocus(
+                display,
+                window,
+                x11::xlib::RevertToParent,
+                x11::xlib::CurrentTime,
+            );
+            x11::xlib::XSync(display, 0);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if super::ewmh_active_window(display) == Some(window)
+                && super::x11_focus_belongs_to_window(display, window)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("window 0x{window:x} did not become exactly focused");
+    }
+
+    fn window_exists(display: *mut x11::xlib::Display, window: x11::xlib::Window) -> bool {
+        unsafe {
+            let previous_handler = x11::xlib::XSetErrorHandler(Some(super::ignore_x_error));
+            let mut attributes: x11::xlib::XWindowAttributes = std::mem::zeroed();
+            let exists = x11::xlib::XGetWindowAttributes(display, window, &mut attributes) != 0;
+            x11::xlib::XSync(display, 0);
+            x11::xlib::XSetErrorHandler(previous_handler);
+            exists
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an X11 window manager"]
+    fn exact_focused_foreground_action_may_close_its_target() {
+        let display = test_display();
+        let target = test_window(display);
+        focus_test_window(display, target);
+        let mut dispatches = 0;
+
+        let result = with_x11_foreground(target, 0, || {
+            dispatches += 1;
+            unsafe {
+                x11::xlib::XDestroyWindow(display, target);
+                x11::xlib::XSync(display, 0);
+            }
+            Ok(())
+        });
+
+        assert!(
+            result.is_ok(),
+            "delivered action became an error: {result:?}"
+        );
+        assert_eq!(dispatches, 1, "foreground action must not be replayed");
+        assert!(!window_exists(display, target), "target did not close");
+        unsafe { x11::xlib::XCloseDisplay(display) };
+    }
+
+    #[test]
+    #[ignore = "requires an X11 window manager"]
+    fn foreign_focus_is_still_restored_after_foreground_action() {
+        let display = test_display();
+        let target = test_window(display);
+        let spectator = test_window(display);
+        focus_test_window(display, spectator);
+        let mut dispatches = 0;
+
+        let result = with_x11_foreground(target, 0, || {
+            dispatches += 1;
+            Ok(())
+        });
+
+        assert!(result.is_ok(), "foreground action failed: {result:?}");
+        assert_eq!(dispatches, 1, "foreground action must not be replayed");
+        assert_eq!(super::ewmh_active_window(display), Some(spectator));
+        assert!(super::x11_focus_belongs_to_window(display, spectator));
+        unsafe {
+            x11::xlib::XDestroyWindow(display, target);
+            x11::xlib::XDestroyWindow(display, spectator);
+            x11::xlib::XCloseDisplay(display);
+        }
+    }
 
     #[test]
     fn click_modifier_state_combines_canonical_names_and_aliases() {
