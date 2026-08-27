@@ -42,6 +42,7 @@ mod type_text_chars;
 mod zoom;
 
 use cua_driver_core::{
+    protocol::ToolResult,
     tool::{Tool, ToolRegistry},
     window_target::{PidOnlyWindowTargetGuard, WindowTargetCandidate, WindowTargetCandidates},
 };
@@ -806,6 +807,70 @@ impl ToolState {
             host_bundle_id,
         }
     }
+
+    /// Resolve one observation-scoped element immediately before dispatch.
+    /// AppKit can replace a native object after an earlier action rebuilds a
+    /// view; in that case only one exact-window, exact-ancestry match is safe.
+    pub(crate) async fn element_for_action(
+        &self,
+        pid: i32,
+        window_id: u32,
+        element_index: usize,
+    ) -> Result<crate::ax::cache::RetainedElement, ToolResult> {
+        let Some((cached, locator, intervening_action)) =
+            self.element_cache
+                .get_element_candidate(pid, window_id, element_index)
+        else {
+            return Err(element_stale_result(
+                element_index,
+                "cache_miss",
+                "element is not present in the claimed observation cache",
+            ));
+        };
+
+        let cached_ptr = cached.as_ptr();
+        let cached_is_exact = tokio::task::spawn_blocking(move || unsafe {
+            crate::ax::exact_target::element_window_id(
+                cached_ptr as crate::ax::bindings::AXUIElementRef,
+            ) == Some(window_id)
+        })
+        .await
+        .unwrap_or(false);
+        if !intervening_action && cached_is_exact {
+            return Ok(cached);
+        }
+        drop(cached);
+
+        match tokio::task::spawn_blocking(move || {
+            crate::ax::refetch::reacquire(pid, window_id, &locator)
+        })
+        .await
+        {
+            Ok(Ok(element)) => Ok(element),
+            Ok(Err(failure)) => Err(element_stale_result(
+                element_index,
+                failure.reason(),
+                "the original native object was replaced and no unique complete exact-window match could be proven",
+            )),
+            Err(_) => Err(element_stale_result(
+                element_index,
+                "refetch_worker_failed",
+                "the bounded native refetch worker did not complete",
+            )),
+        }
+    }
+}
+
+fn element_stale_result(element_index: usize, reason: &str, message: &str) -> ToolResult {
+    ToolResult::error(format!(
+        "Element {element_index} is stale: {message}. Call get_window_state before retrying."
+    ))
+    .with_structured(serde_json::json!({
+        "code": "element_stale",
+        "effect": "refused",
+        "native_side_effect_started": false,
+        "reason": reason,
+    }))
 }
 
 pub(crate) fn cursor_overlay_unavailable() -> cua_driver_core::protocol::ToolResult {

@@ -648,14 +648,9 @@ impl Tool for ClickTool {
             // concurrent get_window_state on the same (pid, window_id) while
             // this click is mid-flight (use-after-free → daemon crash). The
             // guard lives to the end of this method, past the AX action below.
-            let element_guard = match self.state.element_cache.get_element_retained(pid, wid, idx) {
-                Some(e) => e,
-                None => {
-                    return ToolResult::error(format!(
-                        "Element index {idx} not found in cache for pid={pid} window_id={wid}. \
-                     Call get_window_state first."
-                    ))
-                }
+            let element_guard = match self.state.element_for_action(pid, wid, idx).await {
+                Ok(element) => element,
+                Err(error) => return error,
             };
             let element_ptr = element_guard.as_ptr();
 

@@ -474,9 +474,10 @@ impl MacAxTreeProvider {
 
         if !observation_only {
             if scope_matched {
-                self.element_cache.update(pid, window_id, &result.nodes);
+                self.element_cache
+                    .update(pid, window_id, &result.nodes, &result.element_locators);
             } else {
-                self.element_cache.update(pid, window_id, &[]);
+                self.element_cache.update(pid, window_id, &[], &[]);
             }
         }
 
@@ -584,6 +585,7 @@ mod tests {
                 result: TreeWalkResult {
                     tree_markdown: String::new(),
                     nodes: Vec::new(),
+                    element_locators: Vec::new(),
                     truncated: false,
                     window_scope: Some(WindowScope::Matched),
                 },
@@ -605,6 +607,7 @@ mod tests {
         let mut result = TreeWalkResult {
             tree_markdown: String::new(),
             nodes: Vec::new(),
+            element_locators: Vec::new(),
             truncated: false,
             window_scope: Some(WindowScope::Matched),
         };

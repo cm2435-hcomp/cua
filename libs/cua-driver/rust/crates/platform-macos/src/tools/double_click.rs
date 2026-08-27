@@ -113,13 +113,9 @@ impl Tool for DoubleClickTool {
         if let (Some(idx), Some(wid)) = (element_index, window_id) {
             // Retain out of the cache so a concurrent get_window_state can't
             // free the element mid-action (use-after-free → daemon crash).
-            let element_guard = match self.state.element_cache.get_element_retained(pid, wid, idx) {
-                Some(e) => e,
-                None => {
-                    return ToolResult::error(format!(
-                        "Element index {idx} not found. Call get_window_state first."
-                    ))
-                }
+            let element_guard = match self.state.element_for_action(pid, wid, idx).await {
+                Ok(element) => element,
+                Err(error) => return error,
             };
             let element_ptr = element_guard.as_ptr();
 

@@ -17,7 +17,7 @@
 //! when an entry is replaced or removed.
 
 use super::bindings::AXUIElementRef;
-use super::tree::AXNode;
+use super::tree::{AXNode, ElementLocator};
 use core_foundation::base::{CFRelease, CFRetain, CFTypeRef};
 use cua_driver_core::element_cache::ElementCacheCore;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +37,11 @@ impl RetainedElement {
     /// The raw pointer, valid for as long as this guard is held.
     pub fn as_ptr(&self) -> usize {
         self.0
+    }
+
+    /// Take ownership of one existing CFRetain from a fresh AX walk.
+    pub(crate) unsafe fn from_owned(ptr: usize) -> Self {
+        Self(ptr)
     }
 }
 
@@ -62,16 +67,25 @@ pub struct CacheKey {
 
 /// Cached snapshot for one (pid, window_id) pair.
 pub struct CachedSnapshot {
-    /// element_index → raw AXUIElementRef pointer (retained, as usize for Send).
-    pub elements: Vec<usize>,
+    pub elements: Vec<CachedElement>,
+    /// Action epoch at the observation which produced this snapshot. Any
+    /// intervening action may have replaced AppKit objects before AXObserver
+    /// delivery, so later actions must reacquire rather than trust the pointer.
+    pub observed_action_epoch: u64,
+}
+
+pub struct CachedElement {
+    /// Raw AXUIElementRef pointer (retained, as usize for Send).
+    pub ptr: usize,
+    pub locator: ElementLocator,
 }
 
 impl Drop for CachedSnapshot {
     fn drop(&mut self) {
         // Release the extra CFRetain that walk_element added for each cached ptr.
-        for ptr in &self.elements {
-            if *ptr != 0 {
-                unsafe { CFRelease(*ptr as AXUIElementRef as CFTypeRef) };
+        for element in &self.elements {
+            if element.ptr != 0 {
+                unsafe { CFRelease(element.ptr as AXUIElementRef as CFTypeRef) };
             }
         }
     }
@@ -92,14 +106,31 @@ impl ElementCache {
     }
 
     /// Replace the snapshot for (pid, window_id) with the nodes from a fresh walk.
-    pub fn update(&self, pid: i32, window_id: u32, nodes: &[AXNode]) {
-        let elements: Vec<usize> = nodes
+    pub fn update(&self, pid: i32, window_id: u32, nodes: &[AXNode], locators: &[ElementLocator]) {
+        let actionable_count = nodes
             .iter()
-            .filter(|n| n.element_index.is_some())
-            .map(|n| n.element_ptr)
+            .filter(|node| node.element_index.is_some())
+            .count();
+        assert_eq!(
+            actionable_count,
+            locators.len(),
+            "AX walker must produce exactly one locator per actionable element"
+        );
+        let elements: Vec<CachedElement> = nodes
+            .iter()
+            .filter_map(|node| node.element_index.map(|index| (node, index)))
+            .map(|(node, index)| CachedElement {
+                ptr: node.element_ptr,
+                locator: locators[index].clone(),
+            })
             .collect();
-        self.core
-            .insert(CacheKey { pid, window_id }, CachedSnapshot { elements });
+        self.core.insert(
+            CacheKey { pid, window_id },
+            CachedSnapshot {
+                elements,
+                observed_action_epoch: self.action_borrow_epoch(),
+            },
+        );
     }
 
     /// Look up + `CFRetain` the element for `element_index` in (pid, window_id),
@@ -118,7 +149,7 @@ impl ElementCache {
         let retained = self
             .core
             .with_snapshot(&CacheKey { pid, window_id }, |s| {
-                let ptr = s.elements.get(element_index).copied()?;
+                let ptr = s.elements.get(element_index)?.ptr;
                 if ptr != 0 {
                     // Safety: still inside `with_snapshot`'s lock, so the
                     // snapshot (and thus this CFTypeRef) is alive right now.
@@ -136,6 +167,37 @@ impl ElementCache {
             self.action_borrow_epoch.fetch_add(1, Ordering::AcqRel);
         }
         retained
+    }
+
+    /// Return the cached object, its immutable locator, and whether another
+    /// action has occurred since the observation. The latter is the important
+    /// replacement race: our mutation can rebuild AppKit controls before its
+    /// AX notification reaches the observer thread.
+    pub fn get_element_candidate(
+        &self,
+        pid: i32,
+        window_id: u32,
+        element_index: usize,
+    ) -> Option<(RetainedElement, ElementLocator, bool)> {
+        let current_epoch = self.action_borrow_epoch();
+        let candidate = self
+            .core
+            .with_snapshot(&CacheKey { pid, window_id }, |snapshot| {
+                let element = snapshot.elements.get(element_index)?;
+                if element.ptr != 0 {
+                    unsafe { CFRetain(element.ptr as AXUIElementRef as CFTypeRef) };
+                }
+                Some((
+                    RetainedElement(element.ptr),
+                    element.locator.clone(),
+                    snapshot.observed_action_epoch != current_epoch,
+                ))
+            })
+            .flatten();
+        if candidate.is_some() {
+            self.action_borrow_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        candidate
     }
 
     pub fn action_borrow_epoch(&self) -> u64 {
@@ -159,6 +221,7 @@ impl Default for ElementCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ax::tree::ElementIdentity;
     use core_foundation::base::{CFGetRetainCount, CFRetain, TCFType};
     use core_foundation::string::CFString;
 
@@ -193,6 +256,19 @@ mod tests {
         }
     }
 
+    fn locator() -> ElementLocator {
+        ElementLocator {
+            ancestors: Vec::new(),
+            target: ElementIdentity {
+                role: "AXButton".into(),
+                subrole: None,
+                title: Some("fixture".into()),
+                description: None,
+                identifier: None,
+            },
+        }
+    }
+
     /// The crash this guards against: while a click holds an element pointer,
     /// a concurrent `get_window_state` replaces the snapshot and its `Drop`
     /// `CFRelease`s the element to zero — freeing it under the in-flight click
@@ -209,7 +285,7 @@ mod tests {
         // to the cache, and CachedSnapshot::drop releases that retain.
         unsafe { CFRetain(ptr as CFTypeRef) };
         let cache = ElementCache::new();
-        cache.update(1, 2, &[node_with_ptr(ptr)]);
+        cache.update(1, 2, &[node_with_ptr(ptr)], &[locator()]);
         assert_eq!(
             unsafe { CFGetRetainCount(ptr as CFTypeRef) },
             base + 1,
@@ -230,7 +306,7 @@ mod tests {
 
         // Concurrent get_window_state replaces the snapshot → old one dropped →
         // CFRelease of the cache's retain. The guard's retain must remain.
-        cache.update(1, 2, &[]);
+        cache.update(1, 2, &[], &[]);
         assert_eq!(
             unsafe { CFGetRetainCount(ptr as CFTypeRef) },
             base + 1,
@@ -251,7 +327,7 @@ mod tests {
     fn missing_index_returns_none() {
         let cache = ElementCache::new();
         assert!(cache.get_element_retained(1, 2, 0).is_none());
-        cache.update(1, 2, &[]);
+        cache.update(1, 2, &[], &[]);
         assert!(cache.get_element_retained(1, 2, 5).is_none());
     }
 }

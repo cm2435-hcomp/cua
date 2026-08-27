@@ -159,19 +159,14 @@ impl Tool for SelectTextTool {
             }
         };
 
-        let element_guard =
-            match self
-                .state
-                .element_cache
-                .get_element_retained(pid, window_id, element_index)
-            {
-                Some(element) => element,
-                None => {
-                    return ToolResult::error(format!(
-                        "Element index {element_index} not found. Call get_window_state first."
-                    ))
-                }
-            };
+        let element_guard = match self
+            .state
+            .element_for_action(pid, window_id, element_index)
+            .await
+        {
+            Ok(element) => element,
+            Err(error) => return error,
+        };
         let element_ptr = element_guard.as_ptr();
 
         let _mutation_lease =
