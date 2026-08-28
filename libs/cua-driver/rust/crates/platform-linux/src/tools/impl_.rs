@@ -2363,6 +2363,32 @@ async fn await_semantic_click_stage<T>(
 fn terminal_semantic_action_failure(failure: crate::atspi::ActionFailure) -> Option<ToolResult> {
     match failure {
         crate::atspi::ActionFailure::Refused(_) => None,
+        crate::atspi::ActionFailure::ElementStale(detail) => Some(
+            ToolResult::error(format!(
+                "click: requested element is no longer present: {detail}; observe again before retrying"
+            ))
+            .with_structured(json!({
+                "code": "element_stale",
+                "phase": "preflight",
+                "retryable": true,
+                "effect": "refused",
+                "effect_may_have_occurred": false,
+                "native_side_effect_started": false,
+                "failure_site": "linux_atspi_named_action_element_stale",
+            })),
+        ),
+        crate::atspi::ActionFailure::UnsupportedAction(detail) => Some(
+            ToolResult::error(format!("click: requested portable action is unsupported: {detail}"))
+                .with_structured(json!({
+                    "code": "unsupported_action",
+                    "phase": "preflight",
+                    "retryable": false,
+                    "effect": "refused",
+                    "effect_may_have_occurred": false,
+                    "native_side_effect_started": false,
+                    "failure_site": "linux_atspi_named_action_unsupported",
+                })),
+        ),
         crate::atspi::ActionFailure::TimedOutBeforeDispatch(detail) => Some(
             // OSW LibreOffice traces showed pre-dispatch cursor work outliving
             // HAI's authority deadline. Nothing was dispatched, so fail safely
@@ -3620,11 +3646,8 @@ impl Tool for ClickTool {
                 let named_action = requested_action.is_some();
                 let action_budget = remaining_semantic_click_budget(semantic_click_deadline);
                 let ax_result = tokio::task::spawn_blocking(move || match requested_action {
-                    Some(action) => action_budget.and_then(|_| {
-                        crate::atspi::perform_named_action(pid, idx, &action).map_err(|error| {
-                            crate::atspi::ActionFailure::Refused(error.to_string())
-                        })
-                    }),
+                    Some(action) => action_budget
+                        .and_then(|_| crate::atspi::perform_named_action(pid, idx, &action)),
                     None => action_budget.and_then(|timeout| {
                         crate::atspi::perform_action_with_timeout(pid, idx, timeout)
                     }),
@@ -9832,6 +9855,29 @@ mod click_button_schema_tests {
             structured["failure_site"],
             "linux_atspi_action_timeout_before_dispatch"
         );
+    }
+
+    #[test]
+    fn named_action_target_failures_preserve_recovery_scope() {
+        let stale = terminal_semantic_action_failure(crate::atspi::ActionFailure::ElementStale(
+            "fixture missing element".into(),
+        ))
+        .expect("stale target is terminal");
+        let stale = stale.structured_content.expect("structured stale target");
+        assert_eq!(stale["code"], "element_stale");
+        assert_eq!(stale["retryable"], true);
+        assert_eq!(stale["effect_may_have_occurred"], false);
+
+        let unsupported = terminal_semantic_action_failure(
+            crate::atspi::ActionFailure::UnsupportedAction("fixture capability".into()),
+        )
+        .expect("unsupported action is terminal");
+        let unsupported = unsupported
+            .structured_content
+            .expect("structured unsupported action");
+        assert_eq!(unsupported["code"], "unsupported_action");
+        assert_eq!(unsupported["retryable"], false);
+        assert_eq!(unsupported["effect_may_have_occurred"], false);
     }
 
     #[test]

@@ -31,6 +31,10 @@ pub enum ActionFailure {
     #[error("{0}")]
     Refused(String),
     #[error("{0}")]
+    ElementStale(String),
+    #[error("{0}")]
+    UnsupportedAction(String),
+    #[error("{0}")]
     TimedOutBeforeDispatch(String),
     #[error("{0}")]
     AfterDispatch(String),
@@ -2248,48 +2252,78 @@ pub(super) fn perform_action_with_timeout(
     }
 }
 
-pub fn perform_named_action(pid: u32, idx: usize, requested: &str) -> Result<(String, bool)> {
+pub fn perform_named_action(
+    pid: u32,
+    idx: usize,
+    requested: &str,
+) -> std::result::Result<(String, bool), ActionFailure> {
     super::provider::global().invalidate_pid(pid);
     let requested = requested.to_owned();
-    bounded(
-        async {
-            let conn = shared_connection().await?;
+    let dispatched = Arc::new(AtomicBool::new(false));
+    let dispatched_for_call = dispatched.clone();
+    let result = runtime().block_on(async move {
+        tokio::time::timeout(OP_TIMEOUT, async move {
+            let conn = shared_connection()
+                .await
+                .map_err(|error| ActionFailure::Refused(error.to_string()))?;
             let visited = collect_visited(conn, pid)
-                .await?
-                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+                .await
+                .map_err(|error| ActionFailure::Refused(error.to_string()))?
+                .ok_or_else(|| {
+                    ActionFailure::Refused(format!("no AT-SPI application for pid {pid}"))
+                })?;
             let action_nodes: Vec<&Visited> = visited.iter().filter(|v| is_indexable(v)).collect();
+            // OSW traces showed disappearing indices reported as unsupported
+            // actions. Keep stale identity separate so callers observe again,
+            // while a present element with the wrong capability stays terminal.
             let target = action_nodes.get(idx).ok_or_else(|| {
-                anyhow!("element {idx} not found (total: {})", action_nodes.len())
+                ActionFailure::ElementStale(format!(
+                    "element {idx} not found (total: {})",
+                    action_nodes.len()
+                ))
             })?;
             let chosen = portable_action_index(&target.role, &target.actions, &requested)
                 .ok_or_else(|| {
-                    anyhow!("element {idx} does not advertise portable action {requested:?}")
+                    ActionFailure::UnsupportedAction(format!(
+                        "element {idx} does not advertise portable action {requested:?}"
+                    ))
                 })?;
             let action_proxy = target
                 .acc
                 .proxies()
                 .await
-                .map_err(|error| anyhow!("interface proxies unavailable: {error}"))?
+                .map_err(|error| {
+                    ActionFailure::Refused(format!("interface proxies unavailable: {error}"))
+                })?
                 .action()
                 .await
-                .map_err(|error| anyhow!("Action unavailable: {error}"))?;
+                .map_err(|error| ActionFailure::Refused(format!("Action unavailable: {error}")))?;
             let action = target.actions.get(chosen).cloned().unwrap_or_default();
+            dispatched_for_call.store(true, Ordering::SeqCst);
             let accepted = action_proxy
                 .do_action(chosen as i32)
                 .await
-                .map_err(|error| anyhow!("doAction failed: {error}"))?;
+                .map_err(|error| {
+                    ActionFailure::AfterDispatch(format!("doAction failed: {error}"))
+                })?;
             if !accepted {
-                anyhow::bail!("element {idx} rejected portable action {requested:?}");
+                return Err(ActionFailure::AfterDispatch(format!(
+                    "element {idx} rejected portable action {requested:?}"
+                )));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok((action, false))
-        },
-        || {
-            Err(anyhow!(
-                "perform_named_action timed out for pid {pid} (app unresponsive to AT-SPI)"
-            ))
-        },
-    )
+            Ok::<(String, bool), ActionFailure>((action, false))
+        })
+        .await
+    });
+    match result {
+        Ok(value) => value,
+        Err(_) => Err(action_failure(
+            dispatched.load(Ordering::SeqCst),
+            true,
+            format!("perform_named_action timed out for pid {pid} (app unresponsive to AT-SPI)"),
+        )),
+    }
 }
 
 /// Invoke an indexed scroll target's directional AT-SPI action.
