@@ -8535,6 +8535,34 @@ fn canonical_cursor_def(name: &str) -> ToolDef {
 
 // ── check_permissions ─────────────────────────────────────────────────────────
 
+pub struct CheckWinRestoreTool;
+static WINRESTORE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+
+#[async_trait]
+impl Tool for CheckWinRestoreTool {
+    fn def(&self) -> &ToolDef {
+        WINRESTORE_DEF.get_or_init(|| ToolDef {
+            name: "check_winrestore".into(),
+            description: "Verify that the trusted GNOME Shell WinRestore v2 helper is ready."
+                .into(),
+            input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        })
+    }
+
+    async fn invoke(&self, _args: Value) -> ToolResult {
+        if crate::x11::minimized_recovery::helper_ready() {
+            ToolResult::text("trusted GNOME Shell WinRestore v2 helper is ready")
+                .with_structured(json!({"ready": true, "version": 2}))
+        } else {
+            ToolResult::error("trusted GNOME Shell WinRestore v2 helper is unavailable")
+        }
+    }
+}
+
 pub struct CheckPermissionsTool;
 static PERMS_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
@@ -9741,6 +9769,7 @@ pub fn build_registry_with_provider(
         state: state.clone(),
     }));
     r.register(Box::new(CheckPermissionsTool));
+    r.register(Box::new(CheckWinRestoreTool));
     // `health_report` — single-call cross-platform driver diagnostics.
     // Stable schema_version="1" contract for downstream consumers. Linux skips
     // tcc_* and bundle_identity with "not applicable on Linux".

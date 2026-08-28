@@ -35,9 +35,14 @@ pub fn configure_launch_grants(grants: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown launch grant '{other}'")),
         }
     }
+    if let Some(existing) = LAUNCH_GRANTS.get() {
+        return (existing == &normalized)
+            .then_some(())
+            .ok_or_else(|| "launch grants were already configured differently".to_owned());
+    }
     LAUNCH_GRANTS
         .set(normalized)
-        .map_err(|_| "launch grants were already configured".to_owned())
+        .map_err(|_| "launch grants were configured concurrently".to_owned())
 }
 
 pub fn launch_grant_enabled(grant: &str) -> bool {

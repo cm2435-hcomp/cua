@@ -45,6 +45,21 @@ fn is_firefox(name: &str) -> bool {
     })
 }
 
+pub(crate) fn process_is_browser(pid: u32) -> bool {
+    let process = crate::proc_fs::list_processes()
+        .into_iter()
+        .find(|process| process.pid == pid);
+    let executable = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    process.is_some_and(|process| {
+        let identity = executable
+            .filter(|path| !path.is_empty())
+            .unwrap_or(process.name);
+        is_chromium(&identity) || is_firefox(&identity)
+    })
+}
+
 fn browser_product(identity: &str) -> BrowserProduct {
     let tokens = identity
         .to_ascii_lowercase()

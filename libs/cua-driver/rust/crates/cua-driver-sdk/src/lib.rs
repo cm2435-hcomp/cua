@@ -343,6 +343,9 @@ impl SessionPermissionMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct RuntimeAuthorizationOptions {
     pub allowed_modes: Vec<SessionPermissionMode>,
+    /// Immutable, trusted-launcher capabilities such as existing-profile
+    /// browser attachment. Model/tool arguments can never add to this set.
+    pub launch_grants: Vec<String>,
     /// Mode inherited by calls made through the released `CuaDriver` object
     /// rather than a trusted session-bound action surface.
     pub compatibility_mode: SessionPermissionMode,
@@ -372,6 +375,7 @@ fn configured_driver_options_json(options: &ConfiguredDriverOptions) -> Value {
         "claude_code_compatibility": options.claude_code_compatibility,
         "authorization": {
             "allowed_modes": allowed_modes,
+            "launch_grants": options.authorization.launch_grants.clone(),
             "compatibility_mode": options.authorization.compatibility_mode.as_str(),
             "compatibility_bounded_manifest_path": options.authorization.compatibility_bounded_manifest_path.clone(),
             "unrestricted_acknowledged": options.authorization.unrestricted_acknowledged,
@@ -1119,6 +1123,7 @@ impl CuaDriver {
             "claude_code_compatibility": options.claude_code_compatibility,
             "authorization": {
                 "allowed_modes": allowed_modes,
+                "launch_grants": options.authorization.launch_grants.clone(),
                 "compatibility_mode": options.authorization.compatibility_mode.as_str(),
                 "compatibility_bounded_manifest_path": options.authorization.compatibility_bounded_manifest_path,
                 "unrestricted_acknowledged": options.authorization.unrestricted_acknowledged,
@@ -1695,6 +1700,7 @@ mod tests {
             claude_code_compatibility: false,
             authorization: RuntimeAuthorizationOptions {
                 allowed_modes: vec![SessionPermissionMode::Standard],
+                launch_grants: vec![],
                 compatibility_mode: SessionPermissionMode::Standard,
                 compatibility_bounded_manifest_path: None,
                 unrestricted_acknowledged: false,
@@ -1725,6 +1731,7 @@ mod tests {
                 claude_code_compatibility: false,
                 authorization: RuntimeAuthorizationOptions {
                     allowed_modes: vec![SessionPermissionMode::Standard],
+                    launch_grants: vec![],
                     compatibility_mode: SessionPermissionMode::Standard,
                     compatibility_bounded_manifest_path: None,
                     unrestricted_acknowledged: false,
@@ -1756,6 +1763,7 @@ mod tests {
             claude_code_compatibility: false,
             authorization: RuntimeAuthorizationOptions {
                 allowed_modes: vec![SessionPermissionMode::Unrestricted],
+                launch_grants: vec![],
                 compatibility_mode: SessionPermissionMode::Unrestricted,
                 compatibility_bounded_manifest_path: None,
                 unrestricted_acknowledged: true,
@@ -1958,6 +1966,7 @@ mod tests {
                     SessionPermissionMode::Standard,
                     SessionPermissionMode::Unrestricted,
                 ],
+                launch_grants: vec![],
                 compatibility_mode: SessionPermissionMode::Standard,
                 compatibility_bounded_manifest_path: None,
                 unrestricted_acknowledged: true,
@@ -2123,6 +2132,7 @@ mod tests {
             claude_code_compatibility: false,
             authorization: RuntimeAuthorizationOptions {
                 allowed_modes: vec![SessionPermissionMode::Standard],
+                launch_grants: vec![],
                 compatibility_mode: SessionPermissionMode::Standard,
                 compatibility_bounded_manifest_path: None,
                 unrestricted_acknowledged: false,
@@ -2224,6 +2234,7 @@ mod tests {
                     SessionPermissionMode::Standard,
                     SessionPermissionMode::Unrestricted,
                 ],
+                launch_grants: vec![],
                 compatibility_mode: SessionPermissionMode::Standard,
                 compatibility_bounded_manifest_path: None,
                 unrestricted_acknowledged: true,

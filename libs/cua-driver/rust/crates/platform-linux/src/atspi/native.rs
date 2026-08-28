@@ -334,6 +334,15 @@ fn is_web_process_bus(name: &str) -> bool {
     name.contains("webkit") || name.contains("webprocess")
 }
 
+fn child_in_web_document(
+    inherited_web_doc: bool,
+    on_web_process_bus: bool,
+    process_is_browser: bool,
+    role: &str,
+) -> bool {
+    inherited_web_doc || on_web_process_bus || (process_is_browser && is_document_role(role))
+}
+
 /// Build an `AccessibleProxy` for an arbitrary (bus name, path) in the tree.
 /// Uses owned `String`s for destination/path so the resulting `BusName`/
 /// `ObjectPath` are `'static` and the proxy borrows only the connection.
@@ -804,6 +813,7 @@ async fn collect_visited_bounded<'a>(
     max_depth: Option<usize>,
 ) -> Result<Option<(Vec<Visited<'a>>, Option<usize>, WalkCompleteness)>> {
     let walk_started = std::time::Instant::now();
+    let process_is_browser = crate::browser_platform::process_is_browser(pid);
     let app = match app_for_pid(conn, pid).await? {
         Some(a) => a,
         None => return Ok(None),
@@ -897,7 +907,8 @@ async fn collect_visited_bounded<'a>(
         // D-Bus peer and can expose blank role names for the entire subtree.
         // The peer identity is therefore the reliable document boundary when
         // role-based AT-SPI discovery cannot identify one.
-        let in_web_doc = inherited_web_doc || is_web_process_bus(&oref.name);
+        let on_web_process_bus = is_web_process_bus(&oref.name);
+        let in_web_doc = inherited_web_doc || on_web_process_bus;
 
         // accessible_for builds a proxy whose first use round-trips to the
         // target app. On a modal-grabbed (AT-SPI-unresponsive) app this is the
@@ -1072,8 +1083,11 @@ async fn collect_visited_bounded<'a>(
             name = text_content;
         }
 
-        // Children inherit web-document context, plus this node's own role.
-        let child_in_web_doc = in_web_doc || is_document_role(&role);
+        // Calc exposes `document spreadsheet`, but that is not browser page
+        // content. Propagate document roles only for a proved browser process;
+        // WebKit's separately named WebProcess remains sufficient evidence.
+        let child_in_web_doc =
+            child_in_web_document(in_web_doc, on_web_process_bus, process_is_browser, &role);
 
         // Honor max_depth (#22865) and AT-SPI's MANAGES_DESCENDANTS contract
         // before issuing GetChildren. The managed container itself remains in
@@ -1129,7 +1143,7 @@ async fn collect_visited_bounded<'a>(
             has_component,
             focused,
             in_web_doc,
-            on_web_process_bus: is_web_process_bus(&oref.name),
+            on_web_process_bus,
             frame_ordinal,
             acc,
         });
@@ -3736,7 +3750,7 @@ mod frame_correlation_tests {
 mod coord_tests {
     use super::parse_gtk_frame_extents;
     use super::{
-        action_failure, activation_index, before_snapshot_deadline,
+        action_failure, activation_index, before_snapshot_deadline, child_in_web_document,
         combine_wayland_content_offsets, is_activation_action, is_enabled_state,
         is_indexable_capabilities, is_passive_role, is_web_process_bus, portable_action_index,
         prefer_authoritative_wayland_origin, rebase_renderer_window_offset,
@@ -3747,6 +3761,18 @@ mod coord_tests {
     };
     use atspi::{State, StateSet};
     use std::time::Duration;
+
+    #[test]
+    fn document_roles_require_browser_or_web_process_evidence() {
+        assert!(!child_in_web_document(
+            false,
+            false,
+            false,
+            "document spreadsheet"
+        ));
+        assert!(child_in_web_document(false, false, true, "document web"));
+        assert!(child_in_web_document(false, true, false, ""));
+    }
 
     #[test]
     fn action_timeout_preserves_whether_dispatch_started() {

@@ -146,6 +146,11 @@ const FfiConverterString = uniffiCreateFfiConverterString(stringConverter);
 export type RuntimeAuthorizationOptions = {
     allowedModes: Array<SessionPermissionMode>,
     /**
+     * Immutable, trusted-launcher capabilities such as existing-profile
+     * browser attachment. Model/tool arguments can never add to this set.
+     */
+    launchGrants: Array<string>,
+    /**
      * Mode inherited by calls made through the released `CuaDriver` object
      * rather than a trusted session-bound action surface.
      */
@@ -181,6 +186,7 @@ const FfiConverterTypeRuntimeAuthorizationOptions = (() => {
         read(from: RustBuffer): TypeName {
             return {
                 allowedModes: FfiConverterSequenceTypeSessionPermissionMode.read(from),
+                launchGrants: FfiConverterSequenceString.read(from),
                 compatibilityMode: FfiConverterTypeSessionPermissionMode.read(from),
                 compatibilityBoundedManifestPath: FfiConverterOptionalString.read(from),
                 unrestrictedAcknowledged: FfiConverterBool.read(from),
@@ -190,6 +196,7 @@ const FfiConverterTypeRuntimeAuthorizationOptions = (() => {
         }
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterSequenceTypeSessionPermissionMode.write(value.allowedModes, into);
+            FfiConverterSequenceString.write(value.launchGrants, into);
             FfiConverterTypeSessionPermissionMode.write(value.compatibilityMode, into);
             FfiConverterOptionalString.write(value.compatibilityBoundedManifestPath, into);
             FfiConverterBool.write(value.unrestrictedAcknowledged, into);
@@ -198,6 +205,7 @@ const FfiConverterTypeRuntimeAuthorizationOptions = (() => {
         }
         allocationSize(value: TypeName): number {
             return FfiConverterSequenceTypeSessionPermissionMode.allocationSize(value.allowedModes) +
+             FfiConverterSequenceString.allocationSize(value.launchGrants) +
              FfiConverterTypeSessionPermissionMode.allocationSize(value.compatibilityMode) +
              FfiConverterOptionalString.allocationSize(value.compatibilityBoundedManifestPath) +
              FfiConverterBool.allocationSize(value.unrestrictedAcknowledged) +
@@ -5451,11 +5459,11 @@ const FfiConverterTypeEmbeddedCuaDriverHost = new FfiConverterObject(uniffiTypeE
 // FfiConverter for Array<SessionPermissionMode>
 const FfiConverterSequenceTypeSessionPermissionMode = new FfiConverterArray(FfiConverterTypeSessionPermissionMode);
 
-// FfiConverter for string | undefined
-const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
-
 // FfiConverter for Array<string>
 const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
+
+// FfiConverter for string | undefined
+const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
 
 // FfiConverter for Array<EmbeddedEnvironmentVariable>
 const FfiConverterSequenceTypeEmbeddedEnvironmentVariable = new FfiConverterArray(FfiConverterTypeEmbeddedEnvironmentVariable);

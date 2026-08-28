@@ -11,6 +11,7 @@ fn options(allowed_modes: Vec<SessionPermissionMode>) -> ConfiguredDriverOptions
         claude_code_compatibility: false,
         authorization: RuntimeAuthorizationOptions {
             allowed_modes,
+            launch_grants: vec![],
             compatibility_mode: SessionPermissionMode::Standard,
             compatibility_bounded_manifest_path: None,
             unrestricted_acknowledged: true,

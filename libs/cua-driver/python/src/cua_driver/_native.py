@@ -1947,6 +1947,29 @@ class _UniffiFfiConverterString:
             builder.write(value.encode("utf-8"))
             return builder.finalize()
 
+class _UniffiFfiConverterSequenceString(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterString.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterString.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterString.read(buf) for i in range(count)
+        ]
+
 class _UniffiFfiConverterOptionalString(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -1990,8 +2013,9 @@ class RuntimeAuthorizationOptions:
     """
     Immutable authorization ceiling supplied before a runtime accepts actions.
 """
-    def __init__(self, *, allowed_modes:typing.List[SessionPermissionMode], compatibility_mode:SessionPermissionMode, compatibility_bounded_manifest_path:typing.Optional[str], unrestricted_acknowledged:bool, max_session_ttl_seconds:int, max_idle_ttl_seconds:int):
+    def __init__(self, *, allowed_modes:typing.List[SessionPermissionMode], launch_grants:typing.List[str], compatibility_mode:SessionPermissionMode, compatibility_bounded_manifest_path:typing.Optional[str], unrestricted_acknowledged:bool, max_session_ttl_seconds:int, max_idle_ttl_seconds:int):
         self.allowed_modes = allowed_modes
+        self.launch_grants = launch_grants
         self.compatibility_mode = compatibility_mode
         self.compatibility_bounded_manifest_path = compatibility_bounded_manifest_path
         self.unrestricted_acknowledged = unrestricted_acknowledged
@@ -2002,9 +2026,11 @@ class RuntimeAuthorizationOptions:
 
 
     def __str__(self):
-        return "RuntimeAuthorizationOptions(allowed_modes={}, compatibility_mode={}, compatibility_bounded_manifest_path={}, unrestricted_acknowledged={}, max_session_ttl_seconds={}, max_idle_ttl_seconds={})".format(self.allowed_modes, self.compatibility_mode, self.compatibility_bounded_manifest_path, self.unrestricted_acknowledged, self.max_session_ttl_seconds, self.max_idle_ttl_seconds)
+        return "RuntimeAuthorizationOptions(allowed_modes={}, launch_grants={}, compatibility_mode={}, compatibility_bounded_manifest_path={}, unrestricted_acknowledged={}, max_session_ttl_seconds={}, max_idle_ttl_seconds={})".format(self.allowed_modes, self.launch_grants, self.compatibility_mode, self.compatibility_bounded_manifest_path, self.unrestricted_acknowledged, self.max_session_ttl_seconds, self.max_idle_ttl_seconds)
     def __eq__(self, other):
         if self.allowed_modes != other.allowed_modes:
+            return False
+        if self.launch_grants != other.launch_grants:
             return False
         if self.compatibility_mode != other.compatibility_mode:
             return False
@@ -2023,6 +2049,7 @@ class _UniffiFfiConverterTypeRuntimeAuthorizationOptions(_UniffiConverterRustBuf
     def read(buf):
         return RuntimeAuthorizationOptions(
             allowed_modes=_UniffiFfiConverterSequenceTypeSessionPermissionMode.read(buf),
+            launch_grants=_UniffiFfiConverterSequenceString.read(buf),
             compatibility_mode=_UniffiFfiConverterTypeSessionPermissionMode.read(buf),
             compatibility_bounded_manifest_path=_UniffiFfiConverterOptionalString.read(buf),
             unrestricted_acknowledged=_UniffiFfiConverterBoolean.read(buf),
@@ -2033,6 +2060,7 @@ class _UniffiFfiConverterTypeRuntimeAuthorizationOptions(_UniffiConverterRustBuf
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterSequenceTypeSessionPermissionMode.check_lower(value.allowed_modes)
+        _UniffiFfiConverterSequenceString.check_lower(value.launch_grants)
         _UniffiFfiConverterTypeSessionPermissionMode.check_lower(value.compatibility_mode)
         _UniffiFfiConverterOptionalString.check_lower(value.compatibility_bounded_manifest_path)
         _UniffiFfiConverterBoolean.check_lower(value.unrestricted_acknowledged)
@@ -2042,6 +2070,7 @@ class _UniffiFfiConverterTypeRuntimeAuthorizationOptions(_UniffiConverterRustBuf
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterSequenceTypeSessionPermissionMode.write(value.allowed_modes, buf)
+        _UniffiFfiConverterSequenceString.write(value.launch_grants, buf)
         _UniffiFfiConverterTypeSessionPermissionMode.write(value.compatibility_mode, buf)
         _UniffiFfiConverterOptionalString.write(value.compatibility_bounded_manifest_path, buf)
         _UniffiFfiConverterBoolean.write(value.unrestricted_acknowledged, buf)
@@ -2167,29 +2196,6 @@ class _UniffiFfiConverterTypeDriverActivityKind(_UniffiConverterRustBuffer):
             buf.write_i32(7)
 
 
-
-class _UniffiFfiConverterSequenceString(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        for item in value:
-            _UniffiFfiConverterString.check_lower(item)
-
-    @classmethod
-    def write(cls, value, buf):
-        items = len(value)
-        buf.write_i32(items)
-        for item in value:
-            _UniffiFfiConverterString.write(item, buf)
-
-    @classmethod
-    def read(cls, buf):
-        count = buf.read_i32()
-        if count < 0:
-            raise InternalError("Unexpected negative sequence length")
-
-        return [
-            _UniffiFfiConverterString.read(buf) for i in range(count)
-        ]
 
 @dataclass
 class DriverActivityEvent:

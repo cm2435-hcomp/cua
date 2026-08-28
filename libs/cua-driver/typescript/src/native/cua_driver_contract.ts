@@ -360,10 +360,104 @@ const FfiConverterTypeActionRoute = (() => {
     return new FFIConverter();
 })();
 
+export enum FocusEffectKind {
+    NotEligible,
+    Preserved,
+    TemporarilyTakenAndRestored,
+    TakenAndNotRestored,
+    Indeterminate
+}
+
+const FfiConverterTypeFocusEffectKind = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = FocusEffectKind;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return FocusEffectKind.NotEligible;
+                case 2: return FocusEffectKind.Preserved;
+                case 3: return FocusEffectKind.TemporarilyTakenAndRestored;
+                case 4: return FocusEffectKind.TakenAndNotRestored;
+                case 5: return FocusEffectKind.Indeterminate;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case FocusEffectKind.NotEligible: return ordinalConverter.write(1, into);
+                case FocusEffectKind.Preserved: return ordinalConverter.write(2, into);
+                case FocusEffectKind.TemporarilyTakenAndRestored: return ordinalConverter.write(3, into);
+                case FocusEffectKind.TakenAndNotRestored: return ordinalConverter.write(4, into);
+                case FocusEffectKind.Indeterminate: return ordinalConverter.write(5, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * Content-free evidence of whether a desktop action displaced the window
+ * that owned X11 focus when dispatch began.
+ */
+export type FocusEffect = {
+    kind: FocusEffectKind,
+    transitionCount: number,
+    targetActiveMs: bigint,
+    measurementComplete: boolean
+}
+
+/**
+ * Generated factory for {@link FocusEffect} record objects.
+ */
+export const FocusEffect = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<FocusEffect, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<FocusEffect>,
+    });
+})();
+
+const FfiConverterTypeFocusEffect = (() => {
+    type TypeName = FocusEffect;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                kind: FfiConverterTypeFocusEffectKind.read(from),
+                transitionCount: FfiConverterUInt32.read(from),
+                targetActiveMs: FfiConverterUInt64.read(from),
+                measurementComplete: FfiConverterBool.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypeFocusEffectKind.write(value.kind, into);
+            FfiConverterUInt32.write(value.transitionCount, into);
+            FfiConverterUInt64.write(value.targetActiveMs, into);
+            FfiConverterBool.write(value.measurementComplete, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypeFocusEffectKind.allocationSize(value.kind) +
+             FfiConverterUInt32.allocationSize(value.transitionCount) +
+             FfiConverterUInt64.allocationSize(value.targetActiveMs) +
+             FfiConverterBool.allocationSize(value.measurementComplete);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export type ActionResult = {
     effect: ActionEffect,
     route: ActionRoute,
     delivery?: ActionDelivery,
+    focusEffect?: FocusEffect,
     evidence?: Array<ActionEvidence>,
     escalation?: ActionEscalation
 }
@@ -392,6 +486,7 @@ const FfiConverterTypeActionResult = (() => {
                 effect: FfiConverterTypeActionEffect.read(from),
                 route: FfiConverterTypeActionRoute.read(from),
                 delivery: FfiConverterOptionalTypeActionDelivery.read(from),
+                focusEffect: FfiConverterOptionalTypeFocusEffect.read(from),
                 evidence: FfiConverterOptionalSequenceTypeActionEvidence.read(from),
                 escalation: FfiConverterOptionalTypeActionEscalation.read(from)
             };
@@ -400,6 +495,7 @@ const FfiConverterTypeActionResult = (() => {
             FfiConverterTypeActionEffect.write(value.effect, into);
             FfiConverterTypeActionRoute.write(value.route, into);
             FfiConverterOptionalTypeActionDelivery.write(value.delivery, into);
+            FfiConverterOptionalTypeFocusEffect.write(value.focusEffect, into);
             FfiConverterOptionalSequenceTypeActionEvidence.write(value.evidence, into);
             FfiConverterOptionalTypeActionEscalation.write(value.escalation, into);
         }
@@ -407,6 +503,7 @@ const FfiConverterTypeActionResult = (() => {
             return FfiConverterTypeActionEffect.allocationSize(value.effect) +
              FfiConverterTypeActionRoute.allocationSize(value.route) +
              FfiConverterOptionalTypeActionDelivery.allocationSize(value.delivery) +
+             FfiConverterOptionalTypeFocusEffect.allocationSize(value.focusEffect) +
              FfiConverterOptionalSequenceTypeActionEvidence.allocationSize(value.evidence) +
              FfiConverterOptionalTypeActionEscalation.allocationSize(value.escalation);
 
@@ -3206,6 +3303,9 @@ const FfiConverterOptionalUInt32 = new FfiConverterOptional(FfiConverterUInt32);
 // FfiConverter for ActionDelivery | undefined
 const FfiConverterOptionalTypeActionDelivery = new FfiConverterOptional(FfiConverterTypeActionDelivery);
 
+// FfiConverter for FocusEffect | undefined
+const FfiConverterOptionalTypeFocusEffect = new FfiConverterOptional(FfiConverterTypeFocusEffect);
+
 // FfiConverter for Array<ActionEvidence>
 const FfiConverterSequenceTypeActionEvidence = new FfiConverterArray(FfiConverterTypeActionEvidence);
 
@@ -3328,6 +3428,8 @@ export default Object.freeze({
     FfiConverterTypeEndSessionOutput,
     FfiConverterTypeEscalateSessionInput,
     FfiConverterTypeEscalationReason,
+    FfiConverterTypeFocusEffect,
+    FfiConverterTypeFocusEffectKind,
     FfiConverterTypeGetAgentCursorStateInput,
     FfiConverterTypeGetAgentCursorStateOutput,
     FfiConverterTypeGetCursorPositionInput,

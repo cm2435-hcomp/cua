@@ -1271,6 +1271,181 @@ class _UniffiFfiConverterOptionalTypeActionDelivery(_UniffiConverterRustBuffer):
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+
+
+
+
+
+class FocusEffectKind(enum.Enum):
+
+    NOT_ELIGIBLE = 0
+
+    PRESERVED = 1
+
+    TEMPORARILY_TAKEN_AND_RESTORED = 2
+
+    TAKEN_AND_NOT_RESTORED = 3
+
+    INDETERMINATE = 4
+
+
+
+class _UniffiFfiConverterTypeFocusEffectKind(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return FocusEffectKind.NOT_ELIGIBLE
+        if variant == 2:
+            return FocusEffectKind.PRESERVED
+        if variant == 3:
+            return FocusEffectKind.TEMPORARILY_TAKEN_AND_RESTORED
+        if variant == 4:
+            return FocusEffectKind.TAKEN_AND_NOT_RESTORED
+        if variant == 5:
+            return FocusEffectKind.INDETERMINATE
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == FocusEffectKind.NOT_ELIGIBLE:
+            return
+        if value == FocusEffectKind.PRESERVED:
+            return
+        if value == FocusEffectKind.TEMPORARILY_TAKEN_AND_RESTORED:
+            return
+        if value == FocusEffectKind.TAKEN_AND_NOT_RESTORED:
+            return
+        if value == FocusEffectKind.INDETERMINATE:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == FocusEffectKind.NOT_ELIGIBLE:
+            buf.write_i32(1)
+        if value == FocusEffectKind.PRESERVED:
+            buf.write_i32(2)
+        if value == FocusEffectKind.TEMPORARILY_TAKEN_AND_RESTORED:
+            buf.write_i32(3)
+        if value == FocusEffectKind.TAKEN_AND_NOT_RESTORED:
+            buf.write_i32(4)
+        if value == FocusEffectKind.INDETERMINATE:
+            buf.write_i32(5)
+
+
+
+class _UniffiFfiConverterUInt64(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u64"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**64
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u64()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u64(value)
+
+class _UniffiFfiConverterBoolean:
+    @classmethod
+    def check_lower(cls, value):
+        return not not value
+
+    @classmethod
+    def lower(cls, value):
+        return 1 if value else 0
+
+    @staticmethod
+    def lift(value):
+        return value != 0
+
+    @classmethod
+    def read(cls, buf):
+        return cls.lift(buf.read_u8())
+
+    @classmethod
+    def write(cls, value, buf):
+        buf.write_u8(value)
+
+@dataclass
+class FocusEffect:
+    """
+    Content-free evidence of whether a desktop action displaced the window
+    that owned X11 focus when dispatch began.
+"""
+    def __init__(self, *, kind:FocusEffectKind, transition_count:int, target_active_ms:int, measurement_complete:bool):
+        self.kind = kind
+        self.transition_count = transition_count
+        self.target_active_ms = target_active_ms
+        self.measurement_complete = measurement_complete
+
+
+
+
+    def __str__(self):
+        return "FocusEffect(kind={}, transition_count={}, target_active_ms={}, measurement_complete={})".format(self.kind, self.transition_count, self.target_active_ms, self.measurement_complete)
+    def __eq__(self, other):
+        if self.kind != other.kind:
+            return False
+        if self.transition_count != other.transition_count:
+            return False
+        if self.target_active_ms != other.target_active_ms:
+            return False
+        if self.measurement_complete != other.measurement_complete:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeFocusEffect(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return FocusEffect(
+            kind=_UniffiFfiConverterTypeFocusEffectKind.read(buf),
+            transition_count=_UniffiFfiConverterUInt32.read(buf),
+            target_active_ms=_UniffiFfiConverterUInt64.read(buf),
+            measurement_complete=_UniffiFfiConverterBoolean.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeFocusEffectKind.check_lower(value.kind)
+        _UniffiFfiConverterUInt32.check_lower(value.transition_count)
+        _UniffiFfiConverterUInt64.check_lower(value.target_active_ms)
+        _UniffiFfiConverterBoolean.check_lower(value.measurement_complete)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeFocusEffectKind.write(value.kind, buf)
+        _UniffiFfiConverterUInt32.write(value.transition_count, buf)
+        _UniffiFfiConverterUInt64.write(value.target_active_ms, buf)
+        _UniffiFfiConverterBoolean.write(value.measurement_complete, buf)
+
+class _UniffiFfiConverterOptionalTypeFocusEffect(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeFocusEffect.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeFocusEffect.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeFocusEffect.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterSequenceTypeActionEvidence(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -1346,10 +1521,11 @@ class _UniffiFfiConverterOptionalTypeActionEscalation(_UniffiConverterRustBuffer
 
 @dataclass
 class ActionResult:
-    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation]):
+    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], focus_effect:typing.Optional[FocusEffect], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation]):
         self.effect = effect
         self.route = route
         self.delivery = delivery
+        self.focus_effect = focus_effect
         self.evidence = evidence
         self.escalation = escalation
 
@@ -1357,13 +1533,15 @@ class ActionResult:
 
 
     def __str__(self):
-        return "ActionResult(effect={}, route={}, delivery={}, evidence={}, escalation={})".format(self.effect, self.route, self.delivery, self.evidence, self.escalation)
+        return "ActionResult(effect={}, route={}, delivery={}, focus_effect={}, evidence={}, escalation={})".format(self.effect, self.route, self.delivery, self.focus_effect, self.evidence, self.escalation)
     def __eq__(self, other):
         if self.effect != other.effect:
             return False
         if self.route != other.route:
             return False
         if self.delivery != other.delivery:
+            return False
+        if self.focus_effect != other.focus_effect:
             return False
         if self.evidence != other.evidence:
             return False
@@ -1378,6 +1556,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
             effect=_UniffiFfiConverterTypeActionEffect.read(buf),
             route=_UniffiFfiConverterTypeActionRoute.read(buf),
             delivery=_UniffiFfiConverterOptionalTypeActionDelivery.read(buf),
+            focus_effect=_UniffiFfiConverterOptionalTypeFocusEffect.read(buf),
             evidence=_UniffiFfiConverterOptionalSequenceTypeActionEvidence.read(buf),
             escalation=_UniffiFfiConverterOptionalTypeActionEscalation.read(buf),
         )
@@ -1387,6 +1566,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterTypeActionEffect.check_lower(value.effect)
         _UniffiFfiConverterTypeActionRoute.check_lower(value.route)
         _UniffiFfiConverterOptionalTypeActionDelivery.check_lower(value.delivery)
+        _UniffiFfiConverterOptionalTypeFocusEffect.check_lower(value.focus_effect)
         _UniffiFfiConverterOptionalSequenceTypeActionEvidence.check_lower(value.evidence)
         _UniffiFfiConverterOptionalTypeActionEscalation.check_lower(value.escalation)
 
@@ -1395,6 +1575,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterTypeActionEffect.write(value.effect, buf)
         _UniffiFfiConverterTypeActionRoute.write(value.route, buf)
         _UniffiFfiConverterOptionalTypeActionDelivery.write(value.delivery, buf)
+        _UniffiFfiConverterOptionalTypeFocusEffect.write(value.focus_effect, buf)
         _UniffiFfiConverterOptionalSequenceTypeActionEvidence.write(value.evidence, buf)
         _UniffiFfiConverterOptionalTypeActionEscalation.write(value.escalation, buf)
 
@@ -1707,27 +1888,6 @@ class _UniffiFfiConverterTypeClickInput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.session, buf)
         _UniffiFfiConverterOptionalTypeClickButton.write(value.button, buf)
         _UniffiFfiConverterOptionalUInt32.write(value.count, buf)
-
-class _UniffiFfiConverterBoolean:
-    @classmethod
-    def check_lower(cls, value):
-        return not not value
-
-    @classmethod
-    def lower(cls, value):
-        return 1 if value else 0
-
-    @staticmethod
-    def lift(value):
-        return value != 0
-
-    @classmethod
-    def read(cls, buf):
-        return cls.lift(buf.read_u8())
-
-    @classmethod
-    def write(cls, value, buf):
-        buf.write_u8(value)
 
 @dataclass
 class ClipboardReadInput:
@@ -2315,19 +2475,6 @@ class _UniffiFfiConverterTypeCursorAction(_UniffiConverterRustBuffer):
             buf.write_i32(12)
 
 
-
-class _UniffiFfiConverterUInt64(_UniffiConverterPrimitiveInt):
-    CLASS_NAME = "u64"
-    VALUE_MIN = 0
-    VALUE_MAX = 2**64
-
-    @staticmethod
-    def read(buf):
-        return buf.read_u64()
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_u64(value)
 
 @dataclass
 class CursorVisualOutput:
@@ -4719,6 +4866,7 @@ __all__ = [
     "ActionEvidenceKind",
     "ActionEffect",
     "ActionRoute",
+    "FocusEffectKind",
     "DesktopScope",
     "ClickButton",
     "CursorReducedMotion",
@@ -4734,6 +4882,7 @@ __all__ = [
     "ActionDelivery",
     "ActionEscalation",
     "ActionEvidence",
+    "FocusEffect",
     "ActionResult",
     "BoundsExpectation",
     "ClickInput",

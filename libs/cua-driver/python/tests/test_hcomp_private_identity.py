@@ -16,6 +16,7 @@ from build_hcomp_private_wheel import (  # noqa: E402
     PRIVATE_DISTRIBUTION,
     private_version,
     stage_package,
+    stage_winrestore,
 )
 from gate_list_tools_schema import (
     WheelGateError,
@@ -68,6 +69,27 @@ def test_staging_uses_private_distribution_without_renaming_python_api(tmp_path:
     assert 'packages = ["src/cua_driver"]' in staged_pyproject
     assert provenance.version == private_version(SOURCE_SHA)
     assert 'name = "cua-driver"' in (source_package / "pyproject.toml").read_text(encoding="utf-8")
+
+
+def test_linux_private_wheel_stages_winrestore_from_the_native_source(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    helper = source / "libs" / "cua-driver" / "x11-helper"
+    for relative in (
+        "README.md",
+        "install.sh",
+        "winrestore@cua/extension.js",
+        "winrestore@cua/metadata.json",
+    ):
+        path = helper / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(relative, encoding="utf-8")
+
+    package = tmp_path / "package"
+    stage_winrestore(source, package, platform="linux")
+
+    assert (package / "src/cua_driver/x11-helper/winrestore@cua/extension.js").read_text() == (
+        "winrestore@cua/extension.js"
+    )
 
 
 def write_test_wheel(path: Path, *, version: str, sdk_hash: str) -> None:

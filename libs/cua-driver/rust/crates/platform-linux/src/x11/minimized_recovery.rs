@@ -226,6 +226,10 @@ fn trusted_shell_owner() -> Option<String> {
         .then_some(owner)
 }
 
+pub fn helper_ready() -> bool {
+    trusted_shell_owner().is_some()
+}
+
 fn gdbus_call(
     destination: &str,
     object_path: &str,

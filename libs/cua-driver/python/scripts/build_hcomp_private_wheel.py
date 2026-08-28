@@ -19,6 +19,12 @@ from pydantic import BaseModel, ConfigDict
 PUBLIC_VERSION = "0.19.3"
 PRIVATE_DISTRIBUTION = "cua-driver-hcomp"
 SOURCE_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+WINRESTORE_FILES = (
+    "README.md",
+    "install.sh",
+    "winrestore@cua/extension.js",
+    "winrestore@cua/metadata.json",
+)
 
 
 class WheelProvenance(BaseModel):
@@ -116,6 +122,20 @@ def verify_staged_identity(package_dir: Path, version: str) -> None:
         raise ValueError("staged wheel does not preserve the cua_driver import package")
 
 
+def stage_winrestore(source_dir: Path, package_dir: Path, *, platform: str) -> None:
+    if platform != "linux":
+        return
+    source = source_dir / "libs" / "cua-driver" / "x11-helper"
+    destination = package_dir / "src" / "cua_driver" / "x11-helper"
+    for relative in WINRESTORE_FILES:
+        source_file = source / relative
+        if not source_file.is_file():
+            raise FileNotFoundError(f"required WinRestore payload is missing: {source_file}")
+        destination_file = destination / relative
+        destination_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, destination_file)
+
+
 def project_path(package_dir: Path, *keys: str) -> object:
     value: object = tomllib.loads((package_dir / "pyproject.toml").read_text(encoding="utf-8"))
     for key in keys:
@@ -159,6 +179,7 @@ def stage_package(
         ignore=shutil.ignore_patterns("dist", "build", "*.egg-info", "__pycache__"),
         dirs_exist_ok=True,
     )
+    stage_winrestore(source_dir, staging_dir, platform=sys.platform)
     replace_project_identity(staging_dir, version)
     verify_staged_identity(staging_dir, version)
     executable, sdk = native_payload(staging_dir)

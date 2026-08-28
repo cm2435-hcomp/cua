@@ -175,6 +175,7 @@ struct AbiDriverOptions {
 #[serde(deny_unknown_fields)]
 struct AbiRuntimeAuthorizationOptions {
     allowed_modes: Vec<PermissionMode>,
+    launch_grants: Vec<String>,
     compatibility_mode: PermissionMode,
     compatibility_bounded_manifest_path: Option<String>,
     unrestricted_acknowledged: bool,
@@ -286,6 +287,8 @@ fn runtime_options_from_abi(options: AbiDriverOptions) -> Result<RuntimeOptions,
     match options.authorization {
         Some(authorization) => {
             validate_explicit_authorization_sources(&authorization)?;
+            cua_driver_core::authorization::configure_launch_grants(&authorization.launch_grants)
+                .map_err(|error| AbiFailure::new(CuaDriverStatus::InvalidArgument, error))?;
             let ceiling = SessionModeCeiling::for_trusted_sessions(
                 authorization.allowed_modes.clone(),
                 authorization.unrestricted_acknowledged,

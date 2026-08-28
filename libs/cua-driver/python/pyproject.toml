@@ -56,6 +56,7 @@ artifacts = [
     "src/cua_driver/*.dylib",
     "src/cua_driver/*.so",
     "src/cua_driver/*.dll",
+    "src/cua_driver/x11-helper/**/*",
 ]
 pure-python = false
 

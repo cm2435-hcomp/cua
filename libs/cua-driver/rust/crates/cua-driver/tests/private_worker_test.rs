@@ -17,6 +17,7 @@ fn worker_options() -> PrivateWorkerOptions {
                     SessionPermissionMode::Standard,
                     SessionPermissionMode::Unrestricted,
                 ],
+                launch_grants: vec![],
                 compatibility_mode: SessionPermissionMode::Standard,
                 compatibility_bounded_manifest_path: None,
                 unrestricted_acknowledged: true,
