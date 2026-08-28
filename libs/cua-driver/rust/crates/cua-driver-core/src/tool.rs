@@ -24,6 +24,18 @@ use crate::{
     tool_args::ArgsExt,
 };
 
+/// A platform-owned observational epoch around one physical desktop action.
+/// Implementations may enrich its internal record after dispatch, but cannot
+/// influence whether or how the action runs.
+pub trait ActionObservationEpoch: Send {
+    fn finish(self: Box<Self>) -> Option<cua_driver_contract::FocusEffect>;
+}
+
+/// Optional platform instrumentation installed at the registry chokepoint.
+pub trait ActionObserver: Send + Sync {
+    fn begin(&self, tool: &str, args: &Value) -> Option<Box<dyn ActionObservationEpoch>>;
+}
+
 tokio::task_local! {
     /// Authorization inherited by nested registry dispatch such as trajectory
     /// replay. The value is installed only by a trusted runtime/session action
@@ -564,6 +576,7 @@ pub struct ToolRegistry {
     session_end_hooks: Vec<crate::session::SessionEndHookRegistration>,
     cursor_outcome_readers: Vec<crate::session::CursorOutcomeReaderRegistration>,
     runtime_cleanups: Vec<RuntimeCleanup>,
+    action_observer: Option<Arc<dyn ActionObserver>>,
     /// Runtime-owned protected-consent broker shared by every resource
     /// adapter. Keeping it at the canonical dispatch boundary prevents
     /// browser, desktop, and file adapters from growing independent provider
@@ -619,10 +632,18 @@ impl ToolRegistry {
             session_end_hooks: vec![session_end_hook],
             cursor_outcome_readers: Vec::new(),
             runtime_cleanups: Vec::new(),
+            action_observer: None,
             approval_broker,
             protected_resource_grants,
             protected_resource_ownership,
         }
+    }
+
+    /// Install platform-owned, observational action instrumentation. The
+    /// observer may enrich a completed action record but cannot affect routing
+    /// or turn a successful action into a refusal.
+    pub fn set_action_observer(&mut self, observer: Arc<dyn ActionObserver>) {
+        self.action_observer = Some(observer);
     }
 
     /// Return the runtime-owned broker for adapter construction.
@@ -1336,7 +1357,15 @@ impl ToolRegistry {
             })
             .flatten();
 
+        let action_epoch = if is_physical_desktop_action(resolved_name) {
+            self.action_observer
+                .as_ref()
+                .and_then(|observer| observer.begin(resolved_name, &public_args))
+        } else {
+            None
+        };
         let mut result = tool.invoke(args.clone()).await;
+        let focus_effect = action_epoch.and_then(|epoch| epoch.finish());
         // The platform worker has exited, so another text operation for this
         // pid may now start even while result projection and evidence capture
         // finish for the completed call.
@@ -1358,6 +1387,13 @@ impl ToolRegistry {
                     &Value::Null,
                 );
             }
+        }
+        if let Some(record) = result
+            .action_record
+            .as_mut()
+            .filter(|record| record.actual_delivery.is_some())
+        {
+            record.focus_effect = focus_effect;
         }
         if resolved_name == "launch_app" && result.is_error != Some(true) {
             if let (Some(before), Some(pid)) = (

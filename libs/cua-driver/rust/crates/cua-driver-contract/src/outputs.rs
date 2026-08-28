@@ -386,6 +386,27 @@ pub struct ActionDelivery {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
+pub enum FocusEffectKind {
+    NotEligible,
+    Preserved,
+    TemporarilyTakenAndRestored,
+    TakenAndNotRestored,
+    Indeterminate,
+}
+
+/// Content-free evidence of whether a desktop action displaced the window
+/// that owned X11 focus when dispatch began.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct FocusEffect {
+    pub kind: FocusEffectKind,
+    pub transition_count: u32,
+    pub target_active_ms: u64,
+    pub measurement_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
 pub enum ActionEvidenceKind {
     ValueReadback,
     WindowChange,
@@ -430,6 +451,8 @@ pub struct ActionResult {
     pub route: ActionRoute,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<ActionDelivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_effect: Option<FocusEffect>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Vec<ActionEvidence>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -569,6 +592,7 @@ mod tests {
                 mode: ActionDeliveryMode::Background,
                 delivered_count: None,
             }),
+            focus_effect: None,
             evidence: Some(vec![ActionEvidence {
                 kind: ActionEvidenceKind::ValueReadback,
             }]),
@@ -585,7 +609,14 @@ mod tests {
         let properties = schema["properties"].as_object().expect("properties");
         assert_eq!(
             properties.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["delivery", "effect", "escalation", "evidence", "route"]
+            [
+                "delivery",
+                "effect",
+                "escalation",
+                "evidence",
+                "focus_effect",
+                "route"
+            ]
         );
         assert_eq!(
             properties["effect"]["enum"],
@@ -615,6 +646,28 @@ mod tests {
         assert_eq!(
             delivery["properties"]["mode"]["enum"],
             json!(["background", "foreground", "not_applicable", "unknown"])
+        );
+
+        let focus = object_variant(&properties["focus_effect"]);
+        assert_eq!(focus["additionalProperties"], false);
+        assert_eq!(
+            focus["required"],
+            json!([
+                "kind",
+                "transition_count",
+                "target_active_ms",
+                "measurement_complete"
+            ])
+        );
+        assert_eq!(
+            focus["properties"]["kind"]["enum"],
+            json!([
+                "not_eligible",
+                "preserved",
+                "temporarily_taken_and_restored",
+                "taken_and_not_restored",
+                "indeterminate"
+            ])
         );
 
         let evidence_schema = &properties["evidence"];

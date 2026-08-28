@@ -40,8 +40,8 @@ pub use outputs::{
     ActionEvidenceKind, ActionResult, ActionResultValidationError, ActionRoute,
     ClipboardReadOutput, ClipboardWriteOutput, CursorMotionOutput, CursorPointOutput,
     CursorPositionOutput, CursorThemeOutput, CursorVisualOutput, DesktopStateOutput,
-    EffectiveScope, EndSessionOutput, GetAgentCursorStateOutput, ScreenSizeOutput,
-    SessionStateOutput, SetAgentCursorEnabledOutput, SetAgentCursorMotionOutput,
+    EffectiveScope, EndSessionOutput, FocusEffect, FocusEffectKind, GetAgentCursorStateOutput,
+    ScreenSizeOutput, SessionStateOutput, SetAgentCursorEnabledOutput, SetAgentCursorMotionOutput,
     SetAgentCursorThemeOutput, StartSessionOutput, ToolOutput,
 };
 pub use verification::{

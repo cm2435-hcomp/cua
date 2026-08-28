@@ -9609,6 +9609,12 @@ pub fn build_registry_with_provider(
         })
     };
     let mut r = ToolRegistry::new_with_protected_consent_provider(provider);
+    // Focus evidence is observational only. Keeping it at the registry
+    // chokepoint catches brief LibreOffice/Electron foreground assists that a
+    // before/after snapshot would miss, without changing action routing.
+    if let Some(observer) = crate::x11::focus_audit::X11FocusObserver::start() {
+        r.set_action_observer(std::sync::Arc::new(observer));
+    }
     r.retain_cursor_outcome_reader(cursor_outcome_reader);
     r.retain_session_end_hook(session_end_hook);
     if let Some(runtime_scope) = cua_driver_core::tool::current_dispatch_runtime_scope() {

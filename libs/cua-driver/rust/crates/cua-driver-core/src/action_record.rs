@@ -242,6 +242,7 @@ pub struct ActionExecutionRecord {
     pub evidence: Vec<ActionEvidence>,
     pub escalation: Option<ActionEscalation>,
     pub delivered_count: Option<u32>,
+    pub focus_effect: Option<cua_driver_contract::FocusEffect>,
     pub detail: Option<String>,
 }
 
@@ -261,6 +262,7 @@ impl ActionExecutionRecord {
             evidence: Vec::new(),
             escalation: None,
             delivered_count: None,
+            focus_effect: None,
             detail: None,
         }
     }
@@ -304,6 +306,7 @@ impl ActionExecutionRecord {
                 actual,
                 delivered_count: self.delivered_count,
             }),
+            focus_effect: self.focus_effect.clone(),
             evidence: projected_evidence(&self.evidence),
             escalation: self.escalation.clone(),
         })
@@ -350,6 +353,7 @@ impl ActionExecutionRecord {
                     },
                     delivered_count: delivery.delivered_count,
                 }),
+            focus_effect: projection.focus_effect,
             evidence: projection.evidence.map(|evidence| {
                 evidence
                     .into_iter()
@@ -1114,6 +1118,7 @@ pub struct ActionOutcomeProjection {
     pub effect: ActionEffect,
     pub route: ActionRoute,
     pub delivery: Option<ActionDeliveryProjection>,
+    pub focus_effect: Option<cua_driver_contract::FocusEffect>,
     pub evidence: Option<Vec<ActionEvidenceProjection>>,
     pub escalation: Option<ActionEscalation>,
 }

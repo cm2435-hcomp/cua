@@ -8,6 +8,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 
+pub mod focus_audit;
 pub mod minimized_recovery;
 
 #[derive(Debug, Clone)]

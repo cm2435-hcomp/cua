@@ -63,6 +63,7 @@ pub mod element_query;
 pub mod element_token;
 pub mod expectation;
 pub mod ffmpeg_install;
+pub mod focus_effect;
 pub mod health_report;
 pub mod image_utils;
 pub mod page;
