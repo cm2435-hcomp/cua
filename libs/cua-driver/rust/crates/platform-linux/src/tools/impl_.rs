@@ -5398,6 +5398,27 @@ impl Tool for HotkeyTool {
 pub struct SetValueTool;
 static SV_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+fn chromium_set_value_requires_browser_route() -> ToolResult {
+    ToolResult::error(
+        "This Chromium field cannot be set safely through Linux accessibility: \
+         the renderer acknowledges the value write without accepting it. Use a \
+         browser-native page integration.",
+    )
+    .with_structured(json!({
+        "code": "unsupported_in_background",
+        "phase": "preflight",
+        "retryable": false,
+        "effect": "refused",
+        "effect_may_have_occurred": false,
+        "native_side_effect_started": false,
+        "dispatch_scope": "target",
+        // The native process/surface proof owns this recommendation;
+        // callers must not infer browser capability from an app name.
+        "recommended_route": "browser",
+        "recommended_tool": "get_browser_state"
+    }))
+}
+
 #[async_trait]
 impl Tool for SetValueTool {
     fn def(&self) -> &ToolDef {
@@ -5463,20 +5484,7 @@ impl Tool for SetValueTool {
             return result;
         }
         if is_standalone_chromium_browser(pid) {
-            return ToolResult::error(
-                "This Chromium field cannot be set safely through Linux accessibility: \
-                 the renderer acknowledges the value write without accepting it. Use a \
-                 browser-native page integration.",
-            )
-            .with_structured(json!({
-                "code": "unsupported_in_background",
-                "phase": "preflight",
-                "retryable": false,
-                "effect": "refused",
-                "effect_may_have_occurred": false,
-                "native_side_effect_started": false,
-                "dispatch_scope": "target"
-            }));
+            return chromium_set_value_requires_browser_route();
         }
         let cursor_id = resolve_cursor_key(&args);
         let value_for_task = value.clone();
@@ -9834,9 +9842,10 @@ pub fn build_registry_with_provider(
 mod click_button_schema_tests {
     use super::{
         await_semantic_click_stage, build_registry, chromium_background_must_refuse,
-        chromium_debugging_port_from_cmdline, maps_indicate_gtk, maps_indicate_qt_widgets,
-        mark_ax_window_unresolved, remaining_semantic_click_budget, should_try_atspi_action,
-        snapshot_index_extent, terminal_semantic_action_failure, ClickTool,
+        chromium_debugging_port_from_cmdline, chromium_set_value_requires_browser_route,
+        maps_indicate_gtk, maps_indicate_qt_widgets, mark_ax_window_unresolved,
+        remaining_semantic_click_budget, should_try_atspi_action, snapshot_index_extent,
+        terminal_semantic_action_failure, ClickTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::Value;
@@ -9855,6 +9864,18 @@ mod click_button_schema_tests {
             structured["failure_site"],
             "linux_atspi_action_timeout_before_dispatch"
         );
+    }
+
+    #[test]
+    fn chromium_set_value_refusal_carries_typed_browser_recovery() {
+        let result = chromium_set_value_requires_browser_route();
+        let structured = result
+            .structured_content
+            .expect("structured browser-route refusal");
+        assert_eq!(structured["code"], "unsupported_in_background");
+        assert_eq!(structured["recommended_route"], "browser");
+        assert_eq!(structured["recommended_tool"], "get_browser_state");
+        assert_eq!(structured["native_side_effect_started"], false);
     }
 
     #[test]
