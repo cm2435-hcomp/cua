@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Cua Driver Existing-Profile Bridge Spike",
+  "version": "0.0.1",
+  "description": "Disposable proof of extension-mediated CDP attachment.",
+  "permissions": ["debugger", "nativeMessaging", "tabs"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
