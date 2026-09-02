@@ -39,8 +39,8 @@ The result contains only Chrome IDs, window geometry, timings, sizes, and
 SHA-256 digests. DOM and screenshot payloads stay inside the extension and are
 discarded after hashing.
 
-To test debugger conflict, run the same probe with a wait and open DevTools for
-the approved tab before the timeout:
+To test lifecycle cleanup, run the same probe with a wait and close the approved
+tab before the timeout:
 
 ```sh
 python3 bridge.py probe \
@@ -51,8 +51,12 @@ python3 bridge.py probe \
   --wait-for-detach 30
 ```
 
-Chrome should detach the extension and the result should contain a `detached`
-event. Closing the attached tab is the equivalent lifecycle negative control.
+The result should contain either a `detached` or `tab_closed` terminal event.
+Navigating the attached tab must increment its document generation and refuse
+operations carrying the old generation. Chrome builds that allow DevTools and
+an extension debugger to coexist may keep both attached; if Chrome displaces
+the extension, the same wait surfaces its `detached` event. Killing the native
+host must detach the tab before reconnecting a fresh, authority-free channel.
 
 ## Local check and cleanup
 

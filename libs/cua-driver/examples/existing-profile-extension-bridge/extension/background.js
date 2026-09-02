@@ -54,6 +54,18 @@ async function activeTab() {
   return tabMetadata(tabs[0].id);
 }
 
+async function documentIdentity(tabId) {
+  const [result, tab] = await Promise.all([
+    chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree"),
+    chrome.tabs.get(tabId),
+  ]);
+  const frame = result.frameTree?.frame;
+  if (!frame?.id || !frame.loaderId || !tab.url) {
+    throw new Error("the attached tab has no complete top-frame identity");
+  }
+  return { frame_id: frame.id, loader_id: frame.loaderId, url: tab.url };
+}
+
 async function attach(message) {
   if (attached) {
     throw new Error("a tab is already attached");
@@ -75,6 +87,16 @@ async function attach(message) {
     origin: tab.origin,
     generation: 1,
   };
+  try {
+    // The document token is checked synchronously before each operation because
+    // Chrome can suppress tab and debugger navigation events while attached.
+    await chrome.debugger.sendCommand({ tabId: tab.tab_id }, "Page.enable");
+    attached.document = await documentIdentity(tab.tab_id);
+  } catch (error) {
+    attached = undefined;
+    await chrome.debugger.detach({ tabId: tab.tab_id }).catch(() => {});
+    throw error;
+  }
   return { ...tab, generation: attached.generation };
 }
 
@@ -82,15 +104,29 @@ async function proveAttached(message) {
   if (!attached || attached.tab_id !== message.tab_id) {
     throw new Error("the requested tab is not attached");
   }
-  if (attached.generation !== message.generation) {
-    throw new Error("the attached document generation changed");
-  }
   const tab = await tabMetadata(message.tab_id);
   if (
     tab.chrome_window_id !== attached.chrome_window_id ||
     tab.origin !== attached.origin
   ) {
     throw new Error("the attached tab identity changed");
+  }
+  const document = await documentIdentity(message.tab_id);
+  if (
+    document.frame_id !== attached.document.frame_id ||
+    document.loader_id !== attached.document.loader_id ||
+    document.url !== attached.document.url
+  ) {
+    attached.generation += 1;
+    attached.document = document;
+    post({
+      event: "generation_changed",
+      tab_id: attached.tab_id,
+      generation: attached.generation,
+    });
+  }
+  if (attached.generation !== message.generation) {
+    throw new Error("the attached document generation changed");
   }
   return tab;
 }
@@ -165,6 +201,9 @@ function post(message) {
 }
 
 function connect() {
+  if (nativePort) {
+    return;
+  }
   try {
     nativePort = chrome.runtime.connectNative(HOST);
     nativePort.onMessage.addListener((message) => {
@@ -178,8 +217,16 @@ function connect() {
           }),
       );
     });
-    nativePort.onDisconnect.addListener(() => {
+    nativePort.onDisconnect.addListener(async () => {
       nativePort = undefined;
+      if (attached) {
+        // Losing the controller must not strand the user's tab under debugger
+        // control or let a later bridge silently inherit its authority.
+        const tabId = attached.tab_id;
+        attached = undefined;
+        await chrome.debugger.detach({ tabId }).catch(() => {});
+      }
+      setTimeout(connect, 1000);
     });
     post({ event: "hello", protocol_version: PROTOCOL_VERSION });
   } catch {
@@ -195,17 +242,6 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   }
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (attached && tabId === attached.tab_id && changeInfo.url) {
-    attached.generation += 1;
-    post({
-      event: "generation_changed",
-      tab_id: tabId,
-      generation: attached.generation,
-    });
-  }
-});
-
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (attached && tabId === attached.tab_id) {
     attached = undefined;
@@ -213,4 +249,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
 });
 
+// MV3 workers are not guaranteed to run merely because Chrome restarted.
+// Registering this event gives a restored profile an explicit channel wake-up.
+chrome.runtime.onStartup.addListener(connect);
 connect();

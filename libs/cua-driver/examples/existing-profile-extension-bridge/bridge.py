@@ -246,9 +246,12 @@ class ControlClient:
         return value
 
     def wait_for_event(self, name: str) -> dict[str, Any]:
+        return self.wait_for_any_event({name})
+
+    def wait_for_any_event(self, names: set[str]) -> dict[str, Any]:
         while True:
             message = self.receive()
-            if message.get("event") == name:
+            if message.get("event") in names:
                 return message
             self.events.append(message)
 
@@ -324,7 +327,11 @@ def probe(
             evidence[method] = result
         if wait_for_detach:
             client.socket.settimeout(wait_for_detach)
-            evidence["detach_event"] = client.wait_for_event("detached")
+            # Closing a tab can race debugger detachment; either event proves the
+            # approved target is gone and must not be silently rebound.
+            evidence["terminal_event"] = client.wait_for_any_event(
+                {"detached", "tab_closed"}
+            )
             detached = True
         else:
             result, elapsed = client.request("detach", tab_id=tab["tab_id"])
