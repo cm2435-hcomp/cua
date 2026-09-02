@@ -209,6 +209,113 @@ fn loopback_ports_for_pid(pid: i64) -> Result<Vec<u16>, BrowserRefusal> {
     Ok(listeners)
 }
 
+fn extension_bridge_endpoint(pid: i64) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let uid = unsafe { libc::geteuid() };
+    let prefix = format!("cua-driver-browser-extension-{uid}-");
+    let family = process_family_pids(pid)?;
+    let listener_ports = loopback_ports_for_pid(pid)?;
+    let mut endpoints = Vec::new();
+    for entry in std::fs::read_dir(std::env::temp_dir()).map_err(|error| {
+        refusal(
+            BrowserRefusalCode::BrowserRouteUnavailable,
+            format!("could not inspect browser-extension endpoint records: {error}"),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            refusal(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!("could not inspect a browser-extension endpoint record: {error}"),
+            )
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(".json") {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            refusal(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!("could not inspect browser-extension endpoint record: {error}"),
+            )
+        })?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != uid
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() > 4096
+        {
+            return Err(refusal(
+                BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                "a browser-extension endpoint record is not a small private owned file",
+            ));
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).map_err(|error| {
+                refusal(
+                    BrowserRefusalCode::BrowserRouteUnavailable,
+                    format!("could not read browser-extension endpoint record: {error}"),
+                )
+            })?)
+            .map_err(|_| {
+                refusal(
+                    BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                    "the browser-extension endpoint record is malformed",
+                )
+            })?;
+        if value["protocol_version"] != 1
+            || value["extension_id"] != "aaicokmghmaijchfjgiaohgidiimegkp"
+        {
+            return Err(refusal(
+                BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                "the browser-extension endpoint identity is incompatible",
+            ));
+        }
+        let ws_url = value["ws_url"].as_str().ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                "the browser-extension endpoint record has no WebSocket URL",
+            )
+        })?;
+        let port = loopback_websocket_port(ws_url).ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                "the browser-extension endpoint is not loopback-only",
+            )
+        })?;
+        let host_pid = value["host_pid"].as_i64().ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                "the browser-extension endpoint record has no host pid",
+            )
+        })?;
+        if family.contains(&host_pid) && listener_ports.contains(&port) {
+            endpoints.push((ws_url.to_owned(), port, host_pid));
+        }
+    }
+    match endpoints.as_slice() {
+        [] => Ok(None),
+        [(ws_url, port, host_pid)] => Ok(Some(OwnedEndpoint {
+            ws_url: ws_url.clone(),
+            http_port: Some(*port),
+            ownership: EndpointOwnershipProof {
+                method: EndpointOwnershipMethod::PlatformAttested,
+                owner_pid: pid,
+                listener_pid: Some(*host_pid),
+                detail: Some(
+                    "private extension record plus native-host descendant loopback ownership"
+                        .to_owned(),
+                ),
+            },
+        })),
+        _ => Err(refusal(
+            BrowserRefusalCode::BrowserBindingAmbiguous,
+            "multiple browser-extension endpoints belong to the approved browser process",
+        )),
+    }
+}
+
 fn parse_devtools_active_port(text: &str) -> Option<(u16, &str)> {
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
     let port = lines.next()?.parse::<u16>().ok()?;
@@ -706,7 +813,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
             }
         }
         match discovered.as_slice() {
-            [] => Ok(None),
+            [] => extension_bridge_endpoint(pid),
             [(port, ws_url)] => Ok(Some(OwnedEndpoint {
                 ws_url: ws_url.clone(),
                 http_port: Some(*port),
@@ -729,6 +836,11 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         pid: i64,
         expected_ws_url: &str,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+        if let Some(endpoint) = extension_bridge_endpoint(pid)? {
+            if endpoint.ws_url == expected_ws_url {
+                return Ok(Some(endpoint));
+            }
+        }
         let Some(port) = loopback_websocket_port(expected_ws_url) else {
             return Err(refusal(
                 BrowserRefusalCode::BrowserEndpointOwnerMismatch,

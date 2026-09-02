@@ -39,6 +39,8 @@ semver = "1"
 # dependency is easy to find).
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
+futures-util = "0.3"
+tokio-tungstenite = "0.24"
 
 # Used by crate::bundle::parent_is_not_launchd() for the TCC
 # auto-relaunch detection path on Unix (only the macOS heuristic
@@ -80,8 +82,6 @@ base64 = { workspace = true }
 # Isolated HOME / cache directories for `version_check` unit tests so they
 # never touch the developer's real `~/.cua-driver-rs/version_check.json`.
 tempfile = "3"
-futures-util = "0.3"
-tokio-tungstenite = "0.24"
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 platform-windows = { path = "../platform-windows" }

@@ -316,6 +316,136 @@ async fn loopback_ports_for_pid(pid: i64) -> Result<Vec<u16>, BrowserRefusal> {
     )))
 }
 
+async fn process_is_descendant(root_pid: i64, mut candidate_pid: i64) -> bool {
+    for _ in 0..32 {
+        if candidate_pid == root_pid {
+            return true;
+        }
+        let output = match tokio::process::Command::new("ps")
+            .args(["-p", &candidate_pid.to_string(), "-o", "ppid="])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => output,
+            _ => return false,
+        };
+        candidate_pid = match String::from_utf8_lossy(&output.stdout).trim().parse() {
+            Ok(parent) if parent > 1 => parent,
+            _ => return false,
+        };
+    }
+    false
+}
+
+async fn extension_bridge_endpoint(pid: i64) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let uid = unsafe { libc::geteuid() };
+    let prefix = format!("cua-driver-browser-extension-{uid}-");
+    let mut endpoints = Vec::new();
+    for entry in std::fs::read_dir(std::env::temp_dir()).map_err(|error| {
+        refusal(
+            BrowserRefusalCode::BrowserRouteUnavailable,
+            format!("could not inspect browser-extension endpoint records: {error}"),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            refusal(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!("could not inspect a browser-extension endpoint record: {error}"),
+            )
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(".json") {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            refusal(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!("could not inspect browser-extension endpoint record: {error}"),
+            )
+        })?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != uid
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() > 4096
+        {
+            return Err(refusal(
+                BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                "a browser-extension endpoint record is not a small private owned file",
+            ));
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).map_err(|error| {
+                refusal(
+                    BrowserRefusalCode::BrowserRouteUnavailable,
+                    format!("could not read browser-extension endpoint record: {error}"),
+                )
+            })?)
+            .map_err(|_| {
+                refusal(
+                    BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                    "the browser-extension endpoint record is malformed",
+                )
+            })?;
+        if value["protocol_version"] != 1
+            || value["extension_id"] != "aaicokmghmaijchfjgiaohgidiimegkp"
+        {
+            return Err(refusal(
+                BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                "the browser-extension endpoint identity is incompatible",
+            ));
+        }
+        let ws_url = value["ws_url"].as_str().ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                "the browser-extension endpoint record has no WebSocket URL",
+            )
+        })?;
+        let port = loopback_websocket_port(ws_url).ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                "the browser-extension endpoint is not loopback-only",
+            )
+        })?;
+        let host_pid = value["host_pid"].as_i64().ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                "the browser-extension endpoint record has no host pid",
+            )
+        })?;
+        if process_is_descendant(pid, host_pid).await
+            && loopback_ports_for_pid(host_pid).await?.contains(&port)
+        {
+            endpoints.push((ws_url.to_owned(), port, host_pid));
+        }
+    }
+    match endpoints.as_slice() {
+        [] => Ok(None),
+        [(ws_url, port, host_pid)] => Ok(Some(OwnedEndpoint {
+            ws_url: ws_url.clone(),
+            http_port: Some(*port),
+            ownership: EndpointOwnershipProof {
+                method: EndpointOwnershipMethod::PlatformAttested,
+                owner_pid: pid,
+                listener_pid: Some(*host_pid),
+                detail: Some(
+                    "private extension record plus native-host descendant loopback ownership"
+                        .to_owned(),
+                ),
+            },
+        })),
+        _ => Err(refusal(
+            BrowserRefusalCode::BrowserBindingAmbiguous,
+            "multiple browser-extension endpoints belong to the approved browser process",
+        )),
+    }
+}
+
 async fn active_port_endpoint(
     pid: i64,
     product: BrowserProduct,
@@ -655,7 +785,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         // Chromium can own unrelated loopback services. The setup path below
         // correlates a listener with the exact checkbox transition and the
         // pooled WebSocket claim proves the protocol before attachment.
-        Ok(None)
+        extension_bridge_endpoint(pid).await
     }
 
     async fn reprove_existing_profile_endpoint(
@@ -669,6 +799,11 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 "the approved existing-profile endpoint is not loopback-only",
             ));
         };
+        if let Some(endpoint) = extension_bridge_endpoint(pid).await? {
+            if endpoint.ws_url == expected_ws_url {
+                return Ok(Some(endpoint));
+            }
+        }
         if !loopback_ports_for_pid(pid).await?.contains(&port) {
             return Ok(None);
         }
