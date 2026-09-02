@@ -428,7 +428,7 @@ async fn extension_bridge_endpoint(pid: i64) -> Result<Option<OwnedEndpoint>, Br
         [] => Ok(None),
         [(ws_url, port, host_pid)] => Ok(Some(OwnedEndpoint {
             ws_url: ws_url.clone(),
-            http_port: Some(*port),
+            http_port: None,
             ownership: EndpointOwnershipProof {
                 method: EndpointOwnershipMethod::PlatformAttested,
                 owner_pid: pid,
@@ -730,6 +730,9 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         &self,
         pid: i64,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+        if let Some(endpoint) = extension_bridge_endpoint(pid).await? {
+            return Ok(Some(endpoint));
+        }
         for port in loopback_ports_for_pid(pid).await? {
             if let Some(ws_url) = browser_websocket_url(port).await {
                 return Ok(Some(OwnedEndpoint {
@@ -753,6 +756,9 @@ impl BrowserPlatform for MacOsBrowserPlatform {
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
         let classification = self.classify_browser(pid).await?;
         if let Some(endpoint) = active_port_endpoint(pid, classification.product_kind).await? {
+            return Ok(Some(endpoint));
+        }
+        if let Some(endpoint) = extension_bridge_endpoint(pid).await? {
             return Ok(Some(endpoint));
         }
         let ports = loopback_ports_for_pid(pid).await?;
@@ -785,7 +791,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         // Chromium can own unrelated loopback services. The setup path below
         // correlates a listener with the exact checkbox transition and the
         // pooled WebSocket claim proves the protocol before attachment.
-        extension_bridge_endpoint(pid).await
+        Ok(None)
     }
 
     async fn reprove_existing_profile_endpoint(

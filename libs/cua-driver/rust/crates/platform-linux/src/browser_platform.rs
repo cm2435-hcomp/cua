@@ -298,7 +298,7 @@ fn extension_bridge_endpoint(pid: i64) -> Result<Option<OwnedEndpoint>, BrowserR
         [] => Ok(None),
         [(ws_url, port, host_pid)] => Ok(Some(OwnedEndpoint {
             ws_url: ws_url.clone(),
-            http_port: Some(*port),
+            http_port: None,
             ownership: EndpointOwnershipProof {
                 method: EndpointOwnershipMethod::PlatformAttested,
                 owner_pid: pid,
@@ -766,6 +766,9 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         if let Some(endpoint) = active_port_endpoint(pid)? {
             return Ok(Some(endpoint));
         }
+        if let Some(endpoint) = extension_bridge_endpoint(pid)? {
+            return Ok(Some(endpoint));
+        }
         let ports = tokio::task::spawn_blocking(move || loopback_ports_for_pid(pid))
             .await
             .map_err(|error| {
@@ -798,6 +801,9 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         if let Some(endpoint) = active_port_endpoint(pid)? {
             return Ok(Some(endpoint));
         }
+        if let Some(endpoint) = extension_bridge_endpoint(pid)? {
+            return Ok(Some(endpoint));
+        }
         let ports = tokio::task::spawn_blocking(move || loopback_ports_for_pid(pid))
             .await
             .map_err(|error| {
@@ -813,7 +819,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
             }
         }
         match discovered.as_slice() {
-            [] => extension_bridge_endpoint(pid),
+            [] => Ok(None),
             [(port, ws_url)] => Ok(Some(OwnedEndpoint {
                 ws_url: ws_url.clone(),
                 http_port: Some(*port),

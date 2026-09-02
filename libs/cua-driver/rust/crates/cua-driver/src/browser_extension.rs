@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context as _};
+use anyhow::anyhow;
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -274,7 +274,7 @@ async fn run_host_async() -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let expected_path = path.clone();
-        let socket = tokio_tungstenite::accept_hdr_async(stream, move |
+        let socket = match tokio_tungstenite::accept_hdr_async(stream, move |
             request: &tokio_tungstenite::tungstenite::handshake::server::Request,
             response: tokio_tungstenite::tungstenite::handshake::server::Response,
         | {
@@ -287,7 +287,13 @@ async fn run_host_async() -> anyhow::Result<()> {
             }
         })
         .await
-        .context("browser-extension WebSocket handshake failed")?;
+        {
+            Ok(socket) => socket,
+            // Endpoint discovery may probe loopback listeners with a plain
+            // HTTP request. That request has no relay authority and must not
+            // be able to tear down Chrome's long-lived native host.
+            Err(_) => continue,
+        };
         let (mut ws_out, mut ws_in) = socket.split();
         loop {
             tokio::select! {
