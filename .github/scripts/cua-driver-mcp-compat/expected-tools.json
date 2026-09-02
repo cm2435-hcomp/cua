@@ -2,7 +2,7 @@
   "serverName": "cua-driver",
   "outputSchemaCountByPlatform": {
     "darwin": 30,
-    "linux": 34,
+    "linux": 35,
     "win32": 30
   },
   "baseTools": [
@@ -62,11 +62,16 @@
     "zoom"
   ],
   "platformTools": {
+    "darwin": [
+      "select_text"
+    ],
     "linux": [
+      "check_winrestore",
       "mouse_button_down",
       "mouse_button_up",
       "mouse_drag",
-      "parallel_mouse_drag"
+      "parallel_mouse_drag",
+      "select_text"
     ]
   }
 }

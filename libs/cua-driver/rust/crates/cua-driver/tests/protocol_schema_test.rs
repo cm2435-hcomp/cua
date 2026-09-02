@@ -116,6 +116,8 @@ fn tools_list_schema_shape() {
         "right_click",
         "drag",
         "type_text",
+        #[cfg(target_os = "linux")]
+        "set_value",
         "press_key",
         "hotkey",
         "scroll",

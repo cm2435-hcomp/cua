@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Cua Driver Browser Bridge",
+  "version": "0.1.1",
+  "description": "Explicit existing-profile browser connection for Cua Driver.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAlZQxEzGA2VjkNoBNwDqqXlWcRsPkGHv7w1Vcm4T98J1LBK4N+uo+GO1MNQ6QmZMUIdX3I6byQDq55pLzo+WaWPHcTGP6VBpvb5pW+hvQ3HW/0kK3XlW9m/q1dxvLOELtAIWKrrNfVFVA8h/2S0iNrSpoVPPTnoH1lzK4gNLW1ExvaRggNoltx/i2rbiTSThPtFdePmhWz4CIFxyubdU36eYj8Uj+jwn8D4+YXm3fo6gVHJRrzA+5xLEHzNRcsnTYxDt22VaazhzRIQq7QmoILVxMOXlV90k99B1XR7wObY1EMxiZlJtdZ7B47C1bEdQHQnXjCPpmuQvs6u3wr0RHIQIDAQAB",
+  "permissions": ["debugger", "nativeMessaging", "tabs"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

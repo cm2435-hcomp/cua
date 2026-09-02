@@ -163,6 +163,44 @@
               "null"
             ]
           },
+          "focus_effect": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "not_eligible",
+                  "preserved",
+                  "temporarily_taken_and_restored",
+                  "taken_and_not_restored",
+                  "indeterminate"
+                ],
+                "type": "string"
+              },
+              "measurement_complete": {
+                "type": "boolean"
+              },
+              "target_active_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "transition_count": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "transition_count",
+              "target_active_ms",
+              "measurement_complete"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -509,6 +547,44 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "focus_effect": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "not_eligible",
+                  "preserved",
+                  "temporarily_taken_and_restored",
+                  "taken_and_not_restored",
+                  "indeterminate"
+                ],
+                "type": "string"
+              },
+              "measurement_complete": {
+                "type": "boolean"
+              },
+              "target_active_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "transition_count": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "transition_count",
+              "target_active_ms",
+              "measurement_complete"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -1346,6 +1422,44 @@
               "null"
             ]
           },
+          "focus_effect": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "not_eligible",
+                  "preserved",
+                  "temporarily_taken_and_restored",
+                  "taken_and_not_restored",
+                  "indeterminate"
+                ],
+                "type": "string"
+              },
+              "measurement_complete": {
+                "type": "boolean"
+              },
+              "target_active_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "transition_count": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "transition_count",
+              "target_active_ms",
+              "measurement_complete"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -1517,6 +1631,44 @@
               "null"
             ]
           },
+          "focus_effect": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "not_eligible",
+                  "preserved",
+                  "temporarily_taken_and_restored",
+                  "taken_and_not_restored",
+                  "indeterminate"
+                ],
+                "type": "string"
+              },
+              "measurement_complete": {
+                "type": "boolean"
+              },
+              "target_active_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "transition_count": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "transition_count",
+              "target_active_ms",
+              "measurement_complete"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -1675,6 +1827,44 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "focus_effect": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "not_eligible",
+                  "preserved",
+                  "temporarily_taken_and_restored",
+                  "taken_and_not_restored",
+                  "indeterminate"
+                ],
+                "type": "string"
+              },
+              "measurement_complete": {
+                "type": "boolean"
+              },
+              "target_active_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "transition_count": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "transition_count",
+              "target_active_ms",
+              "measurement_complete"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -1838,6 +2028,44 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "focus_effect": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "not_eligible",
+                  "preserved",
+                  "temporarily_taken_and_restored",
+                  "taken_and_not_restored",
+                  "indeterminate"
+                ],
+                "type": "string"
+              },
+              "measurement_complete": {
+                "type": "boolean"
+              },
+              "target_active_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "transition_count": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "transition_count",
+              "target_active_ms",
+              "measurement_complete"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -2021,6 +2249,44 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "focus_effect": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "not_eligible",
+                  "preserved",
+                  "temporarily_taken_and_restored",
+                  "taken_and_not_restored",
+                  "indeterminate"
+                ],
+                "type": "string"
+              },
+              "measurement_complete": {
+                "type": "boolean"
+              },
+              "target_active_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "transition_count": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "transition_count",
+              "target_active_ms",
+              "measurement_complete"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -2508,6 +2774,44 @@
               "null"
             ]
           },
+          "focus_effect": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "not_eligible",
+                  "preserved",
+                  "temporarily_taken_and_restored",
+                  "taken_and_not_restored",
+                  "indeterminate"
+                ],
+                "type": "string"
+              },
+              "measurement_complete": {
+                "type": "boolean"
+              },
+              "target_active_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "transition_count": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "transition_count",
+              "target_active_ms",
+              "measurement_complete"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -2803,6 +3107,44 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "focus_effect": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "not_eligible",
+                  "preserved",
+                  "temporarily_taken_and_restored",
+                  "taken_and_not_restored",
+                  "indeterminate"
+                ],
+                "type": "string"
+              },
+              "measurement_complete": {
+                "type": "boolean"
+              },
+              "target_active_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "transition_count": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "transition_count",
+              "target_active_ms",
+              "measurement_complete"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },

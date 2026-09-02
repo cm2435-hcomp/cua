@@ -624,16 +624,19 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
         self.assertEqual(len(expected["baseTools"]), 54)
         self.assertEqual(
             expected["outputSchemaCountByPlatform"],
-            {"darwin": 30, "linux": 34, "win32": 30},
+            {"darwin": 30, "linux": 35, "win32": 30},
         )
         self.assertEqual(
             expected["platformTools"],
             {
+                "darwin": ["select_text"],
                 "linux": [
+                    "check_winrestore",
                     "mouse_button_down",
                     "mouse_button_up",
                     "mouse_drag",
                     "parallel_mouse_drag",
+                    "select_text",
                 ]
             },
         )

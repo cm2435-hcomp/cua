@@ -432,7 +432,7 @@ pub fn parse_command() -> Command {
             env!("CARGO_PKG_VERSION")
         );
         println!("Usage: cua-driver [SUBCOMMAND] [OPTIONS]");
-        println!("Subcommands: mcp, list-tools, describe, call, serve, stop, revoke, status, config, telemetry, recording, update, check-update, doctor, diagnose, permissions, autostart, skills, browser-approve, manifest, cursor-theme");
+        println!("Subcommands: mcp, list-tools, describe, call, serve, stop, revoke, status, config, telemetry, recording, update, check-update, doctor, diagnose, permissions, autostart, skills, browser-approve, manifest, browser-extension, cursor-theme");
         println!();
         println!("permissions options (macOS):");
         println!("  cua-driver permissions status   Report Accessibility + Screen Recording status. Read-only (no prompt).");
@@ -479,6 +479,11 @@ pub fn parse_command() -> Command {
         println!("  cua-driver browser-approve --strategy existing_profile --pid <pid>");
         println!("                                  --window-id <window_id> --session <session>");
         println!("                                  Approve attachment to one exact existing browser request.");
+        println!();
+        println!("existing-profile browser extension setup (macOS/Linux):");
+        println!("  cua-driver browser-extension install   Install/update the unpacked extension and native host.");
+        println!("  cua-driver browser-extension status    Report whether both installed components exist.");
+        println!("  cua-driver browser-extension path      Print the path to load once in chrome://extensions.");
         println!();
         println!("agent authorization (serve only):");
         println!("  --permission-mode <mode>        standard (default), bounded, or unrestricted.");
@@ -1513,6 +1518,9 @@ pub fn build_manifest() -> serde_json::Value {
             { "name": "mcp-config",
               "description": "Print client-specific connection guidance (MCP config where supported).",
               "args": [ { "name": "--client", "type": "string", "description": "One of: claude, codex, cursor, hermes, antigravity, openclaw, opencode, pi, prime-agent, qwen, droid, zcode. Omit for the generic snippet." } ] },
+            { "name": "browser-extension",
+              "description": "Install or inspect the explicit existing-profile Chrome extension bridge on macOS/Linux.",
+              "args": [ { "name": "subcommand", "type": "positional-string", "description": "One of: install, status, path." } ] },
             { "name": "manifest",
               "description": "Emit this machine-readable description of the CLI surface.",
               "args": [ { "name": "--pretty", "type": "flag", "description": "Pretty-print the JSON." } ] },

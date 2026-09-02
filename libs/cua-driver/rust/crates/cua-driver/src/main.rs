@@ -18,6 +18,7 @@
 //! platform tool registry.
 
 mod autostart;
+mod browser_extension;
 mod bundle;
 mod check_update_tool;
 mod cli;
@@ -437,6 +438,9 @@ mod mcp_runtime_selection_tests {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    if let Some(code) = browser_extension::run_early_if_requested() {
+        std::process::exit(code);
+    }
     init_logging();
     if let Some(code) = cli::run_permissions_host_request_if_requested() {
         std::process::exit(code);
@@ -831,6 +835,9 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
+    if let Some(code) = browser_extension::run_early_if_requested() {
+        std::process::exit(code);
+    }
     init_logging();
     if let Some(generation) = private_worker::requested_generation() {
         return private_worker::run(generation, None);
