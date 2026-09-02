@@ -69,14 +69,15 @@ The snapshot is SCOPED to `window_id`: a window_id that no longer exists is refu
 
 Optional `query` projects both tree_markdown and structured `elements` to matching lines plus their ancestor chain (case-insensitive substring). The element_index values are unchanged, the complete snapshot remains actionable, and `element_count` continues to report its total size; `filtered_element_count` reports the projected response size.
 
-Optional `max_elements` / `max_depth` bound the AX walk to mitigate context-window blow-up on Electron / Obsidian / large web apps that produce 10k+ element trees. When applied, BOTH the markdown and the structured elements are truncated identically. Omit both for current default behaviour (≤2 000 elements, depth ≤25).
+Optional diagnostic `max_elements` / `max_depth` bounds explicitly truncate the AX walk. Omit them for the production provider: healthy large collections use the platform's explicit visible-child subset instead of a global element cap.
 
 **Arguments:**
 
+- `ax_tree_mode` (string, optional): Default full. diff_if_available additionally returns a signed-compatible native AX revision update while keeping tree_markdown and elements complete for existing consumers.
 - `capture_mode` (string, optional): DEPRECATED and ignored. get_window_state always returns BOTH the element tree and a screenshot — ground on both. The modality is chosen at action time by how you address the target: an element ax action (element_index/element_token) or an element px action (x,y). Any value (including the old "som"/"screenshot" aliases) is accepted but has no effect.
 - `include_screenshot` (boolean, optional): Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return the tree only (the cheap path when you're just re-indexing before an element ax action; saves the image tokens + screen-grab latency). screenshot_out_file still forces a capture to disk.
 - `max_depth` (integer, optional): Cap on the AX-tree walk depth. Nodes whose rendered indent would exceed this are omitted. Omit for the default (25). Lower this for deep menu/Electron trees. range: 1–unbounded
-- `max_elements` (integer, optional): Cap on the total number of AX nodes walked. Truncates depth-first; markdown and structured elements truncate together. Omit for the default (2 000). Lower this for Electron / Obsidian / large web apps that produce 10k+ element trees and blow context windows. range: 1–unbounded
+- `max_elements` (integer, optional): Explicit diagnostic cap on AX nodes walked. Truncates depth-first; markdown and structured elements truncate together. Omit for the complete production provider. range: 1–unbounded
 - `pid` (integer, required): Target process ID.
 - `query` (string, optional): Case-insensitive filter for tree_markdown and structured elements. Returns matching actionable rows plus their actionable ancestors without renumbering element_index values.
 - `screenshot_out_file` (string, optional): When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output will contain screenshot_file_path instead.

@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 const HOST_NAME: &str = "com.hcompany.cua_driver";
 pub const EXTENSION_ID: &str = "aaicokmghmaijchfjgiaohgidiimegkp";
-const EXTENSION_MANIFEST: &str = include_str!("../../../../browser-extension/manifest.json");
-const EXTENSION_WORKER: &str = include_str!("../../../../browser-extension/background.js");
+const EXTENSION_MANIFEST: &str = include_str!("../browser-extension/manifest.json");
+const EXTENSION_WORKER: &str = include_str!("../browser-extension/background.js");
 const MAX_HOST_TO_EXTENSION_BYTES: usize = 1024 * 1024;
 const MAX_EXTENSION_TO_HOST_BYTES: usize = 64 * 1024 * 1024;
 
