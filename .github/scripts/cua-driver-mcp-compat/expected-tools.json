@@ -2,7 +2,7 @@
   "serverName": "cua-driver",
   "outputSchemaCountByPlatform": {
     "darwin": 30,
-    "linux": 34,
+    "linux": 35,
     "win32": 30
   },
   "baseTools": [
