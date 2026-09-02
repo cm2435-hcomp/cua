@@ -233,10 +233,15 @@ pub fn run_host(origin: &str) -> anyhow::Result<()> {
             "native host caller is not the installed Cua extension"
         ));
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run_host_async())
+        .build()?;
+    let result = runtime.block_on(run_host_async());
+    // Native messaging stdin is a blocking OS pipe. If the relay fails, do not
+    // let Tokio's blocking-pool shutdown hide that failure behind an immortal
+    // native-host process; Chrome owns and will close the pipe independently.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
 }
 
 async fn run_host_async() -> anyhow::Result<()> {
