@@ -296,7 +296,7 @@ fn extension_bridge_endpoint(pid: i64) -> Result<Option<OwnedEndpoint>, BrowserR
     }
     match endpoints.as_slice() {
         [] => Ok(None),
-        [(ws_url, port, host_pid)] => Ok(Some(OwnedEndpoint {
+        [(ws_url, _port, host_pid)] => Ok(Some(OwnedEndpoint {
             ws_url: ws_url.clone(),
             http_port: None,
             ownership: EndpointOwnershipProof {

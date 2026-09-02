@@ -59,19 +59,27 @@ async function rootCommand(method, params) {
     };
   }
   if (method === "Target.attachToTarget") {
-    if (attached) throw new Error("a browser target is already attached");
     const target = await targetForId(params?.targetId);
     const tab = await chrome.tabs.get(target.tabId);
     if (!tab.active) throw new Error("the approved browser target is no longer active");
-    await chrome.debugger.attach({ tabId: target.tabId }, "1.3");
-    attached = {
-      tabId: target.tabId,
-      targetId: target.id,
-      windowId: tab.windowId,
-      sessionId: `cua-tab-${target.tabId}`,
-      children: new Set(),
-    };
-    return { sessionId: attached.sessionId };
+    if (attached && attached.targetId !== target.id)
+      throw new Error("a different browser target is already attached");
+    if (!attached) {
+      await chrome.debugger.attach({ tabId: target.tabId }, "1.3");
+      attached = {
+        tabId: target.tabId,
+        targetId: target.id,
+        windowId: tab.windowId,
+        sessions: new Set(),
+        children: new Set(),
+      };
+    }
+    // Raw browser CDP supports several flattened sessions for one page. The
+    // extension API exposes one physical tab attachment, so multiplex the
+    // driver's logical sessions over that exact attachment.
+    const sessionId = `cua-tab-${target.tabId}-${crypto.randomUUID()}`;
+    attached.sessions.add(sessionId);
+    return { sessionId };
   }
   if (method === "Target.closeTarget") {
     const target = await targetForId(params?.targetId);
@@ -85,7 +93,7 @@ async function rootCommand(method, params) {
 async function sessionCommand(sessionId, method, params) {
   if (!attached) throw new Error("the approved browser target is not attached");
   let debuggee;
-  if (sessionId === attached.sessionId) debuggee = { tabId: attached.tabId };
+  if (attached.sessions.has(sessionId)) debuggee = { tabId: attached.tabId };
   else if (attached.children.has(sessionId)) debuggee = { tabId: attached.tabId, sessionId };
   else throw new Error("the CDP session is no longer attached to the approved tab");
   return chrome.debugger.sendCommand(debuggee, method, params ?? {});
@@ -142,22 +150,27 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   const child = params?.sessionId;
   if (method === "Target.attachedToTarget" && child) attached.children.add(child);
   if (method === "Target.detachedFromTarget" && child) attached.children.delete(child);
-  const sessionId = source.sessionId ?? attached.sessionId;
-  post({ op: "cdp", message: { method, params: params ?? {}, sessionId } });
+  if (source.sessionId) {
+    post({ op: "cdp", message: { method, params: params ?? {}, sessionId: source.sessionId } });
+    return;
+  }
+  for (const sessionId of attached.sessions)
+    post({ op: "cdp", message: { method, params: params ?? {}, sessionId } });
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (!attached || source.tabId !== attached.tabId) return;
-  const sessionId = attached.sessionId;
+  const sessionIds = [...attached.sessions];
   const targetId = attached.targetId;
   attached = undefined;
-  post({
-    op: "cdp",
-    message: {
-      method: "Target.detachedFromTarget",
-      params: { sessionId, targetId, reason },
-    },
-  });
+  for (const sessionId of sessionIds)
+    post({
+      op: "cdp",
+      message: {
+        method: "Target.detachedFromTarget",
+        params: { sessionId, targetId, reason },
+      },
+    });
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
